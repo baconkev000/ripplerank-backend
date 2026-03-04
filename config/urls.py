@@ -10,6 +10,7 @@ from drf_spectacular.views import SpectacularSwaggerView
 from rest_framework.authtoken.views import obtain_auth_token
 
 from swivl.users.views import google_login_redirect_view
+from accounts import views as accounts_views
 
 urlpatterns = [
     path("", TemplateView.as_view(template_name="pages/home.html"), name="home"),
@@ -23,6 +24,16 @@ urlpatterns = [
     # User management
     path("users/", include("swivl.users.urls", namespace="users")),
     path("auth/google/login/", google_login_redirect_view, name="google-login"),
+    path(
+        "integrations/google-search-console/start/",
+        accounts_views.gsc_connect_start,
+        name="gsc-connect-start",
+    ),
+    path(
+        "integrations/google-search-console/callback/",
+        accounts_views.gsc_connect_callback,
+        name="gsc-connect-callback",
+    ),
     path("accounts/", include("allauth.urls")),
     # Your stuff: custom urls includes go here
     # ...
@@ -36,6 +47,12 @@ urlpatterns += [
     path("api/", include("config.api_router")),
     # DRF auth token
     path("api/auth-token/", obtain_auth_token, name="obtain_auth_token"),
+    # Business profile for settings page
+    path("api/business-profile/", accounts_views.business_profile, name="business-profile"),
+    # Google Search Console integration status
+    path("api/integrations/google-search-console/status/", accounts_views.gsc_status, name="gsc-status"),
+    # API logout to clear Django/Google SSO session
+    path("api/logout/", accounts_views.api_logout, name="api-logout"),
     path("api/schema/", SpectacularAPIView.as_view(), name="api-schema"),
     path(
         "api/docs/",

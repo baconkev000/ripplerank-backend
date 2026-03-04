@@ -64,3 +64,8 @@ INSTALLED_APPS += ["django_extensions"]
 
 # Your stuff...
 # ------------------------------------------------------------------------------
+CSRF_TRUSTED_ORIGINS = ["http://localhost:3000"]  # Allow frontend
+CORS_ALLOW_CREDENTIALS = True  # Allow cookies
+CSRF_COOKIE_HTTPONLY = False  # Must be False for frontend access
+CSRF_COOKIE_SECURE = False  # Set to True in production (HTTPS only)
+CSRF_USE_SESSIONS = False  # Use cookies, not sessions

@@ -57,17 +57,11 @@ def google_login_redirect_view(request: HttpRequest) -> HttpResponseRedirect:
     optional `next` parameter so that, after Google completes, the user is
     sent back to the desired frontend path (e.g. `/app`).
     """
-    next_url = request.GET.get("next") or "/app"
+    frontend_next = request.GET.get("next") or "/app"
 
-    if not isinstance(next_url, str) or not next_url.startswith("/"):
-        next_url = "/app"
+    # Make sure it starts with the frontend base URL
+    if not frontend_next.startswith("http"):
+        frontend_next = f"{settings.FRONTEND_BASE_URL}{frontend_next}"
 
     login_path = "/accounts/google/login/"
-    print("")
-    print("")
-    print("")
-    print("")
-    print("")
-    print("")
-    print(f"{login_path}?next={next_url}")
-    return redirect(f"{login_path}?next={next_url}")
+    return redirect(f"{login_path}?next={frontend_next}")
