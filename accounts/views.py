@@ -15,7 +15,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .models import (
+    AgentActivityLog,
     BusinessProfile,
+    GoogleAdsMetricsCache,
     GoogleSearchConsoleConnection,
     GoogleBusinessProfileConnection,
     SEOOverviewSnapshot,
@@ -23,8 +25,18 @@ from .models import (
     AgentConversation,
     AgentMessage,
 )
+
+# Third-party API cache: only refetch from GSC, Google Ads, GBP if last fetch was >= this long ago.
+THIRD_PARTY_CACHE_TTL = timedelta(hours=1)
 from .serializers import BusinessProfileSerializer
-from .google_ads_client import classify_intent, fetch_keyword_ideas_for_user
+from .google_ads_client import (
+    classify_intent,
+    fetch_ads_metrics_for_user,
+    fetch_ads_metrics_for_user_result,
+    fetch_keyword_ideas_for_user,
+)
+from .meta_ads_utils import get_meta_ads_status_for_user
+from .tiktok_ads_utils import get_tiktok_ads_status_for_user
 from . import openai_utils
 
 logger = logging.getLogger(__name__)
@@ -395,6 +407,174 @@ def ads_status(request: HttpRequest) -> Response:
     return Response({"connected": connected})
 
 
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def meta_ads_status(request: HttpRequest) -> Response:
+    """
+    Return whether the current user has a Meta Ads connection.
+
+    The underlying lookup lives in ``meta_ads_utils.get_meta_ads_status_for_user``
+    so that the storage / API details can evolve independently of this view.
+    """
+
+    status = get_meta_ads_status_for_user(request.user.id)
+    return Response({"connected": bool(status.connected)})
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def tiktok_ads_status(request: HttpRequest) -> Response:
+    """
+    Return whether the current user has a TikTok Ads connection.
+
+    The underlying lookup lives in ``tiktok_ads_utils.get_tiktok_ads_status_for_user``
+    so that implementation details are kept out of the HTTP layer.
+    """
+
+    status = get_tiktok_ads_status_for_user(request.user.id)
+    return Response({"connected": bool(status.connected)})
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def agent_activity_feed(request: HttpRequest) -> Response:
+    """
+    Return the current user's agent activity log for the dashboard "What your agents did today".
+    Only returns records from the last 30 days (same window as cleanup).
+    """
+    from django.utils import timezone
+    from datetime import timedelta
+
+    cutoff = timezone.now() - timedelta(days=30)
+    logs = (
+        AgentActivityLog.objects.filter(user=request.user, created_at__gte=cutoff)
+        .order_by("-created_at")[:100]
+    )
+    return Response({
+        "activities": [
+            {
+                "id": log.id,
+                "agent": log.agent,
+                "description": log.description,
+                "account_name": log.account_name or "",
+                "created_at": log.created_at.isoformat(),
+            }
+            for log in logs
+        ],
+    })
+
+
+def meta_ads_connect_start(request: HttpRequest) -> HttpResponse:
+    """
+    Start Meta Ads OAuth flow. Redirects to next URL until Meta OAuth is configured.
+    When META_APP_ID etc. are set, redirect to Meta login and use meta_ads_connect_callback.
+    """
+    if not request.user.is_authenticated:
+        return redirect(settings.FRONTEND_BASE_URL + "/login")
+    next_url = request.GET.get("next") or settings.FRONTEND_BASE_URL + "/app?tab=integrations"
+    # TODO: when Meta OAuth is configured, redirect to Meta and set session state/callback
+    return redirect(next_url)
+
+
+def meta_ads_connect_callback(request: HttpRequest) -> HttpResponse:
+    """
+    Handle Meta OAuth callback. Redirects to next URL until Meta OAuth is implemented.
+    """
+    next_url = request.session.get("meta_ads_next") or settings.FRONTEND_BASE_URL + "/app?tab=integrations"
+    request.session.pop("meta_ads_state", None)
+    request.session.pop("meta_ads_next", None)
+    return redirect(next_url)
+
+
+def tiktok_ads_connect_start(request: HttpRequest) -> HttpResponse:
+    """
+    Start TikTok Ads OAuth flow. Redirects to next URL until TikTok OAuth is configured.
+    """
+    if not request.user.is_authenticated:
+        return redirect(settings.FRONTEND_BASE_URL + "/login")
+    next_url = request.GET.get("next") or settings.FRONTEND_BASE_URL + "/app?tab=integrations"
+    # TODO: when TikTok OAuth is configured, redirect to TikTok and set session state/callback
+    return redirect(next_url)
+
+
+def tiktok_ads_connect_callback(request: HttpRequest) -> HttpResponse:
+    """
+    Handle TikTok OAuth callback. Redirects to next URL until TikTok OAuth is implemented.
+    """
+    next_url = request.session.get("tiktok_ads_next") or settings.FRONTEND_BASE_URL + "/app?tab=integrations"
+    request.session.pop("tiktok_ads_state", None)
+    request.session.pop("tiktok_ads_next", None)
+    return redirect(next_url)
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def ads_metrics(request: HttpRequest) -> Response:
+    """
+    Return Google Ads performance metrics for the current user.
+    Uses a 1-hour cache: if we have fresh cached metrics, return them without calling the Google Ads API.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - THIRD_PARTY_CACHE_TTL
+    force_refresh = request.GET.get("refresh") == "1"
+
+    if not force_refresh:
+        try:
+            cache = GoogleAdsMetricsCache.objects.get(user=request.user)
+            if cache.fetched_at >= cutoff:
+                return Response({
+                    "new_customers_this_month": cache.new_customers_this_month,
+                    "new_customers_previous_month": cache.new_customers_previous_month,
+                    "avg_roas": cache.avg_roas,
+                    "google_search_roas": cache.google_search_roas,
+                    "cost_per_customer": cache.cost_per_customer,
+                    "cost_per_customer_previous": cache.cost_per_customer_previous,
+                    "active_campaigns_count": cache.active_campaigns_count,
+                })
+        except GoogleAdsMetricsCache.DoesNotExist:
+            pass
+
+    metrics, reason, detail = fetch_ads_metrics_for_user_result(request.user.id)
+    if metrics is None:
+        return Response(
+            {
+                "error": detail or "Google Ads not connected or metrics unavailable",
+                "reason": reason or "not_connected",
+            },
+            status=404,
+        )
+
+    cache, _ = GoogleAdsMetricsCache.objects.update_or_create(
+        user=request.user,
+        defaults={
+            "new_customers_this_month": metrics.new_customers_this_month,
+            "new_customers_previous_month": metrics.new_customers_previous_month,
+            "avg_roas": metrics.avg_roas,
+            "google_search_roas": metrics.google_search_roas,
+            "cost_per_customer": metrics.cost_per_customer,
+            "cost_per_customer_previous": metrics.cost_per_customer_previous,
+            "active_campaigns_count": metrics.active_campaigns_count,
+        },
+    )
+    return Response({
+        "new_customers_this_month": cache.new_customers_this_month,
+        "new_customers_previous_month": cache.new_customers_previous_month,
+        "avg_roas": cache.avg_roas,
+        "google_search_roas": cache.google_search_roas,
+        "cost_per_customer": cache.cost_per_customer,
+        "cost_per_customer_previous": cache.cost_per_customer_previous,
+        "active_campaigns_count": cache.active_campaigns_count,
+    })
+
+
 def ads_connect_start(request: HttpRequest) -> HttpResponse:
     """
     Start Google OAuth flow for Google Ads API access.
@@ -484,6 +664,9 @@ def ads_connect_callback(request: HttpRequest) -> HttpResponse:
     conn.save()
 
     # Try to determine the user's Ads customer ID using the newly created connection.
+    connection_ok = True
+    connection_error_reason = None
+    connection_error_detail = None
     try:
         from google.ads.googleads.client import GoogleAdsClient  # type: ignore[import]
 
@@ -498,18 +681,46 @@ def ads_connect_callback(request: HttpRequest) -> HttpResponse:
             ads_client = GoogleAdsClient.load_from_dict(ads_config)
             customer_service = ads_client.get_service("CustomerService")
             accessible = customer_service.list_accessible_customers()
-            # Pick the first accessible customer as the default for now.
             if accessible.resource_names:
-                resource_name = accessible.resource_names[0]  # "customers/1234567890"
+                resource_name = accessible.resource_names[0]
                 customer_id = resource_name.split("/")[-1]
                 conn.customer_id = customer_id
                 conn.save(update_fields=["customer_id"])
-    except Exception:
-        # If this fails, the integration still works using app-level customer ID fallback.
-        pass
+            else:
+                connection_ok = False
+                connection_error_reason = "no_accounts"
+                connection_error_detail = (
+                    "No Google Ads accounts were found for this login. "
+                    "Create or get access to a Google Ads account at ads.google.com, then try connecting again."
+                )
+        else:
+            connection_ok = False
+            connection_error_reason = "missing_refresh_token"
+            connection_error_detail = (
+                "Google did not return a refresh token. Try disconnecting and connecting again, "
+                "and make sure to approve all requested permissions."
+            )
+    except Exception as e:
+        logger.exception("[Google Ads] list_accessible_customers failed: %s", e)
+        connection_ok = False
+        connection_error_reason = "api_error"
+        connection_error_detail = (
+            f"We couldn't load your Google Ads account: {str(e)}. "
+            "Check that your Google account has access to Google Ads and try reconnecting."
+        )
 
     request.session.pop("gads_state", None)
     request.session.pop("gads_next", None)
+
+    if not connection_ok and connection_error_reason and connection_error_detail:
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        parsed = urlparse(next_url)
+        params = parse_qs(parsed.query)
+        params["google_ads_error"] = [connection_error_reason]
+        params["google_ads_error_detail"] = [connection_error_detail]
+        new_query = urlencode(params, doseq=True)
+        next_url = urlunparse(parsed._replace(query=new_query))
 
     return redirect(next_url)
 
@@ -599,14 +810,41 @@ def _gsc_query(
 @permission_classes([IsAuthenticated])
 def seo_overview(request: HttpRequest) -> Response:
     """
-    Return SEO overview metrics for the dashboard, powered by Google Search Console:
-
-    - Organic Visitors This Month – clicks this month
-    - Keywords Ranking – count of distinct queries this month
-    - Top 3 Positions – count of queries with average position <= 3 this month
-    - Organic Growth – % change in clicks vs previous month
+    Return SEO overview metrics for the dashboard, powered by Google Search Console.
+    Uses a 1-hour cache: if we have fresh snapshot data, return it without calling GSC API.
     """
-    # Ensure we have a site URL for Search Console.
+    today = datetime.now(timezone.utc).date()
+    start_current = today.replace(day=1)
+    now = datetime.now(timezone.utc)
+    cutoff = now - THIRD_PARTY_CACHE_TTL
+    force_refresh = request.GET.get("refresh") == "1"
+
+    # Serve from cache if we have a snapshot for this period fetched within the last hour (unless refresh=1).
+    if not force_refresh:
+        try:
+            snapshot = SEOOverviewSnapshot.objects.get(
+                user=request.user,
+                period_start=start_current,
+            )
+            if snapshot.last_fetched_at >= cutoff:
+                prev_clicks = snapshot.prev_organic_visitors or 0
+                organic_visitors = snapshot.organic_visitors or 0
+                if prev_clicks == 0:
+                    organic_growth_pct = 100.0 if organic_visitors > 0 else 0.0
+                else:
+                    organic_growth_pct = ((organic_visitors - prev_clicks) / prev_clicks) * 100.0
+                return Response(
+                    {
+                        "organic_visitors": organic_visitors,
+                        "keywords_ranking": snapshot.keywords_ranking or 0,
+                        "top3_positions": snapshot.top3_positions or 0,
+                        "organic_growth_pct": organic_growth_pct,
+                    },
+                )
+        except SEOOverviewSnapshot.DoesNotExist:
+            pass
+
+    # Cache miss, stale, or refresh=1: call Google Search Console API.
     profile = BusinessProfile.objects.filter(user=request.user).first()
     site_url = (profile.website_url if profile else None) or getattr(
         settings,
@@ -626,9 +864,6 @@ def seo_overview(request: HttpRequest) -> Response:
             status=400,
         )
 
-    today = datetime.now(timezone.utc).date()
-    start_current = today.replace(day=1)
-    # Previous month range
     if start_current.month == 1:
         prev_year = start_current.year - 1
         prev_month = 12
@@ -651,7 +886,6 @@ def seo_overview(request: HttpRequest) -> Response:
     else:
         organic_growth_pct = ((organic_visitors - prev_clicks) / prev_clicks) * 100.0
 
-    # Persist snapshot for this user and period.
     snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
         user=request.user,
         period_start=start_current,
@@ -846,6 +1080,20 @@ def seo_keywords(request: HttpRequest) -> Response:
     return Response({"keywords": results})
 
 
+def _reviews_overview_response_from_snapshot(snapshot: ReviewsOverviewSnapshot) -> Response:
+    """Build the same JSON shape as fetch_gbp_overview for consistency."""
+    return Response({
+        "star_rating": float(snapshot.star_rating or 0),
+        "previous_star_rating": float(snapshot.previous_star_rating or 0),
+        "total_reviews": snapshot.total_reviews or 0,
+        "new_reviews_this_month": snapshot.new_reviews_this_month or 0,
+        "response_rate_pct": float(snapshot.response_rate_pct or 0),
+        "industry_avg_response_pct": float(snapshot.industry_avg_response_pct or 45),
+        "requests_sent": snapshot.requests_sent or 0,
+        "conversion_pct": float(snapshot.conversion_pct or 0),
+    })
+
+
 @csrf_exempt
 @api_view(["GET"])
 @authentication_classes([CsrfExemptSessionAuthentication])
@@ -853,7 +1101,7 @@ def seo_keywords(request: HttpRequest) -> Response:
 def reviews_overview(request: HttpRequest) -> Response:
     """
     Return Reviews Agent overview: star rating, total reviews, response rate, requests sent.
-    Uses Google Business Profile when connected; otherwise returns cached snapshot or defaults.
+    Uses a 1-hour cache: if we have fresh GBP snapshot data, return it without calling the API.
     """
     from .gbp_client import fetch_gbp_overview
 
@@ -862,6 +1110,17 @@ def reviews_overview(request: HttpRequest) -> Response:
     ).exists()
 
     if connected:
+        now = datetime.now(timezone.utc)
+        cutoff = now - THIRD_PARTY_CACHE_TTL
+        force_refresh = request.GET.get("refresh") == "1"
+        if not force_refresh:
+            try:
+                snapshot = ReviewsOverviewSnapshot.objects.get(user=request.user)
+                if snapshot.last_fetched_at >= cutoff:
+                    return _reviews_overview_response_from_snapshot(snapshot)
+            except ReviewsOverviewSnapshot.DoesNotExist:
+                pass
+
         try:
             data = fetch_gbp_overview(request.user)
             if data:
@@ -872,18 +1131,8 @@ def reviews_overview(request: HttpRequest) -> Response:
     # Fallback: cached snapshot or defaults
     try:
         snapshot = ReviewsOverviewSnapshot.objects.get(user=request.user)
-        return Response({
-            "star_rating": float(snapshot.star_rating or 0),
-            "previous_star_rating": float(snapshot.previous_star_rating or 0),
-            "total_reviews": snapshot.total_reviews or 0,
-            "new_reviews_this_month": snapshot.new_reviews_this_month or 0,
-            "response_rate_pct": float(snapshot.response_rate_pct or 0),
-            "industry_avg_response_pct": float(snapshot.industry_avg_response_pct or 45),
-            "requests_sent": snapshot.requests_sent or 0,
-            "conversion_pct": float(snapshot.conversion_pct or 0),
-        })
+        return _reviews_overview_response_from_snapshot(snapshot)
     except ReviewsOverviewSnapshot.DoesNotExist:
-        # Default placeholder so UI can show "Connect Google Business Profile"
         return Response({
             "star_rating": 0,
             "previous_star_rating": 0,

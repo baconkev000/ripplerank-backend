@@ -54,6 +54,26 @@ urlpatterns = [
         accounts_views.gbp_connect_callback,
         name="gbp-connect-callback",
     ),
+    path(
+        "integrations/meta-ads/start/",
+        accounts_views.meta_ads_connect_start,
+        name="meta-ads-connect-start",
+    ),
+    path(
+        "integrations/meta-ads/callback/",
+        accounts_views.meta_ads_connect_callback,
+        name="meta-ads-connect-callback",
+    ),
+    path(
+        "integrations/tiktok-ads/start/",
+        accounts_views.tiktok_ads_connect_start,
+        name="tiktok-ads-connect-start",
+    ),
+    path(
+        "integrations/tiktok-ads/callback/",
+        accounts_views.tiktok_ads_connect_callback,
+        name="tiktok-ads-connect-callback",
+    ),
     path("accounts/", include("allauth.urls")),
     # Your stuff: custom urls includes go here
     # ...
@@ -73,10 +93,18 @@ urlpatterns += [
     path("api/integrations/google-search-console/status/", accounts_views.gsc_status, name="gsc-status"),
     # Google Ads integration status
     path("api/integrations/google-ads/status/", accounts_views.ads_status, name="gads-status"),
+    # Meta Ads integration status
+    path("api/integrations/meta-ads/status/", accounts_views.meta_ads_status, name="meta-ads-status"),
+    # TikTok Ads integration status
+    path("api/integrations/tiktok-ads/status/", accounts_views.tiktok_ads_status, name="tiktok-ads-status"),
+    # Google Ads performance metrics (conversions, ROAS, cost per customer)
+    path("api/integrations/google-ads/metrics/", accounts_views.ads_metrics, name="gads-metrics"),
     # Google Business Profile integration status (Reviews Agent)
     path("api/integrations/google-business-profile/status/", accounts_views.gbp_status, name="gbp-status"),
     # Reviews overview (star rating, total reviews, response rate, etc. — GBP or cached)
     path("api/reviews/overview/", accounts_views.reviews_overview, name="reviews-overview"),
+    # Agent activity feed for dashboard "What your agents did today"
+    path("api/activity/", accounts_views.agent_activity_feed, name="agent-activity-feed"),
     # SEO overview metrics for dashboard (Google Search Console powered)
     path("api/seo/overview/", accounts_views.seo_overview, name="seo-overview"),
     # High-Intent Keywords dataset for SEO agent

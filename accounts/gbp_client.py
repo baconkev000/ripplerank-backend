@@ -176,12 +176,22 @@ def _build_overview_from_reviews(reviews: list, user) -> dict:
     total = len(reviews)
     if total == 0:
         snapshot, _ = ReviewsOverviewSnapshot.objects.get_or_create(user=user)
+        # Store zeros so the 1-hour cache is updated and we don't hit the API again.
+        snapshot.star_rating = Decimal("0")
+        snapshot.previous_star_rating = snapshot.previous_star_rating or Decimal("0")
+        snapshot.total_reviews = 0
+        snapshot.new_reviews_this_month = 0
+        snapshot.response_rate_pct = Decimal("0")
+        snapshot.industry_avg_response_pct = snapshot.industry_avg_response_pct or Decimal("45")
+        snapshot.requests_sent = snapshot.requests_sent or 0
+        snapshot.conversion_pct = snapshot.conversion_pct or Decimal("0")
+        snapshot.save()
         return {
-            "star_rating": float(snapshot.star_rating or 0),
+            "star_rating": 0.0,
             "previous_star_rating": float(snapshot.previous_star_rating or 0),
-            "total_reviews": snapshot.total_reviews or 0,
-            "new_reviews_this_month": snapshot.new_reviews_this_month or 0,
-            "response_rate_pct": float(snapshot.response_rate_pct or 0),
+            "total_reviews": 0,
+            "new_reviews_this_month": 0,
+            "response_rate_pct": 0.0,
             "industry_avg_response_pct": float(snapshot.industry_avg_response_pct or 45),
             "requests_sent": snapshot.requests_sent or 0,
             "conversion_pct": float(snapshot.conversion_pct or 0),

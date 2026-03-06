@@ -5,6 +5,7 @@ from .models import (
     GoogleSearchConsoleConnection,
     GoogleBusinessProfileConnection,
     GoogleAdsConnection,
+    GoogleAdsMetricsCache,
     SEOOverviewSnapshot,
     ReviewsOverviewSnapshot,
     GoogleAdsKeywordIdea,
@@ -45,6 +46,12 @@ class GoogleBusinessProfileConnectionAdmin(admin.ModelAdmin):
 @admin.register(GoogleAdsConnection)
 class GoogleAdsConnectionAdmin(admin.ModelAdmin):
     list_display = ("id", "user", "created_at", "updated_at")
+    search_fields = ("user__email", "user__username")
+
+
+@admin.register(GoogleAdsMetricsCache)
+class GoogleAdsMetricsCacheAdmin(admin.ModelAdmin):
+    list_display = ("id", "user", "fetched_at", "new_customers_this_month", "avg_roas", "cost_per_customer")
     search_fields = ("user__email", "user__username")
 
 

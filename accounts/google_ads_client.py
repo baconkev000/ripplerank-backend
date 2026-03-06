@@ -273,3 +273,198 @@ def fetch_keyword_ideas_for_user(
     )
     return cached
 
+
+@dataclass
+class AdsMetrics:
+    """Campaign performance metrics for the Ads Agent overview."""
+
+    new_customers_this_month: int
+    new_customers_previous_month: int
+    avg_roas: float
+    google_search_roas: float
+    cost_per_customer: float
+    cost_per_customer_previous: float
+    active_campaigns_count: int
+
+
+def fetch_ads_metrics_for_user_result(
+    user_id: int,
+) -> tuple[AdsMetrics | None, str | None, str | None]:
+    """
+    Fetch Google Ads campaign metrics for the current user.
+
+    Returns (metrics, reason_code, detail_message).
+    - If success: (AdsMetrics, None, None).
+    - If failure: (None, reason, detail). reason is one of:
+      not_connected, missing_refresh_token, missing_customer_id, api_error.
+    """
+    if not _has_app_ads_credentials():
+        logger.info("[Google Ads] fetch_ads_metrics_for_user: app credentials missing.")
+        return (
+            None,
+            "api_error",
+            "Google Ads integration is not fully configured. Please contact support.",
+        )
+
+    try:
+        conn = GoogleAdsConnection.objects.get(user_id=user_id)
+    except GoogleAdsConnection.DoesNotExist:
+        logger.warning("[Google Ads] No GoogleAdsConnection for user_id=%s.", user_id)
+        return (
+            None,
+            "not_connected",
+            "Google Ads is not connected. Connect your account in Integrations to see metrics.",
+        )
+
+    refresh_token = (conn.refresh_token or "").strip()
+    customer_id = (conn.customer_id or "").strip()
+    if not customer_id:
+        customer_id = (getattr(settings, "GOOGLE_ADS_CUSTOMER_ID", None) or "").strip()
+
+    if not refresh_token:
+        logger.warning("[Google Ads] User connection missing refresh_token.")
+        return (
+            None,
+            "missing_refresh_token",
+            "Your Google Ads connection is missing authorization. Please disconnect and reconnect Google Ads in Integrations.",
+        )
+    if not customer_id:
+        logger.warning("[Google Ads] User connection missing customer_id.")
+        return (
+            None,
+            "missing_customer_id",
+            "We couldn't determine your Google Ads account. Please disconnect and reconnect Google Ads in Integrations, and ensure you have access to at least one Google Ads account.",
+        )
+
+    customer_id_clean = customer_id.replace("-", "")
+    config = {
+        "developer_token": settings.GOOGLE_ADS_DEVELOPER_TOKEN,
+        "login_customer_id": customer_id_clean,
+        "client_customer_id": customer_id_clean,
+        "use_proto_plus": True,
+        "refresh_token": refresh_token,
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "client_secret": settings.GOOGLE_CLIENT_SECRET,
+    }
+
+    try:
+        from google.ads.googleads.client import GoogleAdsClient  # type: ignore[import]
+
+        client = GoogleAdsClient.load_from_dict(config)
+        ga_service = client.get_service("GoogleAdsService")
+
+        def _run_query(query: str) -> list:
+            response = ga_service.search(customer_id=customer_id_clean, query=query)
+            return list(response)
+
+        # This month: customer-level totals (conversions, cost, value)
+        q_this = """
+            SELECT
+                metrics.conversions,
+                metrics.cost_micros,
+                metrics.conversions_value
+            FROM customer
+            WHERE segments.date DURING THIS_MONTH
+        """
+        # Previous month
+        q_prev = """
+            SELECT
+                metrics.conversions,
+                metrics.cost_micros,
+                metrics.conversions_value
+            FROM customer
+            WHERE segments.date DURING LAST_MONTH
+        """
+        # This month: Search campaigns only (for Google Search ROAS)
+        q_search = """
+            SELECT
+                metrics.conversions,
+                metrics.cost_micros,
+                metrics.conversions_value
+            FROM campaign
+            WHERE segments.date DURING THIS_MONTH
+              AND campaign.advertising_channel_type = 'SEARCH'
+        """
+        # Count distinct campaigns with any cost this month (for "X Active" badge)
+        q_active_campaigns = """
+            SELECT campaign.id
+            FROM campaign
+            WHERE segments.date DURING THIS_MONTH
+              AND metrics.cost_micros > 0
+        """
+
+        def _sum_row(row) -> tuple[int, int, int]:
+            m = row.metrics
+            conv = int(m.conversions) if m.conversions else 0
+            cost = int(m.cost_micros) if m.cost_micros else 0
+            val = int(m.conversions_value) if m.conversions_value else 0
+            return conv, cost, val
+
+        rows_this = _run_query(q_this)
+        rows_prev = _run_query(q_prev)
+        rows_search = _run_query(q_search)
+
+        conv_this = cost_this = val_this = 0
+        for row in rows_this:
+            c, co, v = _sum_row(row)
+            conv_this += c
+            cost_this += co
+            val_this += v
+
+        conv_prev = cost_prev = val_prev = 0
+        for row in rows_prev:
+            c, co, v = _sum_row(row)
+            conv_prev += c
+            cost_prev += co
+            val_prev += v
+
+        conv_search = cost_search = val_search = 0
+        for row in rows_search:
+            c, co, v = _sum_row(row)
+            conv_search += c
+            cost_search += co
+            val_search += v
+
+        # ROAS = conversions_value / cost (both in micros → dimensionless)
+        avg_roas = (val_this / cost_this) if cost_this else 0.0
+        google_search_roas = (val_search / cost_search) if cost_search else 0.0
+        # Cost per customer in currency (cost_micros / 1e6 / conversions)
+        cost_per_customer = (cost_this / 1_000_000 / conv_this) if conv_this else 0.0
+        cost_per_customer_previous = (cost_prev / 1_000_000 / conv_prev) if conv_prev else 0.0
+
+        # Distinct campaigns with spend this month
+        rows_active = _run_query(q_active_campaigns)
+        active_campaign_ids: set[int] = set()
+        for row in rows_active:
+            if hasattr(row, "campaign") and row.campaign and row.campaign.id:
+                active_campaign_ids.add(int(row.campaign.id))
+        active_campaigns_count = len(active_campaign_ids)
+
+        return (
+            AdsMetrics(
+                new_customers_this_month=conv_this,
+                new_customers_previous_month=conv_prev,
+                avg_roas=round(avg_roas, 2),
+                google_search_roas=round(google_search_roas, 2),
+                cost_per_customer=round(cost_per_customer, 2),
+                cost_per_customer_previous=round(cost_per_customer_previous, 2),
+                active_campaigns_count=active_campaigns_count,
+            ),
+            None,
+            None,
+        )
+    except Exception as e:
+        logger.exception("[Google Ads] fetch_ads_metrics_for_user failed: %s", e)
+        err_msg = str(e).strip() or "Unknown error"
+        return (
+            None,
+            "api_error",
+            f"Google Ads API error: {err_msg}. Check that your account has access to Google Ads and try reconnecting in Integrations.",
+        )
+
+
+def fetch_ads_metrics_for_user(user_id: int) -> AdsMetrics | None:
+    """Convenience wrapper that returns only metrics or None (for callers that don't need reason)."""
+    metrics, _reason, _detail = fetch_ads_metrics_for_user_result(user_id)
+    return metrics
+
