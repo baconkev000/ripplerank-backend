@@ -65,24 +65,8 @@ SECURE_CONTENT_TYPE_NOSNIFF = env.bool(
 
 # STATIC & MEDIA
 # ------------------------
-STORAGES = {
-    "default": {
-        "BACKEND": "storages.backends.s3.S3Storage",
-        "OPTIONS": {
-            "location": "media",
-            "file_overwrite": False,
-        },
-    },
-    "staticfiles": {
-        "BACKEND": "storages.backends.s3.S3Storage",
-        "OPTIONS": {
-            "location": "static",
-            "default_acl": "public-read",
-        },
-    },
-}
-COLLECTFASTA_STRATEGY = "collectfasta.strategies.boto3.Boto3Strategy"
-
+# Using local filesystem storage (no S3). Static and media files are served from
+# STATIC_ROOT and MEDIA_ROOT as defined in base.py.
 # EMAIL
 # ------------------------------------------------------------------------------
 # https://docs.djangoproject.com/en/dev/ref/settings/#default-from-email
@@ -117,11 +101,6 @@ ANYMAIL = {
     "MAILGUN_SENDER_DOMAIN": env("MAILGUN_DOMAIN"),
     "MAILGUN_API_URL": env("MAILGUN_API_URL", default="https://api.mailgun.net/v3"),
 }
-
-# Collectfasta
-# ------------------------------------------------------------------------------
-# https://github.com/jasongi/collectfasta#installation
-INSTALLED_APPS = ["collectfasta", *INSTALLED_APPS]
 
 # LOGGING
 # ------------------------------------------------------------------------------
