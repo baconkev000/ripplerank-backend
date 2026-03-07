@@ -48,10 +48,15 @@ SECURE_SSL_REDIRECT = env.bool("DJANGO_SECURE_SSL_REDIRECT", default=True)
 SESSION_COOKIE_SECURE = True
 # https://docs.djangoproject.com/en/dev/ref/settings/#session-cookie-name
 SESSION_COOKIE_NAME = "__Secure-sessionid"
+# Share session cookie with frontend (getswivl.ai) so /app sees auth after Google login.
+# Use a leading dot so cookie is sent to both api.getswivl.ai and getswivl.ai.
+SESSION_COOKIE_DOMAIN = env("SESSION_COOKIE_DOMAIN", default=".getswivl.ai")
 # https://docs.djangoproject.com/en/dev/ref/settings/#csrf-cookie-secure
 CSRF_COOKIE_SECURE = True
 # https://docs.djangoproject.com/en/dev/ref/settings/#csrf-cookie-name
 CSRF_COOKIE_NAME = "__Secure-csrftoken"
+# Share CSRF cookie with frontend for API requests from getswivl.ai to api.getswivl.ai.
+CSRF_COOKIE_DOMAIN = env("CSRF_COOKIE_DOMAIN", default=".getswivl.ai")
 # https://docs.djangoproject.com/en/dev/topics/security/#ssl-https
 # https://docs.djangoproject.com/en/dev/ref/settings/#secure-hsts-seconds
 # TODO: set this to 60 seconds first and then to 518400 once you prove the former works
