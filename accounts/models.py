@@ -219,6 +219,54 @@ class SEOOverviewSnapshot(models.Model):
         return f"SEOOverviewSnapshot(user={self.user!s}, period_start={self.period_start})"
 
 
+class OnPageAuditSnapshot(models.Model):
+    """
+    Cached On-Page / Technical SEO audit metrics per user & domain.
+    Used to avoid running the DataForSEO On-Page crawler more than once
+    every 24 hours for the same site.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="onpage_audit_snapshots",
+    )
+    domain = models.CharField(max_length=255)
+    last_fetched_at = models.DateTimeField(auto_now=True)
+
+    # Raw counts
+    pages_missing_titles = models.IntegerField(default=0)
+    pages_missing_descriptions = models.IntegerField(default=0)
+    pages_bad_h1 = models.IntegerField(default=0)
+    images_missing_alt = models.IntegerField(default=0)
+    broken_internal_links = models.IntegerField(default=0)
+    error_pages_4xx_5xx = models.IntegerField(default=0)
+    pages_missing_canonical = models.IntegerField(default=0)
+    duplicate_canonical_targets = models.IntegerField(default=0)
+    has_robots_txt = models.BooleanField(default=False)
+    has_sitemap_xml = models.BooleanField(default=False)
+
+    # Scores
+    metadata_score = models.IntegerField(default=0)
+    content_structure_score = models.IntegerField(default=0)
+    accessibility_score = models.IntegerField(default=0)
+    internal_link_score = models.IntegerField(default=0)
+    indexability_score = models.IntegerField(default=0)
+    onpage_seo_score = models.IntegerField(default=0)
+    technical_seo_score = models.IntegerField(default=0)
+
+    # Human-readable summaries for dashboard display
+    issue_summaries = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        unique_together = ("user", "domain")
+        verbose_name = "On-page audit snapshot"
+        verbose_name_plural = "On-page audit snapshots"
+
+    def __str__(self) -> str:
+        return f"OnPageAuditSnapshot(user={self.user!s}, domain={self.domain})"
+
+
 class ReviewsOverviewSnapshot(models.Model):
     """
     Cached reviews/GBP overview metrics per user (star rating, total reviews, response rate, etc.).

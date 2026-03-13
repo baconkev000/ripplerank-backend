@@ -17,7 +17,8 @@ from urllib.parse import urlparse
 import requests
 from django.conf import settings
 
-from .models import SEOOverviewSnapshot
+from .models import SEOOverviewSnapshot, OnPageAuditSnapshot
+from .onpage_audit import run_onpage_audit_for_user
 
 logger = logging.getLogger(__name__)
 
@@ -436,11 +437,18 @@ def get_or_refresh_seo_score_for_user(
 ) -> Dict[str, Any] | None:
     """
     Fetch a cached, professional-grade SEO score + core metrics for the given user,
-    refreshing from DataForSEO at most once per hour (same cadence as the dashboard).
+    refreshing from DataForSEO at most once per hour (same cadence as the dashboard)
+    and combining:
+    - Search Performance (ranked_keywords + competitors)
+    - On-Page SEO (metadata, headings, alt text)
+    - Technical SEO (links, canonical, robots, sitemap)
 
-    Returns a dict with:
-    - seo_score (0–100)
-    - organic_visitors (visibility proxy)
+    Returns a dict with at least:
+    - seo_score (Overall SEO Score 0–100)
+    - search_performance_score
+    - onpage_seo_score
+    - technical_seo_score
+    - organic_visitors (estimated traffic)
     - keywords_ranking
     - top3_positions
     or None if no website is configured / domain cannot be derived.
@@ -511,8 +519,21 @@ def get_or_refresh_seo_score_for_user(
             avg_keyword_difficulty=None,
             competitor_avg_traffic=0.0,
         )
+        # No search performance data; still try to attach on-page snapshot if available.
+        search_performance_score = seo_score
+        onpage_snapshot = run_onpage_audit_for_user(user, site_url)
+        onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
+        technical_score = onpage_snapshot.technical_seo_score if onpage_snapshot else 0
+        overall = int(round(
+            search_performance_score * 0.5
+            + onpage_score * 0.3
+            + technical_score * 0.2
+        ))
         return {
-            "seo_score": seo_score,
+            "seo_score": overall,
+            "search_performance_score": search_performance_score,
+            "onpage_seo_score": onpage_score,
+            "technical_seo_score": technical_score,
             "organic_visitors": 0,
             "keywords_ranking": 0,
             "top3_positions": 0,
@@ -540,8 +561,20 @@ def get_or_refresh_seo_score_for_user(
             avg_keyword_difficulty=None,
             competitor_avg_traffic=0.0,
         )
+        search_performance_score = seo_score
+        onpage_snapshot = run_onpage_audit_for_user(user, site_url)
+        onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
+        technical_score = onpage_snapshot.technical_seo_score if onpage_snapshot else 0
+        overall = int(round(
+            search_performance_score * 0.5
+            + onpage_score * 0.3
+            + technical_score * 0.2
+        ))
         return {
-            "seo_score": seo_score,
+            "seo_score": overall,
+            "search_performance_score": search_performance_score,
+            "onpage_seo_score": onpage_score,
+            "technical_seo_score": technical_score,
             "organic_visitors": 0,
             "keywords_ranking": 0,
             "top3_positions": 0,
@@ -610,7 +643,7 @@ def get_or_refresh_seo_score_for_user(
         # If snapshot persistence fails, still return the live metrics.
         pass
 
-    seo_score = compute_professional_seo_score(
+    search_performance_score = compute_professional_seo_score(
         estimated_traffic=estimated_traffic,
         keywords_count=keywords_ranking,
         top3_positions=top3_positions,
@@ -619,8 +652,22 @@ def get_or_refresh_seo_score_for_user(
         competitor_avg_traffic=competitor_avg_traffic,
     )
 
+    # Attach On-Page / Technical SEO scores via OnPageAuditSnapshot
+    onpage_snapshot = run_onpage_audit_for_user(user, site_url)
+    onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
+    technical_score = onpage_snapshot.technical_seo_score if onpage_snapshot else 0
+
+    overall = int(round(
+        search_performance_score * 0.5
+        + onpage_score * 0.3
+        + technical_score * 0.2
+    ))
+
     return {
-        "seo_score": seo_score,
+        "seo_score": overall,
+        "search_performance_score": search_performance_score,
+        "onpage_seo_score": onpage_score,
+        "technical_seo_score": technical_score,
         "organic_visitors": int(round(estimated_traffic)),
         "keywords_ranking": keywords_ranking,
         "top3_positions": top3_positions,
