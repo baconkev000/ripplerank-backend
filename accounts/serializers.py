@@ -26,6 +26,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "phone",
             "description",
             "website_url",
+            "plan",
             "created_at",
             "updated_at",
         ]

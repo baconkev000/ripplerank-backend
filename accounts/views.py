@@ -43,6 +43,8 @@ from .tiktok_ads_utils import get_tiktok_ads_status_for_user
 from .dataforseo_utils import (
     get_keyword_gap_keywords,
     get_ranked_keywords_visibility,
+    compute_professional_seo_score,
+    get_or_refresh_seo_score_for_user,
 )
 from . import openai_utils
 from . import debug_log as _debug
@@ -968,6 +970,15 @@ def seo_overview(request: HttpRequest) -> Response:
                     organic_growth_pct = 100.0 if organic_visitors > 0 else 0.0
                 else:
                     organic_growth_pct = ((organic_visitors - prev_clicks) / prev_clicks) * 100.0
+
+                seo_score = compute_professional_seo_score(
+                    estimated_traffic=organic_visitors,
+                    keywords_count=snapshot.keywords_ranking or 0,
+                    top3_positions=snapshot.top3_positions or 0,
+                    top10_positions=snapshot.top3_positions or 0,
+                    avg_keyword_difficulty=None,
+                    competitor_avg_traffic=0.0,
+                )
                 # #region agent log
                 _debug.log("views.py:seo_overview:cache_hit", "returning from snapshot cache", {"organic_visitors": organic_visitors, "last_fetched_at": str(snapshot.last_fetched_at), "cutoff": str(cutoff)}, "H2")
                 # #endregion
@@ -977,6 +988,7 @@ def seo_overview(request: HttpRequest) -> Response:
                         "keywords_ranking": snapshot.keywords_ranking or 0,
                         "top3_positions": snapshot.top3_positions or 0,
                         "organic_growth_pct": organic_growth_pct,
+                        "seo_score": seo_score,
                     },
                 )
         except SEOOverviewSnapshot.DoesNotExist:
@@ -1054,12 +1066,21 @@ def seo_overview(request: HttpRequest) -> Response:
             except SEOOverviewSnapshot.DoesNotExist:
                 prev_vis = 0
             organic_growth_pct = 0.0
+            seo_score = compute_professional_seo_score(
+                estimated_traffic=0.0,
+                keywords_count=0,
+                top3_positions=0,
+                top10_positions=0,
+                avg_keyword_difficulty=None,
+                competitor_avg_traffic=0.0,
+            )
             return Response(
                 {
                     "organic_visitors": 0,
                     "keywords_ranking": 0,
                     "top3_positions": 0,
                     "organic_growth_pct": organic_growth_pct,
+                    "seo_score": seo_score,
                 },
             )
 
@@ -1092,6 +1113,15 @@ def seo_overview(request: HttpRequest) -> Response:
         snapshot.top3_positions = top3_positions
         snapshot.save()
 
+        seo_score = compute_professional_seo_score(
+            estimated_traffic=current_visibility,
+            keywords_count=keywords_ranking,
+            top3_positions=top3_positions,
+            top10_positions=top3_positions,
+            avg_keyword_difficulty=None,
+            competitor_avg_traffic=0.0,
+        )
+
         return Response(
             {
                 # For backwards compatibility with the frontend naming, map current visibility
@@ -1100,6 +1130,7 @@ def seo_overview(request: HttpRequest) -> Response:
                 "keywords_ranking": keywords_ranking,
                 "top3_positions": top3_positions,
                 "organic_growth_pct": organic_growth_pct,
+                "seo_score": seo_score,
             },
         )
     except Exception as e:
@@ -1408,6 +1439,7 @@ def business_profile(request: HttpRequest) -> Response:
         return Response(serializer.data)
 
     # For PATCH/PUT, apply partial updates
+    old_site_url = profile.website_url
     serializer = BusinessProfileSerializer(
         profile,
         data=request.data,
@@ -1415,6 +1447,20 @@ def business_profile(request: HttpRequest) -> Response:
     )
     serializer.is_valid(raise_exception=True)
     serializer.save()
+
+    # If the website URL changed, proactively refresh the SEO score snapshot
+    # so that the frontend (and SEO agent) immediately see metrics for the new site.
+    new_site_url = serializer.instance.website_url
+    if new_site_url and new_site_url != old_site_url:
+        try:
+            get_or_refresh_seo_score_for_user(
+                request.user,
+                site_url=new_site_url,
+            )
+        except Exception:
+            # Never block profile saves on DataForSEO errors.
+            pass
+
     return Response(serializer.data)
 
 

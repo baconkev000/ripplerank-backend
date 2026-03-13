@@ -23,6 +23,9 @@ class BusinessProfile(models.Model):
     # Industry is intentionally a free-text field (no choices).
     industry = models.CharField(max_length=255, blank=True)
 
+    # Plan type for this business (free, pro, scale, etc.).
+    plan = models.CharField(max_length=64, blank=True)
+
     # Tone of voice for marketing/communications.
     tone_of_voice = models.CharField(max_length=64, blank=True)
 

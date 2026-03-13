@@ -11,9 +11,13 @@ Primary endpoints used:
 from typing import Any, Dict, List, Optional
 
 import logging
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import requests
 from django.conf import settings
+
+from .models import SEOOverviewSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -333,4 +337,292 @@ def get_keyword_gap_keywords(
         len(gap_keywords),
     )
     return gap_keywords
+
+
+def compute_professional_seo_score(
+    *,
+    estimated_traffic: float,
+    keywords_count: int,
+    top3_positions: int,
+    top10_positions: int,
+    avg_keyword_difficulty: Optional[float],
+    competitor_avg_traffic: float,
+) -> int:
+    """
+    Collapse core SEO metrics into a single 0–100 "professional grade" score using:
+    - estimated organic traffic (via CTR curve)
+    - keyword breadth
+    - ranking quality (share in top 3 / top 10)
+    - keyword difficulty strength
+    - competitive market share vs. top competitors
+
+    All components are soft-scaled so smaller sites can still make meaningful progress.
+    """
+    try:
+        traffic = max(float(estimated_traffic), 0.0)
+        k = max(int(keywords_count), 0)
+        t = max(int(top3_positions), 0)
+        t10 = max(int(top10_positions), 0)
+    except (TypeError, ValueError):
+        traffic, k, t, t10 = 0.0, 0, 0, 0
+
+    import math
+
+    # 1) Traffic visibility: log-scaled estimated organic traffic.
+    # 0 → 0, 100 → ~30, 1k → ~55, 10k → ~75, 100k → ~90, 1M+ → ~100
+    if traffic <= 0:
+        visibility_score = 0.0
+    else:
+        visibility_score = min(100.0, (math.log10(traffic + 10.0) / 6.0) * 100.0)
+
+    # 2) Keyword breadth: log-scaled number of ranking keywords.
+    # 1 → ~15, 10 → ~35, 100 → ~60, 1k → ~85, 10k → ~100
+    if k <= 0:
+        breadth_score = 0.0
+    else:
+        breadth_score = min(100.0, (math.log10(k + 1.0) / 4.0) * 100.0)
+
+    # 3) Ranking quality: combination of share in top 3 and share in top 10.
+    if k <= 0:
+        ranking_score = 0.0
+    else:
+        top3_share = min(t / k, 1.0)
+        top10_share = min(t10 / k, 1.0)
+        ranking_score = (top3_share * 0.7 + top10_share * 0.3) * 100.0
+
+    # 4) Keyword difficulty strength: reward sites ranking on harder keywords.
+    # We treat difficulty as 0–100 where higher means more competitive queries.
+    if avg_keyword_difficulty is None:
+        difficulty_score = 0.0
+    else:
+        d = max(0.0, min(100.0, float(avg_keyword_difficulty)))
+        # Slightly compress extremes so very hard portfolios don't instantly max out.
+        difficulty_score = 10.0 + (d * 0.8)
+        difficulty_score = max(0.0, min(100.0, difficulty_score))
+
+    # 5) Competitive market share: share of traffic vs. average competitor.
+    if traffic <= 0 or competitor_avg_traffic <= 0:
+        market_share_score = 0.0
+    else:
+        # ratio > 1 means above-average vs. top competitors.
+        ratio = traffic / max(competitor_avg_traffic, 1e-6)
+        # Soft saturation: 0.5 → ~33, 1 → ~66, 2 → ~85, 3+ → ~95
+        market_share_score = min(
+            95.0,
+            (math.log10(ratio + 1.0) / math.log10(4.0)) * 100.0,
+        )
+
+    # Weighted blend:
+    # - visibility: 40%
+    # - breadth: 20%
+    # - ranking quality: 15%
+    # - keyword difficulty: 15%
+    # - competitive strength: 10%
+    final = (
+        visibility_score * 0.40
+        + breadth_score * 0.20
+        + ranking_score * 0.15
+        + difficulty_score * 0.15
+        + market_share_score * 0.10
+    )
+
+    return max(0, min(100, int(round(final))))
+
+
+def get_or_refresh_seo_score_for_user(
+    user,
+    *,
+    site_url: str | None,
+) -> Dict[str, Any] | None:
+    """
+    Fetch a cached, professional-grade SEO score + core metrics for the given user,
+    refreshing from DataForSEO at most once per hour (same cadence as the dashboard).
+
+    Returns a dict with:
+    - seo_score (0–100)
+    - organic_visitors (visibility proxy)
+    - keywords_ranking
+    - top3_positions
+    or None if no website is configured / domain cannot be derived.
+    """
+    today = datetime.now(timezone.utc).date()
+    start_current = today.replace(day=1)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=1)
+
+    # 1) If we have a fresh snapshot, derive the score from it without hitting DataForSEO.
+    try:
+        snapshot = SEOOverviewSnapshot.objects.get(
+            user=user,
+            period_start=start_current,
+        )
+        if snapshot.last_fetched_at >= cutoff:
+            organic_visitors = snapshot.organic_visitors or 0
+            keywords_ranking = snapshot.keywords_ranking or 0
+            top3_positions = snapshot.top3_positions or 0
+            seo_score = compute_professional_seo_score(
+                estimated_traffic=organic_visitors,
+                keywords_count=keywords_ranking,
+                top3_positions=top3_positions,
+                top10_positions=top3_positions,  # best effort when we don't know top10
+                avg_keyword_difficulty=None,
+                competitor_avg_traffic=0.0,
+            )
+            return {
+                "seo_score": seo_score,
+                "organic_visitors": organic_visitors,
+                "keywords_ranking": keywords_ranking,
+                "top3_positions": top3_positions,
+            }
+    except SEOOverviewSnapshot.DoesNotExist:
+        snapshot = None
+
+    # 2) Otherwise, refresh from DataForSEO (same logic as seo_overview) and update snapshot.
+    if not site_url:
+        return None
+
+    parsed = urlparse(site_url)
+    domain = (parsed.netloc or parsed.path or "").lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    if not domain:
+        return None
+
+    location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
+    language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
+
+    # Call ranked_keywords/live with richer parsing for the scoring algorithm.
+    payload = [
+        {
+            "target": domain,
+            "location_code": int(location_code),
+            "language_code": language_code,
+            "limit": 100,
+        },
+    ]
+
+    ranked_data = _post("/v3/dataforseo_labs/google/ranked_keywords/live", payload)
+    if not ranked_data:
+        seo_score = compute_professional_seo_score(
+            estimated_traffic=0.0,
+            keywords_count=0,
+            top3_positions=0,
+            top10_positions=0,
+            avg_keyword_difficulty=None,
+            competitor_avg_traffic=0.0,
+        )
+        return {
+            "seo_score": seo_score,
+            "organic_visitors": 0,
+            "keywords_ranking": 0,
+            "top3_positions": 0,
+        }
+
+    try:
+        tasks = ranked_data.get("tasks") or []
+        if not tasks:
+            raise ValueError("no tasks")
+        task = tasks[0]
+        results = task.get("result") or []
+        if not results:
+            raise ValueError("no results")
+        result = results[0]
+        items = result.get("items") or []
+    except Exception:
+        items = []
+
+    if not items:
+        seo_score = compute_professional_seo_score(
+            estimated_traffic=0.0,
+            keywords_count=0,
+            top3_positions=0,
+            top10_positions=0,
+            avg_keyword_difficulty=None,
+            competitor_avg_traffic=0.0,
+        )
+        return {
+            "seo_score": seo_score,
+            "organic_visitors": 0,
+            "keywords_ranking": 0,
+            "top3_positions": 0,
+        }
+
+    # Derive metrics from ranked keyword items.
+    estimated_traffic = 0.0
+    keywords_ranking = len(items)
+    top3_positions = 0
+    top10_positions = 0
+    difficulties: List[float] = []
+
+    for item in items:
+        rank = item.get("rank_absolute") or item.get("rank_group")
+        try:
+            rank_int = int(rank) if rank is not None else None
+        except (TypeError, ValueError):
+            rank_int = None
+
+        kw_info = (item.get("keyword_data") or {}).get("keyword_info") or {}
+        search_volume = (
+            kw_info.get("search_volume")
+            or kw_info.get("search_volume_global")
+            or kw_info.get("sum_search_volume")
+            or item.get("search_volume")
+            or item.get("sum_search_volume")
+            or 0
+        )
+        try:
+            sv = float(search_volume)
+        except (TypeError, ValueError):
+            sv = 0.0
+
+        if rank_int is not None and rank_int > 0 and sv > 0:
+            ctr = _ctr_for_position(rank_int)
+            estimated_traffic += sv * ctr
+
+            if rank_int <= 3:
+                top3_positions += 1
+            if rank_int <= 10:
+                top10_positions += 1
+
+        diff = _extract_keyword_difficulty(kw_info)
+        if diff is not None:
+            difficulties.append(diff)
+
+    avg_difficulty = sum(difficulties) / len(difficulties) if difficulties else None
+
+    # Competitor baseline from competitors_domain/live
+    competitor_avg_traffic = _get_competitor_average_traffic(
+        domain,
+        location_code=location_code,
+        language_code=language_code,
+    )
+
+    try:
+        snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
+            user=user,
+            period_start=start_current,
+        )
+        snapshot.organic_visitors = int(round(estimated_traffic))
+        snapshot.keywords_ranking = keywords_ranking
+        snapshot.top3_positions = top3_positions
+        snapshot.save()
+    except Exception:
+        # If snapshot persistence fails, still return the live metrics.
+        pass
+
+    seo_score = compute_professional_seo_score(
+        estimated_traffic=estimated_traffic,
+        keywords_count=keywords_ranking,
+        top3_positions=top3_positions,
+        top10_positions=top10_positions,
+        avg_keyword_difficulty=avg_difficulty,
+        competitor_avg_traffic=competitor_avg_traffic,
+    )
+
+    return {
+        "seo_score": seo_score,
+        "organic_visitors": int(round(estimated_traffic)),
+        "keywords_ranking": keywords_ranking,
+        "top3_positions": top3_positions,
+    }
 

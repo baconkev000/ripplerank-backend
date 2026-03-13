@@ -19,6 +19,9 @@ from .models import (
     ReviewsConversation,
     ReviewsMessage,
 )
+from .dataforseo_utils import (
+    get_or_refresh_seo_score_for_user,
+)
 
 
 def build_seo_system_prompt(user, profile: BusinessProfile | None) -> str:
@@ -237,7 +240,28 @@ def seo_chat(request: HttpRequest) -> Response:
     recent_messages.reverse()  # oldest → newest
 
     profile = BusinessProfile.objects.filter(user=request.user).first()
-    system_prompt = build_seo_system_prompt(request.user, profile)
+
+    # Attach live, cached SEO score + core metrics so the agent can reason with them.
+    seo_score_block = ""
+    try:
+        seo_score_data = get_or_refresh_seo_score_for_user(
+            request.user,
+            site_url=profile.website_url if profile and profile.website_url else None,
+        )
+        if seo_score_data is not None:
+            seo_score_block = (
+                "\n\nCurrent SEO metrics (from DataForSEO, cached hourly): "
+                f"Overall SEO score: {seo_score_data['seo_score']}/100. "
+                f"Visibility index: {seo_score_data['organic_visitors']} (mapped from search volume). "
+                f"Ranking keywords: {seo_score_data['keywords_ranking']}. "
+                f"Top 3 positions: {seo_score_data['top3_positions']}. "
+                "Use these numbers when assessing SEO health, prioritizing work, and explaining tradeoffs."
+            )
+    except Exception:
+        # Never break chat if the scoring helper fails; just omit the block.
+        seo_score_block = ""
+
+    system_prompt = build_seo_system_prompt(request.user, profile) + seo_score_block
     assistant_reply = get_seo_chat_reply(
         system_prompt,
         recent_messages,
