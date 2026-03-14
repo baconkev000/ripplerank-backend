@@ -169,6 +169,70 @@ def summarize_seo_conversation(messages: list[AgentMessage]) -> str:
     return (completion.choices[0].message.content or "").strip()
 
 
+def generate_seo_keyword_candidates(
+    profile: BusinessProfile | None,
+    homepage_meta: str | None = None,
+) -> list[str]:
+    """
+    Ask OpenAI to generate 10–15 candidate SEO keyword phrases for the business.
+    Used by the keyword enrichment pipeline; output is validated via DataForSEO search volume.
+    Returns a list of phrases (2–4 words, search-intent, no explanations).
+    """
+    if not profile:
+        return []
+
+    parts: list[str] = []
+    if profile.business_name:
+        parts.append(f"Business name: {profile.business_name}.")
+    if profile.industry:
+        parts.append(f"Industry: {profile.industry}.")
+    if profile.description:
+        parts.append(f"Description: {profile.description}.")
+    if homepage_meta:
+        parts.append(f"Homepage meta/title: {homepage_meta}.")
+
+    if not parts:
+        return []
+
+    system = (
+        "You are an SEO expert. Generate 10–15 candidate keyword phrases that real users would type into Google "
+        "when looking for this business or its services. Rules: return ONLY search-intent phrases; 2–4 words per phrase; "
+        "no sentence fragments; no explanations; no generic phrases like 'best in area' or 'near me' unless clearly relevant; "
+        "no brand repetition unless the brand keyword is valuable; prefer transactional/commercial intent. "
+        "Output exactly one phrase per line, nothing else (no numbering, no bullets)."
+    )
+    user_content = "Generate 10–15 SEO keyword phrases for this business:\n\n" + "\n".join(parts)
+
+    try:
+        client = _get_client("OPEN_AI_SEO_API_KEY")
+        model = _get_model()
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+    except Exception:
+        return []
+
+    candidates: list[str] = []
+    for line in raw.splitlines():
+        phrase = line.strip()
+        # Strip leading numbers/bullets (e.g. "1. phrase" or "- phrase")
+        while phrase and phrase[0] in "0123456789.-) ":
+            phrase = phrase.lstrip("0123456789.-) ")
+        if not phrase or len(phrase) > 80:
+            continue
+        word_count = len(phrase.split())
+        if 2 <= word_count <= 4:
+            candidates.append(phrase)
+        elif word_count == 1 and len(phrase) >= 4:
+            candidates.append(phrase)
+    return candidates[:15]
+
+
 def summarize_reviews_conversation(messages: list[ReviewsMessage]) -> str:
     """
     Ask OpenAI to summarize a Reviews conversation into concise memory notes.

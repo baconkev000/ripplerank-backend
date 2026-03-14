@@ -24,6 +24,9 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     onpage_issue_summaries = serializers.SerializerMethodField()
     search_visibility_percent = serializers.SerializerMethodField()
     missed_searches_monthly = serializers.SerializerMethodField()
+    total_search_volume = serializers.SerializerMethodField()
+    organic_visitors = serializers.SerializerMethodField()
+    top_keywords = serializers.SerializerMethodField()
 
     class Meta:
         model = BusinessProfile
@@ -47,6 +50,9 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "onpage_issue_summaries",
             "search_visibility_percent",
             "missed_searches_monthly",
+            "total_search_volume",
+            "organic_visitors",
+            "top_keywords",
             "created_at",
             "updated_at",
         ]
@@ -161,3 +167,23 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             return None
         val = bundle.get("missed_searches_monthly")
         return int(val) if val is not None else None
+
+    def get_total_search_volume(self, obj: BusinessProfile) -> int | None:
+        bundle = self._get_seo_bundle(obj)
+        if not bundle:
+            return None
+        val = bundle.get("total_search_volume")
+        return int(val) if val is not None else None
+
+    def get_organic_visitors(self, obj: BusinessProfile) -> int | None:
+        bundle = self._get_seo_bundle(obj)
+        if not bundle:
+            return None
+        val = bundle.get("organic_visitors")
+        return int(val) if val is not None else None
+
+    def get_top_keywords(self, obj: BusinessProfile):
+        bundle = self._get_seo_bundle(obj)
+        if not bundle:
+            return []
+        return bundle.get("top_keywords") or []
