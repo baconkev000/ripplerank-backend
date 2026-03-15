@@ -949,6 +949,47 @@ def get_or_refresh_seo_score_for_user(
         # #endregion
         return None
 
+    # Return cached keyword and search metrics if refreshed within the last hour and domain unchanged
+    now_utc = datetime.now(timezone.utc)
+    cache_ttl = timedelta(hours=1)
+    try:
+        snapshot = SEOOverviewSnapshot.objects.filter(
+            user=user,
+            period_start=start_current,
+        ).first()
+        if snapshot and snapshot.refreshed_at and snapshot.cached_domain:
+            age = now_utc - snapshot.refreshed_at
+            if age <= cache_ttl and (snapshot.cached_domain or "").strip().lower() == domain:
+                # Use cached keywords and search metrics; still attach current on-page/technical
+                onpage_snapshot = run_onpage_audit_for_user(user, site_url)
+                onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
+                technical_score = onpage_snapshot.technical_seo_score if onpage_snapshot else 0
+                pages_audited = onpage_snapshot.pages_audited if onpage_snapshot else 0
+                onpage_issue_summaries = onpage_snapshot.issue_summaries if onpage_snapshot else {}
+                search_perf = snapshot.search_performance_score
+                if search_perf is None:
+                    search_perf = 0
+                overall = int(round(
+                    search_perf * 0.5 + onpage_score * 0.3 + technical_score * 0.2
+                ))
+                return {
+                    "seo_score": overall,
+                    "search_performance_score": search_perf,
+                    "onpage_seo_score": onpage_score,
+                    "technical_seo_score": technical_score,
+                    "pages_audited": pages_audited,
+                    "onpage_issue_summaries": onpage_issue_summaries,
+                    "organic_visitors": snapshot.organic_visitors,
+                    "total_search_volume": getattr(snapshot, "total_search_volume", 0) or 0,
+                    "keywords_ranking": snapshot.keywords_ranking,
+                    "top3_positions": snapshot.top3_positions,
+                    "search_visibility_percent": getattr(snapshot, "search_visibility_percent", 0) or 0,
+                    "missed_searches_monthly": getattr(snapshot, "missed_searches_monthly", 0) or 0,
+                    "top_keywords": getattr(snapshot, "top_keywords", None) or [],
+                }
+    except Exception:
+        logger.exception("[SEO score] Error reading keyword cache for user_id=%s", getattr(user, "id", None))
+
     location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
     language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
 
@@ -1311,19 +1352,6 @@ def get_or_refresh_seo_score_for_user(
         language_code=language_code,
     )
 
-    try:
-        snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
-            user=user,
-            period_start=start_current,
-        )
-        snapshot.organic_visitors = int(round(estimated_traffic))
-        snapshot.keywords_ranking = keywords_ranking
-        snapshot.top3_positions = top3_positions
-        snapshot.save()
-    except Exception:
-        # If snapshot persistence fails, still return the live metrics.
-        pass
-
     search_performance_score = compute_professional_seo_score(
         estimated_traffic=estimated_traffic,
         keywords_count=keywords_ranking,
@@ -1332,6 +1360,26 @@ def get_or_refresh_seo_score_for_user(
         avg_keyword_difficulty=avg_difficulty,
         competitor_avg_traffic=competitor_avg_traffic,
     )
+
+    # Persist keyword list and search metrics so they are not repopulated on every request
+    try:
+        snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
+            user=user,
+            period_start=start_current,
+        )
+        snapshot.organic_visitors = int(round(estimated_traffic))
+        snapshot.keywords_ranking = keywords_ranking
+        snapshot.top3_positions = top3_positions
+        snapshot.refreshed_at = now_utc
+        snapshot.cached_domain = domain
+        snapshot.top_keywords = top_keywords_sorted
+        snapshot.total_search_volume = int(round(total_search_volume))
+        snapshot.missed_searches_monthly = missed_searches_monthly
+        snapshot.search_visibility_percent = search_visibility_percent
+        snapshot.search_performance_score = int(round(search_performance_score))
+        snapshot.save()
+    except Exception:
+        logger.exception("[SEO score] Failed to save keyword cache for user_id=%s", getattr(user, "id", None))
 
     # Attach On-Page / Technical SEO scores via OnPageAuditSnapshot
     onpage_snapshot = run_onpage_audit_for_user(user, site_url)

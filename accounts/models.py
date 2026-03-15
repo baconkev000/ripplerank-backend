@@ -195,6 +195,8 @@ class SEOOverviewSnapshot(models.Model):
     """
     Stores monthly SEO overview metrics for a user
     (first day of the month + last time data was fetched).
+    Keyword list and search metrics are cached and only refreshed once per hour
+    or when the user changes their business profile website URL (domain).
     """
 
     user = models.ForeignKey(
@@ -209,6 +211,15 @@ class SEOOverviewSnapshot(models.Model):
     prev_organic_visitors = models.IntegerField(default=0)
     keywords_ranking = models.IntegerField(default=0)
     top3_positions = models.IntegerField(default=0)
+
+    # Cache for keyword list and search metrics; refreshed at most once per hour or when URL changes
+    refreshed_at = models.DateTimeField(null=True, blank=True)
+    cached_domain = models.CharField(max_length=255, blank=True)
+    top_keywords = models.JSONField(default=list, blank=True)
+    total_search_volume = models.IntegerField(default=0)
+    missed_searches_monthly = models.IntegerField(default=0)
+    search_visibility_percent = models.IntegerField(default=0)
+    search_performance_score = models.IntegerField(null=True, blank=True)
 
     class Meta:
         unique_together = ("user", "period_start")
