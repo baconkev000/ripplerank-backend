@@ -884,117 +884,61 @@ def compute_professional_seo_score(
     return max(0, min(100, int(round(final))))
 
 
-def get_or_refresh_seo_score_for_user(
-    user,
-    *,
-    site_url: str | None,
-) -> Dict[str, Any] | None:
-    """
-    Fetch a cached, professional-grade SEO score + core metrics for the given user,
-    refreshing from DataForSEO at most once per hour (same cadence as the dashboard)
-    and combining:
-    - Search Performance (ranked_keywords + competitors)
-    - On-Page SEO (metadata, headings, alt text)
-    - Technical SEO (links, canonical, robots, sitemap)
+# -----------------------------------------------------------------------------
+# SEO pipeline helpers (orchestration only in get_or_refresh_seo_score_for_user)
+# -----------------------------------------------------------------------------
 
-    Returns a dict with at least:
-    - seo_score (Overall SEO Score 0–100)
-    - search_performance_score
-    - onpage_seo_score
-    - technical_seo_score
-    - organic_visitors (estimated traffic)
-    - keywords_ranking
-    - top3_positions
-    or None if no website is configured / domain cannot be derived.
-    """
-    today = datetime.now(timezone.utc).date()
-    start_current = today.replace(day=1)
-    if not site_url:
-        # #region agent log
-        try:
-            with open(DEBUG_LOG_PATH, "a") as f:
-                f.write(json.dumps({
-                    "sessionId": "098bfd",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H2",
-                    "location": "accounts/dataforseo_utils.py:get_or_refresh_seo_score_for_user",
-                    "message": "No site_url; skipping SEO score calculation",
-                    "data": {"user_id": getattr(user, "id", None)},
-                    "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                }) + "\n")
-        except Exception:
-            pass
-        # #endregion
+
+def normalize_domain(site_url: Optional[str]) -> Optional[str]:
+    """Extract and normalize domain from site_url; strip www. Return None if empty."""
+    if not site_url or not str(site_url).strip():
         return None
-
     parsed = urlparse(site_url)
-    domain = (parsed.netloc or parsed.path or "").lower()
+    domain = (parsed.netloc or parsed.path or "").strip().lower()
     if domain.startswith("www."):
         domain = domain[4:]
-    if not domain:
-        # #region agent log
-        try:
-            with open(DEBUG_LOG_PATH, "a") as f:
-                f.write(json.dumps({
-                    "sessionId": "098bfd",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H2",
-                    "location": "accounts/dataforseo_utils.py:get_or_refresh_seo_score_for_user",
-                    "message": "Could not normalise domain from site_url",
-                    "data": {"user_id": getattr(user, "id", None), "site_url": site_url},
-                    "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-                }) + "\n")
-        except Exception:
-            pass
-        # #endregion
-        return None
+    return domain if domain else None
 
-    # Return cached keyword and search metrics if refreshed within the last hour and domain unchanged
-    now_utc = datetime.now(timezone.utc)
-    cache_ttl = timedelta(hours=1)
+
+def get_cached_seo_snapshot(
+    user,
+    domain: str,
+    period_start,
+    cache_ttl: timedelta,
+    now_utc: datetime,
+) -> Optional[Any]:
+    """
+    Return a fresh SEOOverviewSnapshot for this user/period if cache is valid
+    (refreshed within cache_ttl and cached_domain matches). Otherwise return None.
+    """
     try:
         snapshot = SEOOverviewSnapshot.objects.filter(
             user=user,
-            period_start=start_current,
+            period_start=period_start,
         ).first()
-        if snapshot and snapshot.refreshed_at and snapshot.cached_domain:
-            age = now_utc - snapshot.refreshed_at
-            if age <= cache_ttl and (snapshot.cached_domain or "").strip().lower() == domain:
-                # Use cached keywords and search metrics; still attach current on-page/technical
-                onpage_snapshot = run_onpage_audit_for_user(user, site_url)
-                onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
-                technical_score = onpage_snapshot.technical_seo_score if onpage_snapshot else 0
-                pages_audited = onpage_snapshot.pages_audited if onpage_snapshot else 0
-                onpage_issue_summaries = onpage_snapshot.issue_summaries if onpage_snapshot else {}
-                search_perf = snapshot.search_performance_score
-                if search_perf is None:
-                    search_perf = 0
-                overall = int(round(
-                    search_perf * 0.5 + onpage_score * 0.3 + technical_score * 0.2
-                ))
-                return {
-                    "seo_score": overall,
-                    "search_performance_score": search_perf,
-                    "onpage_seo_score": onpage_score,
-                    "technical_seo_score": technical_score,
-                    "pages_audited": pages_audited,
-                    "onpage_issue_summaries": onpage_issue_summaries,
-                    "organic_visitors": snapshot.organic_visitors,
-                    "total_search_volume": getattr(snapshot, "total_search_volume", 0) or 0,
-                    "keywords_ranking": snapshot.keywords_ranking,
-                    "top3_positions": snapshot.top3_positions,
-                    "search_visibility_percent": getattr(snapshot, "search_visibility_percent", 0) or 0,
-                    "missed_searches_monthly": getattr(snapshot, "missed_searches_monthly", 0) or 0,
-                    "top_keywords": getattr(snapshot, "top_keywords", None) or [],
-                    "seo_next_steps": getattr(snapshot, "seo_next_steps", None) or [],
-                }
+        if not snapshot or not snapshot.refreshed_at or not snapshot.cached_domain:
+            return None
+        age = now_utc - snapshot.refreshed_at
+        if age > cache_ttl:
+            return None
+        if (snapshot.cached_domain or "").strip().lower() != domain:
+            return None
+        return snapshot
     except Exception:
         logger.exception("[SEO score] Error reading keyword cache for user_id=%s", getattr(user, "id", None))
+        return None
 
-    location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
-    language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
 
-    # Call ranked_keywords/live with richer parsing for the scoring algorithm.
+def fetch_ranked_keyword_items(
+    domain: str,
+    location_code: int,
+    language_code: str,
+    user=None,
+) -> List[Dict[str, Any]]:
+    """
+    Call DataForSEO ranked_keywords/live and return parsed items list.
+    Returns [] on any failure. Logs request and first-item preview.
+    """
     payload = [
         {
             "target": domain,
@@ -1003,7 +947,6 @@ def get_or_refresh_seo_score_for_user(
             "limit": 100,
         },
     ]
-
     logger.info(
         "[SEO score] ranked_keywords request user_id=%s domain=%s payload=%s",
         getattr(user, "id", None),
@@ -1017,54 +960,20 @@ def get_or_refresh_seo_score_for_user(
             getattr(user, "id", None),
             domain,
         )
-        seo_score = compute_professional_seo_score(
-            estimated_traffic=0.0,
-            keywords_count=0,
-            top3_positions=0,
-            top10_positions=0,
-            avg_keyword_difficulty=None,
-            competitor_avg_traffic=0.0,
-        )
-        # No search performance data; still try to attach on-page snapshot if available.
-        search_performance_score = seo_score
-        onpage_snapshot = run_onpage_audit_for_user(user, site_url)
-        onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
-        technical_score = onpage_snapshot.technical_seo_score if onpage_snapshot else 0
-        overall = int(round(
-            search_performance_score * 0.5
-            + onpage_score * 0.3
-            + technical_score * 0.2
-        ))
-        # #region agent log
         try:
             with open(DEBUG_LOG_PATH, "a") as f:
                 f.write(json.dumps({
                     "sessionId": "098bfd",
                     "runId": "pre-fix",
                     "hypothesisId": "H3",
-                    "location": "accounts/dataforseo_utils.py:get_or_refresh_seo_score_for_user",
+                    "location": "accounts/dataforseo_utils.py:fetch_ranked_keyword_items",
                     "message": "No ranked_data; using fallback SEO score",
-                    "data": {"user_id": getattr(user, "id", None), "domain": domain, "seo_score": seo_score},
+                    "data": {"user_id": getattr(user, "id", None), "domain": domain},
                     "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
                 }) + "\n")
         except Exception:
             pass
-        # #endregion
-        return {
-            "seo_score": overall,
-            "search_performance_score": search_performance_score,
-            "onpage_seo_score": onpage_score,
-            "technical_seo_score": technical_score,
-            "organic_visitors": 0,
-            "total_search_volume": 0,
-            "keywords_ranking": 0,
-            "top3_positions": 0,
-            "search_visibility_percent": 0,
-            "missed_searches_monthly": 0,
-            "top_keywords": [],
-            "seo_next_steps": [],
-        }
-
+        return []
     try:
         tasks = ranked_data.get("tasks") or []
         if not tasks:
@@ -1082,7 +991,6 @@ def get_or_refresh_seo_score_for_user(
             task.get("status_code"),
             len(items),
         )
-        # Log a small preview of the first item for debugging (no PII or secrets).
         if items:
             preview = {
                 "rank_absolute": items[0].get("rank_absolute"),
@@ -1098,56 +1006,30 @@ def get_or_refresh_seo_score_for_user(
                 domain,
                 preview,
             )
+        return items
     except Exception as exc:
-        items = []
         logger.exception(
             "[SEO score] Error parsing ranked_keywords for user_id=%s domain=%s raw_preview=%s",
             getattr(user, "id", None),
             domain,
             str(ranked_data)[:200],
         )
+        return []
 
-    if not items:
-        seo_score = compute_professional_seo_score(
-            estimated_traffic=0.0,
-            keywords_count=0,
-            top3_positions=0,
-            top10_positions=0,
-            avg_keyword_difficulty=None,
-            competitor_avg_traffic=0.0,
-        )
-        search_performance_score = seo_score
-        onpage_snapshot = run_onpage_audit_for_user(user, site_url)
-        onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
-        technical_score = onpage_snapshot.technical_seo_score if onpage_snapshot else 0
-        overall = int(round(
-            search_performance_score * 0.5
-            + onpage_score * 0.3
-            + technical_score * 0.2
-        ))
-        return {
-            "seo_score": overall,
-            "search_performance_score": search_performance_score,
-            "onpage_seo_score": onpage_score,
-            "technical_seo_score": technical_score,
-            "organic_visitors": 0,
-            "total_search_volume": 0,
-            "keywords_ranking": 0,
-            "top3_positions": 0,
-            "search_visibility_percent": 0,
-            "missed_searches_monthly": 0,
-        }
 
-    # Derive metrics from ranked keyword items.
+def compute_ranked_metrics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    From ranked_keywords API items, compute estimated_traffic, keywords_ranking,
+    top3_positions, top10_positions, avg_difficulty, total_search_volume (items only),
+    and top_keywords list (ranked + unranked opportunities from items).
+    """
+    MIN_SEARCH_VOLUME = 10
     estimated_traffic = 0.0
     keywords_ranking = len(items)
     top3_positions = 0
     top10_positions = 0
     difficulties: List[float] = []
     total_search_volume = 0.0
-    total_traffic_share = 0.0
-    missed_searches_volume = 0.0
-    MIN_SEARCH_VOLUME = 10
     top_keywords: List[Dict[str, Any]] = []
 
     for item in items:
@@ -1178,56 +1060,46 @@ def get_or_refresh_seo_score_for_user(
         keyword_text = keyword_data.get("keyword") or item.get("keyword")
         if keyword_text and sv > 0:
             if rank_int is not None and rank_int > 0:
-                # Existing ranked keyword — include as a concrete visibility signal.
                 top_keywords.append(
-                    {
-                        "keyword": str(keyword_text),
-                        "search_volume": int(sv),
-                        "rank": int(rank_int),
-                    }
+                    {"keyword": str(keyword_text), "search_volume": int(sv), "rank": int(rank_int)}
                 )
             elif rank_int is None and sv >= MIN_SEARCH_VOLUME:
-                # New / unranked keyword with meaningful volume — treat as opportunity.
                 top_keywords.append(
-                    {
-                        "keyword": str(keyword_text),
-                        "search_volume": int(sv),
-                        "rank": None,
-                    }
+                    {"keyword": str(keyword_text), "search_volume": int(sv), "rank": None}
                 )
-
-        traffic_share_raw = item.get("traffic_share")
-        try:
-            traffic_share = float(traffic_share_raw) if traffic_share_raw is not None else 0.0
-        except (TypeError, ValueError):
-            traffic_share = 0.0
-        if traffic_share > 0:
-            total_traffic_share += traffic_share
 
         if rank_int is not None and rank_int > 0 and sv > 0:
             ctr = _ctr_for_position(rank_int)
             estimated_traffic += sv * ctr
-
             if rank_int <= 3:
                 top3_positions += 1
             if rank_int <= 10:
                 top10_positions += 1
-
-        # Missed searches: keywords where we're effectively not capturing traffic yet:
-        # - position is > 10, or no traffic_share, with sufficient volume.
-        if (
-            sv >= MIN_SEARCH_VOLUME
-            and (rank_int is None or rank_int > 10 or traffic_share <= 0.0)
-        ):
-            missed_searches_volume += sv
 
         diff = _extract_keyword_difficulty(kw_info)
         if diff is not None:
             difficulties.append(diff)
 
     avg_difficulty = sum(difficulties) / len(difficulties) if difficulties else None
+    return {
+        "estimated_traffic": estimated_traffic,
+        "keywords_ranking": keywords_ranking,
+        "top3_positions": top3_positions,
+        "top10_positions": top10_positions,
+        "avg_difficulty": avg_difficulty,
+        "total_search_volume": total_search_volume,
+        "top_keywords": top_keywords,
+    }
 
-    # --- Identify 3–5 main competitors in the same niche (avoid broad local dirs for non-local businesses) ---
+
+def enrich_with_gap_keywords(
+    domain: str,
+    location_code: int,
+    language_code: str,
+    user,
+    top_keywords: List[Dict[str, Any]],
+) -> None:
+    """Append gap keywords (vs competitors) to top_keywords in place. Preserves logging on error."""
     competitor_domains = _get_competitor_domains(
         domain,
         location_code=location_code,
@@ -1249,62 +1121,68 @@ def get_or_refresh_seo_score_for_user(
 
     existing_keys = {str(k.get("keyword", "")).lower() for k in top_keywords if k.get("keyword")}
 
-    if competitor_domains:
-        try:
-            gap_items = get_keyword_gap_keywords(
-                domain,
-                competitor_domains,
-                location_code=location_code,
-                language_code=language_code,
-                limit=50,
-            )
-            for item in gap_items:
-                kw = item.get("keyword")
-                if not kw:
-                    continue
-                key_lower = str(kw).lower()
-                if key_lower in existing_keys:
-                    continue
-                sv_gap = item.get("search_volume") or 0
-                try:
-                    sv_gap_f = float(sv_gap)
-                except (TypeError, ValueError):
-                    sv_gap_f = 0.0
-                if sv_gap_f <= 0:
-                    continue
-                top_keywords.append(
-                    {
-                        "keyword": str(kw),
-                        "search_volume": int(sv_gap_f),
-                        "rank": None,
-                    }
-                )
-                existing_keys.add(key_lower)
-        except Exception:
-            logger.exception(
-                "[SEO score] Error while enriching top_keywords with gap keywords for domain=%s",
-                domain,
-            )
-
-    # --- Validated LLM-generated seed keywords (after ranked + gap; no fixed seed data) ---
+    if not competitor_domains:
+        return
     try:
-        homepage_meta: Optional[str] = None
-        try:
-            if _profile and getattr(_profile, "website_url", None):
-                pass  # Optional: fetch homepage title/meta for LLM context
-        except Exception:
-            pass
-        llm_candidates = _get_llm_keyword_candidates(_profile, homepage_meta)
+        gap_items = get_keyword_gap_keywords(
+            domain,
+            competitor_domains,
+            location_code=location_code,
+            language_code=language_code,
+            limit=50,
+        )
+        for item in gap_items:
+            kw = item.get("keyword")
+            if not kw:
+                continue
+            key_lower = str(kw).lower()
+            if key_lower in existing_keys:
+                continue
+            sv_gap = item.get("search_volume") or 0
+            try:
+                sv_gap_f = float(sv_gap)
+            except (TypeError, ValueError):
+                sv_gap_f = 0.0
+            if sv_gap_f <= 0:
+                continue
+            top_keywords.append(
+                {"keyword": str(kw), "search_volume": int(sv_gap_f), "rank": None}
+            )
+            existing_keys.add(key_lower)
+    except Exception:
+        logger.exception(
+            "[SEO score] Error while enriching top_keywords with gap keywords for domain=%s",
+            domain,
+        )
 
+
+def enrich_with_llm_keywords(
+    user,
+    location_code: int,
+    top_keywords: List[Dict[str, Any]],
+) -> None:
+    """Append validated LLM seed keywords to top_keywords in place. Preserves logging on error."""
+    existing_keys = {str(k.get("keyword", "")).lower() for k in top_keywords if k.get("keyword")}
+    try:
+        _profile = BusinessProfile.objects.filter(user=user).first()
+    except Exception:
+        _profile = None
+    homepage_meta: Optional[str] = None
+    try:
+        if _profile and getattr(_profile, "website_url", None):
+            pass
+    except Exception:
+        pass
+    try:
+        llm_candidates = _get_llm_keyword_candidates(_profile, homepage_meta)
         filtered_candidates: List[str] = []
-        for phrase in llm_candidates:
+        for phrase in (llm_candidates or []):
             p = (phrase or "").strip()[:50]
             if not p or p.lower() in existing_keys:
                 continue
             if not _is_search_like(p, allow_one_stopword=True):
                 continue
             filtered_candidates.append(p)
-
         if filtered_candidates:
             volumes = _get_search_volumes_for_keywords(filtered_candidates, location_code)
             for phrase in filtered_candidates:
@@ -1314,9 +1192,7 @@ def get_or_refresh_seo_score_for_user(
                     continue
                 if key_lower in existing_keys:
                     continue
-                top_keywords.append(
-                    {"keyword": phrase, "search_volume": int(vol), "rank": None}
-                )
+                top_keywords.append({"keyword": phrase, "search_volume": int(vol), "rank": None})
                 existing_keys.add(key_lower)
     except Exception:
         logger.exception(
@@ -1324,36 +1200,36 @@ def get_or_refresh_seo_score_for_user(
             getattr(user, "id", None),
         )
 
-    # Sort and keep a compact list of top keywords by volume for the UI.
-    top_keywords_sorted = sorted(
-        top_keywords,
-        key=lambda x: x.get("search_volume", 0),
-        reverse=True,
-    )[:20]
 
-    # Total search volume across the full keyword set (ranked + gap + seed) so missed_searches
-    # and visibility reflect all opportunity keywords we show, not just the API-ranked set.
+def compute_visibility_metrics(
+    top_keywords_sorted: List[Dict[str, Any]],
+    estimated_traffic: float,
+    keywords_ranking: int,
+    top3_positions: int,
+    top10_positions: int,
+    avg_difficulty: Optional[float],
+    domain: str,
+    location_code: int,
+    language_code: str,
+) -> Dict[str, Any]:
+    """
+    From combined top_keywords and ranked metrics, compute total_search_volume (from keywords),
+    search_visibility_percent, missed_searches_monthly, and search_performance_score.
+    """
     total_search_volume = sum(k.get("search_volume", 0) for k in top_keywords_sorted)
-
-    # Search visibility: (estimated_traffic / total_search_volume) * 100, capped 0–100%
     if total_search_volume > 0:
         search_visibility_percent = int(round(
             max(0.0, min(100.0, (estimated_traffic / total_search_volume) * 100.0))
         ))
     else:
         search_visibility_percent = 0
-
-    # Missed searches = total_search_volume - estimated_traffic; includes volume from
-    # gap and seed keywords (rank None or >10) so the number matches the keyword list.
     missed_searches_monthly = int(round(max(0.0, total_search_volume - estimated_traffic)))
 
-    # Competitor baseline from competitors_domain/live
     competitor_avg_traffic = _get_competitor_average_traffic(
         domain,
         location_code=location_code,
         language_code=language_code,
     )
-
     search_performance_score = compute_professional_seo_score(
         estimated_traffic=estimated_traffic,
         keywords_count=keywords_ranking,
@@ -1362,63 +1238,62 @@ def get_or_refresh_seo_score_for_user(
         avg_keyword_difficulty=avg_difficulty,
         competitor_avg_traffic=competitor_avg_traffic,
     )
+    return {
+        "total_search_volume": total_search_volume,
+        "search_visibility_percent": search_visibility_percent,
+        "missed_searches_monthly": missed_searches_monthly,
+        "search_performance_score": search_performance_score,
+    }
 
-    # Persist keyword list and search metrics so they are not repopulated on every request
+
+def save_seo_snapshot(
+    user,
+    period_start,
+    domain: str,
+    now_utc: datetime,
+    organic_visitors: int,
+    keywords_ranking: int,
+    top3_positions: int,
+    top_keywords_sorted: List[Dict[str, Any]],
+    total_search_volume: int,
+    missed_searches_monthly: int,
+    search_visibility_percent: int,
+    search_performance_score: int,
+) -> None:
+    """Persist keyword list and search metrics to SEOOverviewSnapshot. Logs on failure."""
     try:
         snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
             user=user,
-            period_start=start_current,
+            period_start=period_start,
         )
-        snapshot.organic_visitors = int(round(estimated_traffic))
-        snapshot.keywords_ranking = keywords_ranking
-        snapshot.top3_positions = top3_positions
+        snapshot.organic_visitors = int(organic_visitors or 0)
+        snapshot.keywords_ranking = int(keywords_ranking or 0)
+        snapshot.top3_positions = int(top3_positions or 0)
         snapshot.refreshed_at = now_utc
         snapshot.cached_domain = domain
         snapshot.top_keywords = top_keywords_sorted
-        snapshot.total_search_volume = int(round(total_search_volume))
-        snapshot.missed_searches_monthly = missed_searches_monthly
-        snapshot.search_visibility_percent = search_visibility_percent
-        snapshot.search_performance_score = int(round(search_performance_score))
+        snapshot.total_search_volume = int(total_search_volume or 0)
+        snapshot.missed_searches_monthly = int(missed_searches_monthly or 0)
+        snapshot.search_visibility_percent = int(search_visibility_percent or 0)
+        snapshot.search_performance_score = int(search_performance_score or 0)
         snapshot.save()
     except Exception:
         logger.exception("[SEO score] Failed to save keyword cache for user_id=%s", getattr(user, "id", None))
 
-    # Attach On-Page / Technical SEO scores via OnPageAuditSnapshot
-    onpage_snapshot = run_onpage_audit_for_user(user, site_url)
-    onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
-    technical_score = onpage_snapshot.technical_seo_score if onpage_snapshot else 0
-    pages_audited = onpage_snapshot.pages_audited if onpage_snapshot else 0
-    onpage_issue_summaries = onpage_snapshot.issue_summaries if onpage_snapshot else {}
 
-    overall = int(round(
-        search_performance_score * 0.5
-        + onpage_score * 0.3
-        + technical_score * 0.2
-    ))
-
-    result = {
-        "seo_score": overall,
-        "search_performance_score": search_performance_score,
-        "onpage_seo_score": onpage_score,
-        "technical_seo_score": technical_score,
-        "pages_audited": pages_audited,
-        "onpage_issue_summaries": onpage_issue_summaries,
-        "organic_visitors": int(round(estimated_traffic)),
-        "total_search_volume": int(round(total_search_volume)),
-        "keywords_ranking": keywords_ranking,
-        "top3_positions": top3_positions,
-        "search_visibility_percent": search_visibility_percent,
-        "missed_searches_monthly": missed_searches_monthly,
-        "top_keywords": top_keywords_sorted,
-    }
-
-    # Next steps: only regenerate at most once per week; otherwise reuse cached list
+def generate_or_get_next_steps(
+    user,
+    period_start,
+    result: Dict[str, Any],
+    now_utc: datetime,
+) -> None:
+    """Fill result['seo_next_steps'] from cache (if fresh) or OpenAI; save to snapshot. Mutates result."""
     steps_ttl = timedelta(days=7)
     snapshot_for_steps = SEOOverviewSnapshot.objects.filter(
         user=user,
-        period_start=start_current,
+        period_start=period_start,
     ).first()
-    cached_steps = []
+    cached_steps: List[Any] = []
     if snapshot_for_steps and getattr(snapshot_for_steps, "seo_next_steps_refreshed_at", None):
         refreshed_at = snapshot_for_steps.seo_next_steps_refreshed_at
         if refreshed_at and (now_utc - refreshed_at) <= steps_ttl:
@@ -1436,7 +1311,7 @@ def get_or_refresh_seo_score_for_user(
         try:
             snap, _ = SEOOverviewSnapshot.objects.get_or_create(
                 user=user,
-                period_start=start_current,
+                period_start=period_start,
             )
             snap.seo_next_steps = result.get("seo_next_steps") or []
             snap.seo_next_steps_refreshed_at = now_utc
@@ -1444,5 +1319,174 @@ def get_or_refresh_seo_score_for_user(
         except Exception:
             logger.exception("[SEO score] Failed to save seo_next_steps to snapshot for user_id=%s", getattr(user, "id", None))
 
+
+def build_seo_response(
+    *,
+    onpage_snapshot: Optional[Any],
+    search_performance_score: int,
+    organic_visitors: int,
+    total_search_volume: int,
+    keywords_ranking: int,
+    top3_positions: int,
+    search_visibility_percent: int,
+    missed_searches_monthly: int,
+    top_keywords: List[Dict[str, Any]],
+    seo_next_steps: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """Build the final API response dict from on-page snapshot and SEO metrics. Numeric safety: int(x or 0)."""
+    onpage_score = onpage_snapshot.onpage_seo_score if onpage_snapshot else 0
+    technical_score = onpage_snapshot.technical_seo_score if onpage_snapshot else 0
+    pages_audited = onpage_snapshot.pages_audited if onpage_snapshot else 0
+    onpage_issue_summaries = onpage_snapshot.issue_summaries if onpage_snapshot else {}
+    overall = int(round(
+        search_performance_score * 0.5 + onpage_score * 0.3 + technical_score * 0.2
+    ))
+    return {
+        "seo_score": overall,
+        "search_performance_score": int(search_performance_score or 0),
+        "onpage_seo_score": int(onpage_score or 0),
+        "technical_seo_score": int(technical_score or 0),
+        "pages_audited": int(pages_audited or 0),
+        "onpage_issue_summaries": onpage_issue_summaries,
+        "organic_visitors": int(organic_visitors or 0),
+        "total_search_volume": int(total_search_volume or 0),
+        "keywords_ranking": int(keywords_ranking or 0),
+        "top3_positions": int(top3_positions or 0),
+        "search_visibility_percent": int(search_visibility_percent or 0),
+        "missed_searches_monthly": int(missed_searches_monthly or 0),
+        "top_keywords": top_keywords or [],
+        "seo_next_steps": seo_next_steps if seo_next_steps is not None else [],
+    }
+
+
+def _build_empty_seo_response(user, site_url: str) -> Dict[str, Any]:
+    """Build zeroed SEO response when no ranked data; attaches on-page snapshot."""
+    fallback_score = compute_professional_seo_score(
+        estimated_traffic=0.0, keywords_count=0, top3_positions=0, top10_positions=0,
+        avg_keyword_difficulty=None, competitor_avg_traffic=0.0,
+    )
+    onpage_snapshot = run_onpage_audit_for_user(user, site_url)
+    return build_seo_response(
+        onpage_snapshot=onpage_snapshot,
+        search_performance_score=fallback_score,
+        organic_visitors=0, total_search_volume=0, keywords_ranking=0, top3_positions=0,
+        search_visibility_percent=0, missed_searches_monthly=0, top_keywords=[], seo_next_steps=[],
+    )
+
+
+def _log_seo_skip_and_return_none(message: str, user, **data_extra: Any) -> None:
+    """Preserve agent debug log when skipping SEO score (no site_url or no domain)."""
+    try:
+        with open(DEBUG_LOG_PATH, "a") as f:
+            f.write(json.dumps({
+                "sessionId": "098bfd", "runId": "pre-fix", "hypothesisId": "H2",
+                "location": "accounts/dataforseo_utils.py:get_or_refresh_seo_score_for_user",
+                "message": message,
+                "data": {"user_id": getattr(user, "id", None), **data_extra},
+                "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+
+
+def get_or_refresh_seo_score_for_user(
+    user,
+    *,
+    site_url: str | None,
+) -> Dict[str, Any] | None:
+    """
+    Fetch a cached, professional-grade SEO score + core metrics for the given user,
+    refreshing from DataForSEO at most once per hour (same cadence as the dashboard)
+    and combining:
+    - Search Performance (ranked_keywords + competitors)
+    - On-Page SEO (metadata, headings, alt text)
+    - Technical SEO (links, canonical, robots, sitemap)
+
+    Returns a dict with at least:
+    - seo_score (Overall SEO Score 0–100)
+    - search_performance_score
+    - onpage_seo_score
+    - technical_seo_score
+    - organic_visitors (estimated traffic)
+    - keywords_ranking
+    - top3_positions
+    or None if no website is configured / domain cannot be derived.
+    """
+    today = datetime.now(timezone.utc).date()
+    start_current = today.replace(day=1)
+    now_utc = datetime.now(timezone.utc)
+    cache_ttl = timedelta(hours=1)
+    if not site_url:
+        _log_seo_skip_and_return_none("No site_url; skipping SEO score calculation", user)
+        return None
+    domain = normalize_domain(site_url)
+    if not domain:
+        _log_seo_skip_and_return_none("Could not normalise domain from site_url", user, site_url=site_url)
+        return None
+
+    snapshot = get_cached_seo_snapshot(user, domain, start_current, cache_ttl, now_utc)
+    if snapshot:
+        onpage_snapshot = run_onpage_audit_for_user(user, site_url)
+        return build_seo_response(
+            onpage_snapshot=onpage_snapshot,
+            search_performance_score=int(snapshot.search_performance_score or 0),
+            organic_visitors=int(snapshot.organic_visitors or 0),
+            total_search_volume=int(getattr(snapshot, "total_search_volume", 0) or 0),
+            keywords_ranking=int(snapshot.keywords_ranking or 0),
+            top3_positions=int(snapshot.top3_positions or 0),
+            search_visibility_percent=int(getattr(snapshot, "search_visibility_percent", 0) or 0),
+            missed_searches_monthly=int(getattr(snapshot, "missed_searches_monthly", 0) or 0),
+            top_keywords=getattr(snapshot, "top_keywords", None) or [],
+            seo_next_steps=getattr(snapshot, "seo_next_steps", None) or [],
+        )
+
+    location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
+    language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
+    items = fetch_ranked_keyword_items(domain, location_code, language_code, user)
+    if not items:
+        return _build_empty_seo_response(user, site_url)
+
+    metrics = compute_ranked_metrics(items)
+    enrich_with_gap_keywords(domain, location_code, language_code, user, metrics["top_keywords"])
+    enrich_with_llm_keywords(user, location_code, metrics["top_keywords"])
+    top_keywords_sorted = sorted(metrics["top_keywords"], key=lambda x: x.get("search_volume", 0), reverse=True)[:20]
+
+    visibility = compute_visibility_metrics(
+        top_keywords_sorted,
+        metrics["estimated_traffic"],
+        metrics["keywords_ranking"],
+        metrics["top3_positions"],
+        metrics["top10_positions"],
+        metrics["avg_difficulty"],
+        domain,
+        location_code,
+        language_code,
+    )
+
+    save_seo_snapshot(
+        user, start_current, domain, now_utc,
+        organic_visitors=int(round(metrics["estimated_traffic"]) or 0),
+        keywords_ranking=int(metrics["keywords_ranking"] or 0),
+        top3_positions=int(metrics["top3_positions"] or 0),
+        top_keywords_sorted=top_keywords_sorted,
+        total_search_volume=int(visibility["total_search_volume"] or 0),
+        missed_searches_monthly=int(visibility["missed_searches_monthly"] or 0),
+        search_visibility_percent=int(visibility["search_visibility_percent"] or 0),
+        search_performance_score=int(visibility["search_performance_score"] or 0),
+    )
+
+    onpage_snapshot = run_onpage_audit_for_user(user, site_url)
+    result = build_seo_response(
+        onpage_snapshot=onpage_snapshot,
+        search_performance_score=int(visibility["search_performance_score"] or 0),
+        organic_visitors=int(round(metrics["estimated_traffic"]) or 0),
+        total_search_volume=int(visibility["total_search_volume"] or 0),
+        keywords_ranking=int(metrics["keywords_ranking"] or 0),
+        top3_positions=int(metrics["top3_positions"] or 0),
+        search_visibility_percent=int(visibility["search_visibility_percent"] or 0),
+        missed_searches_monthly=int(visibility["missed_searches_monthly"] or 0),
+        top_keywords=top_keywords_sorted,
+    )
+    generate_or_get_next_steps(user, start_current, result, now_utc)
     return result
 
