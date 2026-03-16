@@ -91,6 +91,7 @@ urlpatterns += [
     path("api/business-profile/", accounts_views.business_profile, name="business-profile"),
     path("api/business-profiles/", accounts_views.business_profile_list, name="business-profile-list"),
     path("api/business-profiles/<int:pk>/", accounts_views.business_profile_detail, name="business-profile-detail"),
+    path("api/seo/refresh-next-steps/", accounts_views.refresh_seo_next_steps, name="seo-refresh-next-steps"),
     # Google Search Console integration status
     path("api/integrations/google-search-console/status/", accounts_views.gsc_status, name="gsc-status"),
     # Google Ads integration status

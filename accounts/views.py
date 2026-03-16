@@ -1521,6 +1521,103 @@ def business_profile_list(request: HttpRequest) -> Response:
 
 
 @csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def refresh_seo_next_steps(request: HttpRequest) -> Response:
+    """
+    Regenerate SEO next steps (\"Your action plan\" / \"Do these now\") for the current main business profile.
+
+    This:
+    - Resolves the user's main BusinessProfile (is_main=True, or first as fallback)
+    - Uses its website_url to identify the SEOOverviewSnapshot for the current month
+    - Recomputes seo_next_steps immediately (bypassing the usual 7-day TTL)
+    - Stores the new steps on the snapshot and updates BusinessProfile serialization
+    """
+    today = datetime.now(timezone.utc).date()
+    start_current = today.replace(day=1)
+    user = request.user
+
+    profile = (
+        BusinessProfile.objects.filter(user=user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=user).first()
+    )
+    if not profile or not profile.website_url:
+        return Response(
+            {"detail": "No main business profile with a website URL is configured."},
+            status=400,
+        )
+
+    site_url = profile.website_url
+    domain = normalize_domain(site_url)
+    if not domain:
+        return Response(
+            {"detail": "Could not determine domain from website URL."},
+            status=400,
+        )
+
+    try:
+        snapshot = SEOOverviewSnapshot.objects.filter(
+            user=user,
+            period_start=start_current,
+            cached_domain__iexact=domain,
+        ).first()
+    except Exception:
+        snapshot = None
+
+    if not snapshot:
+        # If we don't yet have a snapshot for this domain/period, trigger the main SEO score helper
+        # which will create one and enqueue enrichment tasks; then try again.
+        from .dataforseo_utils import get_or_refresh_seo_score_for_user
+
+        get_or_refresh_seo_score_for_user(user, site_url=site_url)
+        snapshot = SEOOverviewSnapshot.objects.filter(
+            user=user,
+            period_start=start_current,
+            cached_domain__iexact=domain,
+        ).first()
+
+    if not snapshot:
+        return Response(
+            {"detail": "SEO snapshot not available yet for this site. Try again in a few minutes."},
+            status=202,
+        )
+
+    # Build fresh seo_data for this snapshot and forcibly regenerate next steps.
+    from .openai_utils import generate_seo_next_steps
+
+    seo_data = {
+        "seo_score": int(snapshot.search_performance_score or 0),
+        "missed_searches_monthly": int(getattr(snapshot, "missed_searches_monthly", 0) or 0),
+        "organic_visitors": int(snapshot.organic_visitors or 0),
+        "total_search_volume": int(getattr(snapshot, "total_search_volume", 0) or 0),
+        "search_visibility_percent": int(getattr(snapshot, "search_visibility_percent", 0) or 0),
+        "top_keywords": getattr(snapshot, "top_keywords", None) or [],
+        "onpage_issue_summaries": {},
+        "business_name": getattr(profile, "business_name", "") or "",
+        "website_url": site_url,
+        "business_description": getattr(profile, "description", "") or "",
+    }
+
+    try:
+        steps = generate_seo_next_steps(seo_data)
+    except Exception:
+        return Response(
+            {"detail": "Failed to generate SEO next steps. Please try again later."},
+            status=500,
+        )
+
+    steps_list = list(steps)[:10] if steps else []
+    snapshot.seo_next_steps = steps_list
+    snapshot.seo_next_steps_refreshed_at = datetime.now(timezone.utc)
+    snapshot.save(update_fields=["seo_next_steps", "seo_next_steps_refreshed_at"])
+
+    # Return the updated main profile (serializer will now include fresh seo_next_steps)
+    serializer = BusinessProfileSerializer(profile)
+    return Response(serializer.data)
+
+
+@csrf_exempt
 @api_view(["GET", "PATCH", "PUT", "DELETE"])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
