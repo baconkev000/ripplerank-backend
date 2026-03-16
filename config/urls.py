@@ -87,8 +87,10 @@ urlpatterns += [
     path("api/", include("config.api_router")),
     # DRF auth token
     path("api/auth-token/", obtain_auth_token, name="obtain_auth_token"),
-    # Business profile for settings page
+    # Business profile for settings page (main profile) + list/create/update profiles
     path("api/business-profile/", accounts_views.business_profile, name="business-profile"),
+    path("api/business-profiles/", accounts_views.business_profile_list, name="business-profile-list"),
+    path("api/business-profiles/<int:pk>/", accounts_views.business_profile_detail, name="business-profile-detail"),
     # Google Search Console integration status
     path("api/integrations/google-search-console/status/", accounts_views.gsc_status, name="gsc-status"),
     # Google Ads integration status

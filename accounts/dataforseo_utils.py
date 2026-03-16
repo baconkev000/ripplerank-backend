@@ -167,7 +167,10 @@ def _get_business_seed_phrases(user) -> List[tuple[str, int]]:
     """
     profile = None
     try:
-        profile = BusinessProfile.objects.filter(user=user).first()
+        profile = (
+            BusinessProfile.objects.filter(user=user, is_main=True).first()
+            or BusinessProfile.objects.filter(user=user).first()
+        )
     except Exception:
         return []
     if not profile:
@@ -1107,7 +1110,10 @@ def enrich_with_gap_keywords(
         limit=5,
     )
     try:
-        _profile = BusinessProfile.objects.filter(user=user).first()
+        _profile = (
+            BusinessProfile.objects.filter(user=user, is_main=True).first()
+            or BusinessProfile.objects.filter(user=user).first()
+        )
     except Exception:
         _profile = None
     industry_lower = ((_profile.industry or "").strip()).lower() if _profile else ""
@@ -1164,7 +1170,10 @@ def enrich_with_llm_keywords(
     """Append validated LLM seed keywords to top_keywords in place. Preserves logging on error."""
     existing_keys = {str(k.get("keyword", "")).lower() for k in top_keywords if k.get("keyword")}
     try:
-        _profile = BusinessProfile.objects.filter(user=user).first()
+        _profile = (
+            BusinessProfile.objects.filter(user=user, is_main=True).first()
+            or BusinessProfile.objects.filter(user=user).first()
+        )
     except Exception:
         _profile = None
     homepage_meta: Optional[str] = None

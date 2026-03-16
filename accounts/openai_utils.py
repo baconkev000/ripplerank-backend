@@ -450,7 +450,10 @@ def seo_chat(request: HttpRequest) -> Response:
     )
     recent_messages.reverse()  # oldest → newest
 
-    profile = BusinessProfile.objects.filter(user=request.user).first()
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
 
     # Attach live, cached SEO score + core metrics so the agent can reason with them.
     seo_score_block = ""
@@ -542,7 +545,10 @@ def reviews_chat(request: HttpRequest) -> Response:
     )
     recent_messages.reverse()
 
-    profile = BusinessProfile.objects.filter(user=request.user).first()
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
     system_prompt = build_reviews_system_prompt(request.user, profile)
     assistant_reply = _get_chat_reply(
         system_prompt,

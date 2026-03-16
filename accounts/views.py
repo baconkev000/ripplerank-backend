@@ -999,7 +999,11 @@ def seo_overview(request: HttpRequest) -> Response:
     # #endregion
     try:
         # Cache miss, stale, or refresh=1: call DataForSEO Labs ranked_keywords API.
-        profile = BusinessProfile.objects.filter(user=request.user).first()
+        # Always use the user's main business profile (selected in Settings).
+        profile = (
+            BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+            or BusinessProfile.objects.filter(user=request.user).first()
+        )
         site_url = profile.website_url if profile and profile.website_url else ""
         if not site_url:
             return Response(
@@ -1429,10 +1433,18 @@ def business_profile(request: HttpRequest) -> Response:
     """
     Retrieve or upsert the authenticated user's business profile.
 
-    - GET: returns the current profile (creates an empty one if missing).
-    - PATCH/PUT: updates existing profile fields; creates a profile if it does not exist yet.
+    - GET: returns the user's main business profile (creates one if missing).
+    - PATCH/PUT: updates main profile fields; creates a main profile if it does not exist yet.
     """
-    profile, _created = BusinessProfile.objects.get_or_create(user=request.user)
+    profile_qs = BusinessProfile.objects.filter(user=request.user)
+    profile = profile_qs.filter(is_main=True).first()
+    if profile is None:
+        # If the user has no profiles yet, create a main profile for them.
+        if not profile_qs.exists():
+            profile = BusinessProfile.objects.create(user=request.user, is_main=True)
+        else:
+            # Fallback: use the first existing profile as the main one.
+            profile = profile_qs.first()
 
     if request.method == "GET":
         serializer = BusinessProfileSerializer(profile)
@@ -1462,6 +1474,100 @@ def business_profile(request: HttpRequest) -> Response:
             pass
 
     return Response(serializer.data)
+
+
+@csrf_exempt
+@api_view(["GET", "POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def business_profile_list(request: HttpRequest) -> Response:
+    """
+    List or create business profiles for the authenticated user.
+
+    - GET: return all business profiles (main first).
+    - POST: create a new business profile for this user.
+      The first profile for a user is always created as is_main=True.
+    """
+    if request.method == "GET":
+        profiles = BusinessProfile.objects.filter(user=request.user).order_by("-is_main", "created_at", "id")
+        serializer = BusinessProfileSerializer(profiles, many=True)
+        return Response(serializer.data)
+
+    # POST: create a new profile under this user
+    existing_qs = BusinessProfile.objects.filter(user=request.user)
+    is_first = not existing_qs.exists()
+
+    data = request.data.copy()
+    # Never allow client to set a different user
+    data.pop("user", None)
+
+    if is_first:
+        # First profile for this user is main by definition
+        data["is_main"] = True
+    else:
+        # For additional profiles, default is_main to False unless explicitly set
+        if "is_main" not in data:
+            data["is_main"] = False
+
+    serializer = BusinessProfileSerializer(data=data)
+    serializer.is_valid(raise_exception=True)
+    profile = serializer.save(user=request.user)
+
+    # If this profile is being set as main, unset others
+    if profile.is_main:
+        existing_qs.exclude(pk=profile.pk).update(is_main=False)
+
+    return Response(serializer.data, status=201)
+
+
+@csrf_exempt
+@api_view(["GET", "PATCH", "PUT", "DELETE"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def business_profile_detail(request: HttpRequest, pk: int) -> Response:
+    """
+    Retrieve, update, or delete a single business profile owned by the authenticated user.
+    Primarily used by the Settings page to update a specific profile or mark it as main.
+    """
+    try:
+        profile = BusinessProfile.objects.get(id=pk, user=request.user)
+    except BusinessProfile.DoesNotExist:
+        return Response({"detail": "Not found."}, status=404)
+
+    if request.method == "GET":
+        serializer = BusinessProfileSerializer(profile)
+        return Response(serializer.data)
+
+    if request.method in ("PATCH", "PUT"):
+        old_site_url = profile.website_url
+        serializer = BusinessProfileSerializer(
+            profile,
+            data=request.data,
+            partial=(request.method == "PATCH"),
+        )
+        serializer.is_valid(raise_exception=True)
+        profile = serializer.save()
+
+        # If is_main was set to True on this profile, unset main on all others.
+        if profile.is_main:
+            BusinessProfile.objects.filter(user=request.user).exclude(pk=profile.pk).update(is_main=False)
+
+        # If the website URL changed, refresh SEO snapshot for this site.
+        new_site_url = profile.website_url
+        if new_site_url and new_site_url != old_site_url:
+            try:
+                get_or_refresh_seo_score_for_user(
+                    request.user,
+                    site_url=new_site_url,
+                )
+            except Exception:
+                pass
+
+        return Response(serializer.data)
+
+    # DELETE
+    profile.delete()
+    return Response(status=204)
 
 
 @csrf_exempt

@@ -45,6 +45,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "description",
             "website_url",
             "plan",
+            "is_main",
             "seo_score",
             "search_performance_score",
             "onpage_seo_score",

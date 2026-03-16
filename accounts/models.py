@@ -6,14 +6,14 @@ class BusinessProfile(models.Model):
     """
     Stores business profile settings for a user.
 
-    Each user has at most one BusinessProfile, linked via a foreign key
-    to the Django user model (which includes the user's email).
+    Each user can have multiple BusinessProfiles. One of them can be marked
+    as the main profile (used by default in most places).
     """
 
-    user = models.OneToOneField(
+    user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        related_name="business_profile",
+        related_name="business_profiles",
     )
 
     full_name = models.CharField(max_length=255, blank=True)
@@ -32,6 +32,9 @@ class BusinessProfile(models.Model):
     phone = models.CharField(max_length=50, blank=True)
     description = models.TextField(blank=True)
     website_url = models.URLField(blank=True)
+
+    # Whether this is the main / primary profile for the user.
+    is_main = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
