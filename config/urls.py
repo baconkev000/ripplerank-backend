@@ -24,56 +24,6 @@ urlpatterns = [
     # User management
     path("users/", include("swivl.users.urls", namespace="users")),
     path("auth/google/login/", google_login_redirect_view, name="google-login"),
-    path(
-        "integrations/google-search-console/start/",
-        accounts_views.gsc_connect_start,
-        name="gsc-connect-start",
-    ),
-    path(
-        "integrations/google-search-console/callback/",
-        accounts_views.gsc_connect_callback,
-        name="gsc-connect-callback",
-    ),
-    path(
-        "integrations/google-ads/start/",
-        accounts_views.ads_connect_start,
-        name="gads-connect-start",
-    ),
-    path(
-        "integrations/google-ads/callback/",
-        accounts_views.ads_connect_callback,
-        name="gads-connect-callback",
-    ),
-    path(
-        "integrations/google-business-profile/start/",
-        accounts_views.gbp_connect_start,
-        name="gbp-connect-start",
-    ),
-    path(
-        "integrations/google-business-profile/callback/",
-        accounts_views.gbp_connect_callback,
-        name="gbp-connect-callback",
-    ),
-    path(
-        "integrations/meta-ads/start/",
-        accounts_views.meta_ads_connect_start,
-        name="meta-ads-connect-start",
-    ),
-    path(
-        "integrations/meta-ads/callback/",
-        accounts_views.meta_ads_connect_callback,
-        name="meta-ads-connect-callback",
-    ),
-    path(
-        "integrations/tiktok-ads/start/",
-        accounts_views.tiktok_ads_connect_start,
-        name="tiktok-ads-connect-start",
-    ),
-    path(
-        "integrations/tiktok-ads/callback/",
-        accounts_views.tiktok_ads_connect_callback,
-        name="tiktok-ads-connect-callback",
-    ),
     path("accounts/", include("allauth.urls")),
     # Your stuff: custom urls includes go here
     # ...
@@ -92,19 +42,6 @@ urlpatterns += [
     path("api/business-profiles/", accounts_views.business_profile_list, name="business-profile-list"),
     path("api/business-profiles/<int:pk>/", accounts_views.business_profile_detail, name="business-profile-detail"),
     path("api/seo/refresh-next-steps/", accounts_views.refresh_seo_next_steps, name="seo-refresh-next-steps"),
-    # Google Search Console integration status
-    path("api/integrations/google-search-console/status/", accounts_views.gsc_status, name="gsc-status"),
-    # Google Ads integration status
-    path("api/integrations/google-ads/status/", accounts_views.ads_status, name="gads-status"),
-    # Meta Ads integration status
-    path("api/integrations/meta-ads/status/", accounts_views.meta_ads_status, name="meta-ads-status"),
-    # TikTok Ads integration status
-    path("api/integrations/tiktok-ads/status/", accounts_views.tiktok_ads_status, name="tiktok-ads-status"),
-    # Google Ads performance metrics (conversions, ROAS, cost per customer)
-    # Google Business Profile integration status (Reviews Agent)
-    path("api/integrations/google-business-profile/status/", accounts_views.gbp_status, name="gbp-status"),
-    # Reviews overview (star rating, total reviews, response rate, etc. — GBP or cached)
-    path("api/reviews/overview/", accounts_views.reviews_overview, name="reviews-overview"),
     # Agent activity feed for dashboard "What your agents did today"
     path("api/activity/", accounts_views.agent_activity_feed, name="agent-activity-feed"),
     # SEO overview metrics for dashboard (Google Search Console powered)
@@ -117,8 +54,6 @@ urlpatterns += [
     path("api/seo/refresh-snapshot/", accounts_views.refresh_seo_snapshot, name="refresh-seo-snapshot"),
     # SEO agent chat
     path("api/seo/chat/", accounts_views.seo_chat, name="seo-chat"),
-    # Reviews agent chat (separate tables, different system role)
-    path("api/reviews/chat/", accounts_views.reviews_chat, name="reviews-chat"),
     # API logout to clear Django/Google SSO session
     path("api/logout/", accounts_views.api_logout, name="api-logout"),
     path("api/schema/", SpectacularAPIView.as_view(), name="api-schema"),
