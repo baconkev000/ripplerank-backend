@@ -156,6 +156,13 @@ def get_profile_location_code(
     fallback_code = int(default_code)
     if not profile:
         return fallback_code, True, ""
+
+    # Organic mode intentionally bypasses profile-level location targeting and
+    # uses the app default location behavior (current baseline behavior).
+    location_mode = str(getattr(profile, "seo_location_mode", "organic") or "organic").strip().lower()
+    if location_mode == "organic":
+        return fallback_code, False, "Organic"
+
     raw_code = getattr(profile, "seo_location_code", None)
     raw_label = str(getattr(profile, "seo_location_label", "") or "").strip()
     if raw_code is None:

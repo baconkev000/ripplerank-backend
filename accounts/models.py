@@ -3,6 +3,13 @@ from django.db import models
 
 
 class BusinessProfile(models.Model):
+    SEO_LOCATION_MODE_ORGANIC = "organic"
+    SEO_LOCATION_MODE_LOCAL = "local"
+    SEO_LOCATION_MODE_CHOICES = [
+        (SEO_LOCATION_MODE_ORGANIC, "Organic"),
+        (SEO_LOCATION_MODE_LOCAL, "Local"),
+    ]
+
     """
     Stores business profile settings for a user.
 
@@ -40,6 +47,11 @@ class BusinessProfile(models.Model):
     # When provided, these are preferred over DataForSEO auto-competitors.
     # Example: "smilebright.com, nocavityclinic.com, oakdentalcare.com"
     seo_competitor_domains_override = models.TextField(blank=True, default="")
+    seo_location_mode = models.CharField(
+        max_length=16,
+        choices=SEO_LOCATION_MODE_CHOICES,
+        default=SEO_LOCATION_MODE_ORGANIC,
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
