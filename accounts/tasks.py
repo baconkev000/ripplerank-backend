@@ -197,11 +197,13 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
             language_code=language_code,
         )
         logger.info(
-            "[SEO async] recompute snapshot_id=%s keywords_with_rank=%s estimated_traffic_before=%s estimated_traffic_after=%s total_search_volume_before=%s total_search_volume_after=%s visibility_before=%s visibility_after=%s missed_before=%s missed_after=%s",
+            "[SEO async] recompute snapshot_id=%s keywords_with_rank=%s estimated_traffic_before=%s estimated_traffic_after=%s appearances_before=%s appearances_after=%s total_search_volume_before=%s total_search_volume_after=%s visibility_before=%s visibility_after=%s missed_before=%s missed_after=%s",
             snapshot_id,
             keywords_with_rank,
             int(snapshot.organic_visitors or 0),
             int(metrics.get("estimated_traffic") or 0),
+            int(snapshot.estimated_search_appearances_monthly or 0),
+            int(metrics.get("estimated_search_appearances_monthly") or 0),
             int(snapshot.total_search_volume or 0),
             int(metrics.get("total_search_volume") or 0),
             int(snapshot.search_visibility_percent or 0),
@@ -224,6 +226,9 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
             snapshot.keywords_enriched_at = django_tz.now()
             snapshot.organic_visitors = int(metrics.get("estimated_traffic") or 0)
             snapshot.total_search_volume = int(metrics.get("total_search_volume") or 0)
+            snapshot.estimated_search_appearances_monthly = int(
+                metrics.get("estimated_search_appearances_monthly") or 0
+            )
             snapshot.search_visibility_percent = int(metrics.get("search_visibility_percent") or 0)
             snapshot.missed_searches_monthly = int(metrics.get("missed_searches_monthly") or 0)
             snapshot.search_performance_score = int(metrics.get("search_performance_score") or 0)
@@ -235,6 +240,7 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
                     "keywords_enriched_at",
                     "organic_visitors",
                     "total_search_volume",
+                    "estimated_search_appearances_monthly",
                     "search_visibility_percent",
                     "missed_searches_monthly",
                     "search_performance_score",

@@ -768,6 +768,26 @@ def _ctr_for_position(position: int) -> float:
     return 0.002
 
 
+def _appearance_weight_for_position(position: int) -> float:
+    """
+    Estimate appearance coverage contribution by rank band.
+    This is intentionally different from CTR, representing likely SERP presence.
+    """
+    if position <= 0:
+        return 0.0
+    if position <= 3:
+        return 1.0
+    if position <= 10:
+        return 0.85
+    if position <= 20:
+        return 0.45
+    if position <= 50:
+        return 0.2
+    if position <= 100:
+        return 0.08
+    return 0.02
+
+
 def _estimate_missed_searches_monthly(search_volume: float, rank: Optional[int]) -> int:
     """
     Estimate how many monthly searches are *not* expected to click the business site.
@@ -3159,13 +3179,26 @@ def compute_visibility_metrics(
     search_visibility_percent, missed_searches_monthly, and search_performance_score.
     """
     total_search_volume = sum(k.get("search_volume", 0) for k in top_keywords_sorted)
+    estimated_search_appearances = 0.0
+    for row in top_keywords_sorted:
+        try:
+            sv = max(float((row or {}).get("search_volume") or 0.0), 0.0)
+        except (TypeError, ValueError):
+            sv = 0.0
+        rank_raw = (row or {}).get("rank")
+        try:
+            rank_int = int(rank_raw) if rank_raw is not None else None
+        except (TypeError, ValueError):
+            rank_int = None
+        if isinstance(rank_int, int) and rank_int > 0:
+            estimated_search_appearances += sv * _appearance_weight_for_position(rank_int)
     if total_search_volume > 0:
         search_visibility_percent = int(round(
-            max(0.0, min(100.0, (estimated_traffic / total_search_volume) * 100.0))
+            max(0.0, min(100.0, (estimated_search_appearances / total_search_volume) * 100.0))
         ))
     else:
         search_visibility_percent = 0
-    missed_searches_monthly = int(round(max(0.0, total_search_volume - estimated_traffic)))
+    missed_searches_monthly = int(round(max(0.0, total_search_volume - estimated_search_appearances)))
 
     competitor_avg_traffic = _get_competitor_average_traffic(
         domain,
@@ -3182,6 +3215,7 @@ def compute_visibility_metrics(
     )
     return {
         "total_search_volume": total_search_volume,
+        "estimated_search_appearances_monthly": int(round(max(0.0, estimated_search_appearances))),
         "search_visibility_percent": search_visibility_percent,
         "missed_searches_monthly": missed_searches_monthly,
         "search_performance_score": search_performance_score,
@@ -3253,6 +3287,7 @@ def recompute_snapshot_metrics_from_keywords(
     return {
         "estimated_traffic": int(round(max(0.0, estimated_traffic))),
         "total_search_volume": int(visibility.get("total_search_volume") or 0),
+        "estimated_search_appearances_monthly": int(visibility.get("estimated_search_appearances_monthly") or 0),
         "search_visibility_percent": int(visibility.get("search_visibility_percent") or 0),
         "missed_searches_monthly": int(visibility.get("missed_searches_monthly") or 0),
         "search_performance_score": int(visibility.get("search_performance_score") or 0),
@@ -3271,6 +3306,7 @@ def save_seo_snapshot(
     top3_positions: int,
     top_keywords_sorted: List[Dict[str, Any]],
     total_search_volume: int,
+    estimated_search_appearances_monthly: int,
     missed_searches_monthly: int,
     search_visibility_percent: int,
     search_performance_score: int,
@@ -3291,6 +3327,7 @@ def save_seo_snapshot(
         snapshot.cached_domain = domain
         snapshot.top_keywords = top_keywords_sorted
         snapshot.total_search_volume = int(total_search_volume or 0)
+        snapshot.estimated_search_appearances_monthly = int(estimated_search_appearances_monthly or 0)
         snapshot.missed_searches_monthly = int(missed_searches_monthly or 0)
         snapshot.search_visibility_percent = int(search_visibility_percent or 0)
         snapshot.search_performance_score = int(search_performance_score or 0)
@@ -3345,6 +3382,7 @@ def build_seo_response(
     search_performance_score: int,
     organic_visitors: int,
     total_search_volume: int,
+    estimated_search_appearances_monthly: int,
     keywords_ranking: int,
     top3_positions: int,
     search_visibility_percent: int,
@@ -3363,6 +3401,7 @@ def build_seo_response(
         "search_performance_score": int(search_performance_score or 0),
         "organic_visitors": int(organic_visitors or 0),
         "total_search_volume": int(total_search_volume or 0),
+        "estimated_search_appearances_monthly": int(estimated_search_appearances_monthly or 0),
         "keywords_ranking": int(keywords_ranking or 0),
         "top3_positions": int(top3_positions or 0),
         "search_visibility_percent": int(search_visibility_percent or 0),
@@ -3381,7 +3420,7 @@ def _build_empty_seo_response(user, site_url: str) -> Dict[str, Any]:
     )
     return build_seo_response(
         search_performance_score=fallback_score,
-        organic_visitors=0, total_search_volume=0, keywords_ranking=0, top3_positions=0,
+        organic_visitors=0, total_search_volume=0, estimated_search_appearances_monthly=0, keywords_ranking=0, top3_positions=0,
         search_visibility_percent=0, missed_searches_monthly=0, top_keywords=[], seo_next_steps=[],
         enrichment_status="complete",
     )
@@ -3493,6 +3532,7 @@ def get_or_refresh_seo_score_for_user(
             search_performance_score=int(snapshot.search_performance_score or 0),
             organic_visitors=int(snapshot.organic_visitors or 0),
             total_search_volume=int(getattr(snapshot, "total_search_volume", 0) or 0),
+            estimated_search_appearances_monthly=int(getattr(snapshot, "estimated_search_appearances_monthly", 0) or 0),
             keywords_ranking=int(snapshot.keywords_ranking or 0),
             top3_positions=int(snapshot.top3_positions or 0),
             search_visibility_percent=int(getattr(snapshot, "search_visibility_percent", 0) or 0),
@@ -3550,6 +3590,7 @@ def get_or_refresh_seo_score_for_user(
         top3_positions=int(metrics["top3_positions"] or 0),
         top_keywords_sorted=top_keywords_ranked,
         total_search_volume=int(visibility["total_search_volume"] or 0),
+        estimated_search_appearances_monthly=int(visibility.get("estimated_search_appearances_monthly") or 0),
         missed_searches_monthly=int(visibility["missed_searches_monthly"] or 0),
         search_visibility_percent=int(visibility["search_visibility_percent"] or 0),
         search_performance_score=int(visibility["search_performance_score"] or 0),
@@ -3572,6 +3613,7 @@ def get_or_refresh_seo_score_for_user(
         search_performance_score=int(visibility["search_performance_score"] or 0),
         organic_visitors=int(round(metrics["estimated_traffic"]) or 0),
         total_search_volume=int(visibility["total_search_volume"] or 0),
+        estimated_search_appearances_monthly=int(visibility.get("estimated_search_appearances_monthly") or 0),
         keywords_ranking=int(metrics["keywords_ranking"] or 0),
         top3_positions=int(metrics["top3_positions"] or 0),
         search_visibility_percent=int(visibility["search_visibility_percent"] or 0),

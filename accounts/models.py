@@ -197,6 +197,7 @@ class SEOOverviewSnapshot(models.Model):
     cached_domain = models.CharField(max_length=255, blank=True)
     top_keywords = models.JSONField(default=list, blank=True)
     total_search_volume = models.IntegerField(default=0)
+    estimated_search_appearances_monthly = models.IntegerField(default=0)
     missed_searches_monthly = models.IntegerField(default=0)
     search_visibility_percent = models.IntegerField(default=0)
     search_performance_score = models.IntegerField(null=True, blank=True)
