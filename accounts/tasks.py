@@ -29,8 +29,8 @@ KEYWORD_ACTION_TTL = timedelta(days=7)
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
     """
-    Load snapshot by id; enrich top_keywords with gap + LLM keywords; update only
-    top_keywords and keywords_enriched_at. Does not change core score or visibility metrics.
+    Load snapshot by id; enrich top_keywords with gap + LLM keywords; then atomically
+    recompute and persist all dependent SEO snapshot metrics.
     """
     from .models import SEOOverviewSnapshot
 
@@ -90,6 +90,7 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
             enrich_with_llm_keywords,
             enrich_keyword_ranks_from_labs,
             recompute_snapshot_metrics_from_keywords,
+            normalize_seo_snapshot_metrics,
         )
 
         enrich_with_gap_keywords(domain, location_code, language_code, user, top_keywords)
@@ -190,12 +191,12 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
     )
 
     try:
-        metrics = recompute_snapshot_metrics_from_keywords(
+        metrics = normalize_seo_snapshot_metrics(recompute_snapshot_metrics_from_keywords(
             top_keywords=top_keywords_sorted,
             domain=domain,
             location_code=location_code,
             language_code=language_code,
-        )
+        ))
         logger.info(
             "[SEO async] recompute snapshot_id=%s keywords_with_rank=%s estimated_traffic_before=%s estimated_traffic_after=%s appearances_before=%s appearances_after=%s total_search_volume_before=%s total_search_volume_after=%s visibility_before=%s visibility_after=%s missed_before=%s missed_after=%s",
             snapshot_id,
@@ -224,16 +225,14 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
         with transaction.atomic():
             snapshot.top_keywords = top_keywords_sorted
             snapshot.keywords_enriched_at = django_tz.now()
-            snapshot.organic_visitors = int(metrics.get("estimated_traffic") or 0)
-            snapshot.total_search_volume = int(metrics.get("total_search_volume") or 0)
-            snapshot.estimated_search_appearances_monthly = int(
-                metrics.get("estimated_search_appearances_monthly") or 0
-            )
-            snapshot.search_visibility_percent = int(metrics.get("search_visibility_percent") or 0)
-            snapshot.missed_searches_monthly = int(metrics.get("missed_searches_monthly") or 0)
-            snapshot.search_performance_score = int(metrics.get("search_performance_score") or 0)
-            snapshot.keywords_ranking = int(metrics.get("keywords_ranking") or 0)
-            snapshot.top3_positions = int(metrics.get("top3_positions") or 0)
+            snapshot.organic_visitors = int(metrics["estimated_traffic"])
+            snapshot.total_search_volume = int(metrics["total_search_volume"])
+            snapshot.estimated_search_appearances_monthly = int(metrics["estimated_search_appearances_monthly"])
+            snapshot.search_visibility_percent = int(metrics["search_visibility_percent"])
+            snapshot.missed_searches_monthly = int(metrics["missed_searches_monthly"])
+            snapshot.search_performance_score = int(metrics["search_performance_score"])
+            snapshot.keywords_ranking = int(metrics["keywords_ranking"])
+            snapshot.top3_positions = int(metrics["top3_positions"])
             snapshot.save(
                 update_fields=[
                     "top_keywords",

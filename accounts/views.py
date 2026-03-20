@@ -6,6 +6,7 @@ from datetime import datetime, date, timedelta, timezone
 import requests
 from django.conf import settings
 from django.core.cache import cache
+from django.db import transaction
 from django.contrib.auth import get_user_model, login, logout as django_logout
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import redirect
@@ -1798,6 +1799,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
             enrich_with_llm_keywords,
             enrich_keyword_ranks_from_labs,
             recompute_snapshot_metrics_from_keywords,
+            normalize_seo_snapshot_metrics,
         )
         from .tasks import (
             generate_snapshot_next_steps_task,
@@ -1942,12 +1944,12 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                 competitor_pct,
                 outranking_competitor_pct,
             )
-            metrics = recompute_snapshot_metrics_from_keywords(
+            metrics = normalize_seo_snapshot_metrics(recompute_snapshot_metrics_from_keywords(
                 top_keywords=top_keywords_sorted,
                 domain=domain,
                 location_code=location_code,
                 language_code=language_code,
-            )
+            ))
             logger.info(
                 "[SEO refresh] recompute user_id=%s keywords_with_rank=%s estimated_traffic_before=%s estimated_traffic_after=%s appearances_before=%s appearances_after=%s total_search_volume_before=%s total_search_volume_after=%s visibility_before=%s visibility_after=%s missed_before=%s missed_after=%s",
                 getattr(user, "id", None),
@@ -1973,34 +1975,33 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                     getattr(user, "id", None),
                     keywords_with_rank,
                 )
-            snapshot.top_keywords = top_keywords_sorted
-            snapshot.keywords_enriched_at = datetime.now(timezone.utc)
-            snapshot.refreshed_at = datetime.now(timezone.utc)
-            snapshot.organic_visitors = int(metrics.get("estimated_traffic") or 0)
-            snapshot.total_search_volume = int(metrics.get("total_search_volume") or 0)
-            snapshot.estimated_search_appearances_monthly = int(
-                metrics.get("estimated_search_appearances_monthly") or 0
-            )
-            snapshot.search_visibility_percent = int(metrics.get("search_visibility_percent") or 0)
-            snapshot.missed_searches_monthly = int(metrics.get("missed_searches_monthly") or 0)
-            snapshot.search_performance_score = int(metrics.get("search_performance_score") or 0)
-            snapshot.keywords_ranking = int(metrics.get("keywords_ranking") or 0)
-            snapshot.top3_positions = int(metrics.get("top3_positions") or 0)
-            snapshot.save(
-                update_fields=[
-                    "top_keywords",
-                    "keywords_enriched_at",
-                    "refreshed_at",
-                    "organic_visitors",
-                    "total_search_volume",
-                    "estimated_search_appearances_monthly",
-                    "search_visibility_percent",
-                    "missed_searches_monthly",
-                    "search_performance_score",
-                    "keywords_ranking",
-                    "top3_positions",
-                ]
-            )
+            with transaction.atomic():
+                snapshot.top_keywords = top_keywords_sorted
+                snapshot.keywords_enriched_at = datetime.now(timezone.utc)
+                snapshot.refreshed_at = datetime.now(timezone.utc)
+                snapshot.organic_visitors = int(metrics["estimated_traffic"])
+                snapshot.total_search_volume = int(metrics["total_search_volume"])
+                snapshot.estimated_search_appearances_monthly = int(metrics["estimated_search_appearances_monthly"])
+                snapshot.search_visibility_percent = int(metrics["search_visibility_percent"])
+                snapshot.missed_searches_monthly = int(metrics["missed_searches_monthly"])
+                snapshot.search_performance_score = int(metrics["search_performance_score"])
+                snapshot.keywords_ranking = int(metrics["keywords_ranking"])
+                snapshot.top3_positions = int(metrics["top3_positions"])
+                snapshot.save(
+                    update_fields=[
+                        "top_keywords",
+                        "keywords_enriched_at",
+                        "refreshed_at",
+                        "organic_visitors",
+                        "total_search_volume",
+                        "estimated_search_appearances_monthly",
+                        "search_visibility_percent",
+                        "missed_searches_monthly",
+                        "search_performance_score",
+                        "keywords_ranking",
+                        "top3_positions",
+                    ]
+                )
 
             # Next steps / action suggestions can remain async.
             generate_snapshot_next_steps_task.delay(snapshot.id)

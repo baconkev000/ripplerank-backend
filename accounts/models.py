@@ -217,6 +217,26 @@ class SEOOverviewSnapshot(models.Model):
     def __str__(self) -> str:
         return f"SEOOverviewSnapshot(user={self.user!s}, period_start={self.period_start})"
 
+    def save(self, *args, **kwargs):
+        """
+        Enforce canonical SEO metric invariants at write time.
+        """
+        total = max(0, int(self.total_search_volume or 0))
+        appearances = max(0, int(self.estimated_search_appearances_monthly or 0))
+        if appearances > total:
+            appearances = total
+            self.estimated_search_appearances_monthly = appearances
+
+        if total > 0:
+            self.search_visibility_percent = int(round((appearances / total) * 100))
+        else:
+            self.search_visibility_percent = 0
+
+        self.search_visibility_percent = max(0, min(100, int(self.search_visibility_percent or 0)))
+        self.missed_searches_monthly = max(0, total - appearances)
+
+        super().save(*args, **kwargs)
+
 
 class AEOOverviewSnapshot(models.Model):
     """

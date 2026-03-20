@@ -3284,7 +3284,8 @@ def recompute_snapshot_metrics_from_keywords(
         int(location_code),
         language_code,
     )
-    return {
+    return normalize_seo_snapshot_metrics(
+        {
         "estimated_traffic": int(round(max(0.0, estimated_traffic))),
         "total_search_volume": int(visibility.get("total_search_volume") or 0),
         "estimated_search_appearances_monthly": int(visibility.get("estimated_search_appearances_monthly") or 0),
@@ -3293,6 +3294,37 @@ def recompute_snapshot_metrics_from_keywords(
         "search_performance_score": int(visibility.get("search_performance_score") or 0),
         "keywords_ranking": int(keywords_ranking),
         "top3_positions": int(top3_positions),
+        }
+    )
+
+
+def normalize_seo_snapshot_metrics(metrics: Dict[str, Any]) -> Dict[str, int]:
+    """
+    Canonical SEO snapshot invariants.
+    - visibility_percent = appearances / total_search_volume * 100
+    - missed_searches = total_search_volume - appearances
+    """
+    total_search_volume = max(0, int(metrics.get("total_search_volume") or 0))
+    estimated_search_appearances_monthly = max(
+        0,
+        min(total_search_volume, int(metrics.get("estimated_search_appearances_monthly") or 0)),
+    )
+    if total_search_volume > 0:
+        search_visibility_percent = int(
+            round((estimated_search_appearances_monthly / total_search_volume) * 100)
+        )
+    else:
+        search_visibility_percent = 0
+    missed_searches_monthly = max(0, total_search_volume - estimated_search_appearances_monthly)
+    return {
+        "estimated_traffic": max(0, int(metrics.get("estimated_traffic") or 0)),
+        "total_search_volume": total_search_volume,
+        "estimated_search_appearances_monthly": estimated_search_appearances_monthly,
+        "search_visibility_percent": max(0, min(100, search_visibility_percent)),
+        "missed_searches_monthly": missed_searches_monthly,
+        "search_performance_score": max(0, int(metrics.get("search_performance_score") or 0)),
+        "keywords_ranking": max(0, int(metrics.get("keywords_ranking") or 0)),
+        "top3_positions": max(0, int(metrics.get("top3_positions") or 0)),
     }
 
 
@@ -3395,17 +3427,29 @@ def build_seo_response(
 
     On-page/technical audit is intentionally disabled to avoid DataForSEO On-Page costs.
     """
-    overall = int(search_performance_score or 0)
+    normalized = normalize_seo_snapshot_metrics(
+        {
+            "estimated_traffic": organic_visitors,
+            "total_search_volume": total_search_volume,
+            "estimated_search_appearances_monthly": estimated_search_appearances_monthly,
+            "search_visibility_percent": search_visibility_percent,
+            "missed_searches_monthly": missed_searches_monthly,
+            "search_performance_score": search_performance_score,
+            "keywords_ranking": keywords_ranking,
+            "top3_positions": top3_positions,
+        }
+    )
+    overall = int(normalized["search_performance_score"] or 0)
     return {
         "seo_score": overall,
-        "search_performance_score": int(search_performance_score or 0),
-        "organic_visitors": int(organic_visitors or 0),
-        "total_search_volume": int(total_search_volume or 0),
-        "estimated_search_appearances_monthly": int(estimated_search_appearances_monthly or 0),
-        "keywords_ranking": int(keywords_ranking or 0),
-        "top3_positions": int(top3_positions or 0),
-        "search_visibility_percent": int(search_visibility_percent or 0),
-        "missed_searches_monthly": int(missed_searches_monthly or 0),
+        "search_performance_score": int(normalized["search_performance_score"] or 0),
+        "organic_visitors": int(normalized["estimated_traffic"] or 0),
+        "total_search_volume": int(normalized["total_search_volume"] or 0),
+        "estimated_search_appearances_monthly": int(normalized["estimated_search_appearances_monthly"] or 0),
+        "keywords_ranking": int(normalized["keywords_ranking"] or 0),
+        "top3_positions": int(normalized["top3_positions"] or 0),
+        "search_visibility_percent": int(normalized["search_visibility_percent"] or 0),
+        "missed_searches_monthly": int(normalized["missed_searches_monthly"] or 0),
         "top_keywords": top_keywords or [],
         "seo_next_steps": seo_next_steps if seo_next_steps is not None else [],
         "enrichment_status": enrichment_status,
@@ -3523,6 +3567,47 @@ def get_or_refresh_seo_score_for_user(
             )
         except Exception:
             pass
+        # Self-heal stale/inconsistent snapshot metrics from current keyword rows.
+        try:
+            cached_keywords = list(getattr(snapshot, "top_keywords", None) or [])
+            repaired_metrics = recompute_snapshot_metrics_from_keywords(
+                top_keywords=cached_keywords,
+                domain=domain,
+                location_code=location_code if "location_code" in locals() else int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840)),
+                language_code=language_code if "language_code" in locals() else getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en"),
+            )
+            stored_visibility = int(getattr(snapshot, "search_visibility_percent", 0) or 0)
+            repaired_visibility = int(repaired_metrics.get("search_visibility_percent") or 0)
+            stored_appearances = int(getattr(snapshot, "estimated_search_appearances_monthly", 0) or 0)
+            repaired_appearances = int(repaired_metrics.get("estimated_search_appearances_monthly") or 0)
+            if stored_visibility != repaired_visibility or stored_appearances != repaired_appearances:
+                snapshot.organic_visitors = int(repaired_metrics["estimated_traffic"])
+                snapshot.total_search_volume = int(repaired_metrics["total_search_volume"])
+                snapshot.estimated_search_appearances_monthly = int(repaired_metrics["estimated_search_appearances_monthly"])
+                snapshot.search_visibility_percent = int(repaired_metrics["search_visibility_percent"])
+                snapshot.missed_searches_monthly = int(repaired_metrics["missed_searches_monthly"])
+                snapshot.search_performance_score = int(repaired_metrics["search_performance_score"])
+                snapshot.keywords_ranking = int(repaired_metrics["keywords_ranking"])
+                snapshot.top3_positions = int(repaired_metrics["top3_positions"])
+                snapshot.save(
+                    update_fields=[
+                        "organic_visitors",
+                        "total_search_volume",
+                        "estimated_search_appearances_monthly",
+                        "search_visibility_percent",
+                        "missed_searches_monthly",
+                        "search_performance_score",
+                        "keywords_ranking",
+                        "top3_positions",
+                    ]
+                )
+        except Exception:
+            logger.exception(
+                "[SEO score] cache-hit metric repair failed user_id=%s domain=%s",
+                getattr(user, "id", None),
+                domain,
+            )
+
         enrichment_status = "complete" if (
             getattr(snapshot, "keywords_enriched_at", None)
             and getattr(snapshot, "seo_next_steps_refreshed_at", None)
