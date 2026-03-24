@@ -190,13 +190,28 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
         outranking_competitor_pct,
     )
 
+    profile_for_metrics = (
+        snapshot.user.business_profiles.filter(is_main=True).first()
+        or snapshot.user.business_profiles.first()
+    )
+    from .dataforseo_utils import resolve_snapshot_location_context as _resolve_snap_ctx
+
+    snapshot_context = _resolve_snap_ctx(
+        profile=profile_for_metrics,
+        default_location_code=int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840)),
+    )
+    snapshot_mode = str(snapshot_context.get("mode") or "organic")
+
     try:
-        metrics = normalize_seo_snapshot_metrics(recompute_snapshot_metrics_from_keywords(
-            top_keywords=top_keywords_sorted,
-            domain=domain,
-            location_code=location_code,
-            language_code=language_code,
-        ))
+        metrics = normalize_seo_snapshot_metrics(
+            recompute_snapshot_metrics_from_keywords(
+                top_keywords=top_keywords_sorted,
+                domain=domain,
+                location_code=location_code,
+                language_code=language_code,
+                seo_location_mode=snapshot_mode,
+            )
+        )
         logger.info(
             "[SEO async] recompute snapshot_id=%s keywords_with_rank=%s estimated_traffic_before=%s estimated_traffic_after=%s appearances_before=%s appearances_after=%s total_search_volume_before=%s total_search_volume_after=%s visibility_before=%s visibility_after=%s missed_before=%s missed_after=%s",
             snapshot_id,
@@ -233,6 +248,16 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
             snapshot.search_performance_score = int(metrics["search_performance_score"])
             snapshot.keywords_ranking = int(metrics["keywords_ranking"])
             snapshot.top3_positions = int(metrics["top3_positions"])
+            snapshot.cached_location_mode = str(snapshot_context.get("mode") or "organic")
+            snapshot.cached_location_code = int(snapshot_context.get("code") or 0)
+            snapshot.cached_location_label = str(snapshot_context.get("label") or "")
+            snapshot.local_verification_applied = any(
+                str((row or {}).get("rank_source") or "baseline") == "local_verified"
+                for row in top_keywords_sorted
+            )
+            snapshot.local_verified_keyword_count = sum(
+                1 for row in top_keywords_sorted if (row or {}).get("local_verified_rank") is not None
+            )
             snapshot.save(
                 update_fields=[
                     "top_keywords",
@@ -245,6 +270,11 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
                     "search_performance_score",
                     "keywords_ranking",
                     "top3_positions",
+                    "cached_location_mode",
+                    "cached_location_code",
+                    "cached_location_label",
+                    "local_verification_applied",
+                    "local_verified_keyword_count",
                 ]
             )
 

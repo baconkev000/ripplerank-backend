@@ -49,6 +49,10 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     aeo_last_computed_at = serializers.SerializerMethodField()
     keyword_action_suggestions = serializers.SerializerMethodField()
     enrichment_status = serializers.SerializerMethodField()
+    seo_metrics_location_mode = serializers.SerializerMethodField()
+    seo_location_label = serializers.SerializerMethodField()
+    local_verified_keyword_count = serializers.SerializerMethodField()
+    local_verification_affects_visibility = serializers.SerializerMethodField()
     seo_competitor_domains_override = serializers.CharField(
         required=False,
         allow_blank=True,
@@ -94,6 +98,10 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "aeo_last_computed_at",
             "keyword_action_suggestions",
             "enrichment_status",
+            "seo_metrics_location_mode",
+            "seo_location_label",
+            "local_verified_keyword_count",
+            "local_verification_affects_visibility",
             "created_at",
             "updated_at",
         ]
@@ -532,6 +540,30 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             return "complete"
         return bundle.get("enrichment_status") or "complete"
 
+    def get_seo_metrics_location_mode(self, obj: BusinessProfile) -> str:
+        bundle = self._get_seo_bundle(obj)
+        if bundle and bundle.get("seo_metrics_location_mode") is not None:
+            return str(bundle.get("seo_metrics_location_mode") or "organic")
+        return str(getattr(obj, "seo_location_mode", None) or "organic")
+
+    def get_seo_location_label(self, obj: BusinessProfile) -> str:
+        bundle = self._get_seo_bundle(obj)
+        if not bundle:
+            return ""
+        return str(bundle.get("seo_location_label") or "")
+
+    def get_local_verified_keyword_count(self, obj: BusinessProfile) -> int:
+        bundle = self._get_seo_bundle(obj)
+        if not bundle:
+            return 0
+        return int(bundle.get("local_verified_keyword_count") or 0)
+
+    def get_local_verification_affects_visibility(self, obj: BusinessProfile) -> bool:
+        bundle = self._get_seo_bundle(obj)
+        if not bundle:
+            return False
+        return bool(bundle.get("local_verification_affects_visibility"))
+
 
 class BusinessProfileSEOSerializer(BusinessProfileSerializer):
     class Meta(BusinessProfileSerializer.Meta):
@@ -561,6 +593,10 @@ class BusinessProfileSEOSerializer(BusinessProfileSerializer):
             "seo_next_steps",
             "keyword_action_suggestions",
             "enrichment_status",
+            "seo_metrics_location_mode",
+            "seo_location_label",
+            "local_verified_keyword_count",
+            "local_verification_affects_visibility",
             "created_at",
             "updated_at",
         ]

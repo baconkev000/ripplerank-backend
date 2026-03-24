@@ -45,12 +45,23 @@ from .dataforseo_utils import (
     compute_professional_seo_score,
     get_or_refresh_seo_score_for_user,
     get_competitors_for_domain_intersection,
+    get_profile_location_code,
 )
 from . import openai_utils
 from . import debug_log as _debug
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+
+def _seo_snapshot_context_for_profile(profile: BusinessProfile | None) -> tuple[str, int]:
+    """Resolve snapshot identity context for SEO snapshots."""
+    mode = str(getattr(profile, "seo_location_mode", "organic") or "organic").strip().lower()
+    if mode != "local":
+        return "organic", 0
+    default_location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
+    resolved_code, _fallback, _label = get_profile_location_code(profile, default_location_code)
+    return "local", int(resolved_code or 0)
 
 
 def classify_intent(keyword: str) -> str:
@@ -913,12 +924,20 @@ def seo_overview(request: HttpRequest) -> Response:
     cache_ttl = int(THIRD_PARTY_CACHE_TTL.total_seconds())
     force_refresh = request.GET.get("refresh") == "1"
 
+    profile_for_context = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile_for_context)
+
     # Serve from cache if we have a snapshot for this period fetched within the last hour (unless refresh=1).
     if not force_refresh:
         try:
             snapshot = SEOOverviewSnapshot.objects.get(
                 user=request.user,
                 period_start=start_current,
+                cached_location_mode=snapshot_mode,
+                cached_location_code=snapshot_location_code,
             )
             if snapshot.last_fetched_at >= cutoff:
                 prev_clicks = snapshot.prev_organic_visitors or 0
@@ -1022,6 +1041,8 @@ def seo_overview(request: HttpRequest) -> Response:
                 snapshot = SEOOverviewSnapshot.objects.get(
                     user=request.user,
                     period_start=start_current,
+                    cached_location_mode=snapshot_mode,
+                    cached_location_code=snapshot_location_code,
                 )
                 prev_vis = snapshot.organic_visitors or 0
             except SEOOverviewSnapshot.DoesNotExist:
@@ -1054,6 +1075,8 @@ def seo_overview(request: HttpRequest) -> Response:
             snapshot = SEOOverviewSnapshot.objects.get(
                 user=request.user,
                 period_start=start_current,
+                cached_location_mode=snapshot_mode,
+                cached_location_code=snapshot_location_code,
             )
             prev_vis = snapshot.organic_visitors or 0
         except SEOOverviewSnapshot.DoesNotExist:
@@ -1067,6 +1090,8 @@ def seo_overview(request: HttpRequest) -> Response:
         snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
             user=request.user,
             period_start=start_current,
+            cached_location_mode=snapshot_mode,
+            cached_location_code=snapshot_location_code,
         )
         snapshot.organic_visitors = current_visibility
         snapshot.prev_organic_visitors = prev_vis
@@ -1256,9 +1281,19 @@ def seo_keyword_debug(request: HttpRequest) -> Response:
 
     today = datetime.now(timezone.utc).date()
     start_current = today.replace(day=1)
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
 
     snapshot = (
-        SEOOverviewSnapshot.objects.filter(user=request.user, period_start=start_current)
+        SEOOverviewSnapshot.objects.filter(
+            user=request.user,
+            period_start=start_current,
+            cached_location_mode=snapshot_mode,
+            cached_location_code=snapshot_location_code,
+        )
         .order_by("-last_fetched_at")
         .first()
     )
@@ -1694,10 +1729,13 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
         )
 
     try:
+        snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
         snapshot = SEOOverviewSnapshot.objects.filter(
             user=user,
             period_start=start_current,
             cached_domain__iexact=domain,
+            cached_location_mode=snapshot_mode,
+            cached_location_code=snapshot_location_code,
         ).first()
     except Exception:
         snapshot = None
@@ -1712,6 +1750,8 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
             user=user,
             period_start=start_current,
             cached_domain__iexact=domain,
+            cached_location_mode=snapshot_mode,
+            cached_location_code=snapshot_location_code,
         ).first()
 
     if not snapshot:
@@ -1812,10 +1852,13 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
 
         today = datetime.now(timezone.utc).date()
         start_current = today.replace(day=1)
+        snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
 
         snapshot = SEOOverviewSnapshot.objects.filter(
             user=user,
             period_start=start_current,
+            cached_location_mode=snapshot_mode,
+            cached_location_code=snapshot_location_code,
         ).order_by("-last_fetched_at").first()
 
         # If snapshot doesn't exist yet, fall back to full creation (it will enqueue tasks).
@@ -1824,6 +1867,8 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
             snapshot = SEOOverviewSnapshot.objects.filter(
                 user=user,
                 period_start=start_current,
+                cached_location_mode=snapshot_mode,
+                cached_location_code=snapshot_location_code,
             ).order_by("-last_fetched_at").first()
 
         if snapshot:
@@ -1944,12 +1989,15 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                 competitor_pct,
                 outranking_competitor_pct,
             )
-            metrics = normalize_seo_snapshot_metrics(recompute_snapshot_metrics_from_keywords(
-                top_keywords=top_keywords_sorted,
-                domain=domain,
-                location_code=location_code,
-                language_code=language_code,
-            ))
+            metrics = normalize_seo_snapshot_metrics(
+                recompute_snapshot_metrics_from_keywords(
+                    top_keywords=top_keywords_sorted,
+                    domain=domain,
+                    location_code=location_code,
+                    language_code=language_code,
+                    seo_location_mode=str(snapshot_mode or "organic"),
+                )
+            )
             logger.info(
                 "[SEO refresh] recompute user_id=%s keywords_with_rank=%s estimated_traffic_before=%s estimated_traffic_after=%s appearances_before=%s appearances_after=%s total_search_volume_before=%s total_search_volume_after=%s visibility_before=%s visibility_after=%s missed_before=%s missed_after=%s",
                 getattr(user, "id", None),
@@ -1976,6 +2024,16 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                     keywords_with_rank,
                 )
             with transaction.atomic():
+                snapshot_context = {
+                    "mode": snapshot_mode,
+                    "code": snapshot_location_code,
+                    "label": "",
+                }
+                if snapshot_mode == "local":
+                    default_location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
+                    resolved_code, _used_fallback, resolved_label = get_profile_location_code(profile, default_location_code)
+                    snapshot_context["code"] = int(resolved_code or 0)
+                    snapshot_context["label"] = str(resolved_label or "")
                 snapshot.top_keywords = top_keywords_sorted
                 snapshot.keywords_enriched_at = datetime.now(timezone.utc)
                 snapshot.refreshed_at = datetime.now(timezone.utc)
@@ -1987,6 +2045,16 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                 snapshot.search_performance_score = int(metrics["search_performance_score"])
                 snapshot.keywords_ranking = int(metrics["keywords_ranking"])
                 snapshot.top3_positions = int(metrics["top3_positions"])
+                snapshot.cached_location_mode = str(snapshot_context.get("mode") or "organic")
+                snapshot.cached_location_code = int(snapshot_context.get("code") or 0)
+                snapshot.cached_location_label = str(snapshot_context.get("label") or "")
+                snapshot.local_verification_applied = any(
+                    str((row or {}).get("rank_source") or "baseline") == "local_verified"
+                    for row in top_keywords_sorted
+                )
+                snapshot.local_verified_keyword_count = sum(
+                    1 for row in top_keywords_sorted if (row or {}).get("local_verified_rank") is not None
+                )
                 snapshot.save(
                     update_fields=[
                         "top_keywords",
@@ -2000,6 +2068,11 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                         "search_performance_score",
                         "keywords_ranking",
                         "top3_positions",
+                        "cached_location_mode",
+                        "cached_location_code",
+                        "cached_location_label",
+                        "local_verification_applied",
+                        "local_verified_keyword_count",
                     ]
                 )
 

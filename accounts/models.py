@@ -207,6 +207,11 @@ class SEOOverviewSnapshot(models.Model):
     # Cache for keyword list and search metrics; refreshed at most once per hour or when URL changes
     refreshed_at = models.DateTimeField(null=True, blank=True)
     cached_domain = models.CharField(max_length=255, blank=True)
+    cached_location_mode = models.CharField(max_length=16, blank=True, default="organic")
+    cached_location_code = models.IntegerField(default=0)
+    cached_location_label = models.CharField(max_length=255, blank=True, default="")
+    local_verification_applied = models.BooleanField(default=False)
+    local_verified_keyword_count = models.IntegerField(default=0)
     top_keywords = models.JSONField(default=list, blank=True)
     total_search_volume = models.IntegerField(default=0)
     estimated_search_appearances_monthly = models.IntegerField(default=0)
@@ -222,7 +227,7 @@ class SEOOverviewSnapshot(models.Model):
     keyword_action_suggestions_refreshed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        unique_together = ("user", "period_start")
+        unique_together = ("user", "period_start", "cached_location_mode", "cached_location_code")
         verbose_name = "SEO overview snapshot"
         verbose_name_plural = "SEO overview snapshots"
 
