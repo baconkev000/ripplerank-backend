@@ -53,6 +53,7 @@ urlpatterns += [
     # Force-refresh SEO snapshot (keywords, rankings, visibility) for main business profile
     path("api/seo/refresh-snapshot/", accounts_views.refresh_seo_snapshot, name="refresh-seo-snapshot"),
     path("api/seo/profile/", accounts_views.seo_profile_data, name="seo-profile-data"),
+    path("api/seo/score-history/", accounts_views.seo_score_history_data, name="seo-score-history-data"),
     path("api/aeo/profile/", accounts_views.aeo_profile_data, name="aeo-profile-data"),
     path("api/aeo/refresh-snapshot/", accounts_views.refresh_aeo_snapshot, name="refresh-aeo-snapshot"),
     path(

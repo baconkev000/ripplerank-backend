@@ -40,13 +40,13 @@ from .serializers import (
 from .meta_ads_utils import get_meta_ads_status_for_user
 from .tiktok_ads_utils import get_tiktok_ads_status_for_user
 from .dataforseo_utils import (
-    get_keyword_gap_keywords,
     get_ranked_keywords_visibility,
     compute_professional_seo_score,
     get_or_refresh_seo_score_for_user,
-    get_competitors_for_domain_intersection,
     get_profile_location_code,
+    normalize_domain,
 )
+from .constants import SEO_SNAPSHOT_TTL
 from . import openai_utils
 from . import debug_log as _debug
 from .aeo.aeo_utils import (
@@ -1151,85 +1151,76 @@ def seo_keywords(request: HttpRequest) -> Response:
     if not site_url:
         return Response({"keywords": []})
 
-    parsed = urlparse(site_url)
-    domain = (parsed.netloc or parsed.path or "").lower()
-    if domain.startswith("www."):
-        domain = domain[4:]
+    domain = normalize_domain(site_url)
 
     if not domain:
         return Response({"keywords": []})
 
-    # Use per-user cache so we only call DataForSEO at most once per 7 days,
-    # unless the caller explicitly asks for a refresh via ?refresh=1 or the
-    # business website domain has changed.
-    cache_key = f"seo_keywords:{request.user.id}"
-    domain_cache_key = f"seo_keywords_domain:{request.user.id}"
-    previous_domain = cache.get(domain_cache_key)
-    if previous_domain and previous_domain != domain:
-        force_refresh = True
+    now_utc = datetime.now(timezone.utc)
+    start_current = now_utc.date().replace(day=1)
+    snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
+    snapshot = (
+        SEOOverviewSnapshot.objects.filter(
+            user=request.user,
+            period_start=start_current,
+            cached_domain__iexact=domain,
+            cached_location_mode=snapshot_mode,
+            cached_location_code=snapshot_location_code,
+        )
+        .order_by("-last_fetched_at")
+        .first()
+    )
 
-    if not force_refresh:
-        cached = cache.get(cache_key)
-        if cached is not None:
-            logger.info(
-                "[SEO keywords] Returning cached keyword gap items for user_id=%s (count=%s).",
-                request.user.id,
-                len(cached),
+    snapshot_fresh = bool(
+        snapshot
+        and getattr(snapshot, "refreshed_at", None)
+        and (now_utc - snapshot.refreshed_at) <= SEO_SNAPSHOT_TTL
+    )
+
+    # Never call DataForSEO competitors endpoint on routine page loads.
+    # Recompute snapshot only on explicit refresh or once snapshot is stale.
+    if force_refresh or not snapshot_fresh:
+        get_or_refresh_seo_score_for_user(
+            request.user,
+            site_url=site_url,
+            force_refresh=force_refresh,
+        )
+        snapshot = (
+            SEOOverviewSnapshot.objects.filter(
+                user=request.user,
+                period_start=start_current,
+                cached_domain__iexact=domain,
+                cached_location_mode=snapshot_mode,
+                cached_location_code=snapshot_location_code,
             )
-            return Response({"keywords": cached})
-
-    location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
-    language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
-
-    competitor_selection = get_competitors_for_domain_intersection(
-        domain=domain,
-        location_code=location_code,
-        language_code=language_code,
-        user=request.user,
-        profile=profile,
-        limit=5,
-        min_competitors=int(getattr(settings, "DATAFORSEO_MIN_COMPETITORS_FOR_GAP", 2)),
-    )
-    competitor_domains = competitor_selection.get("filtered_competitors_used") or []
-
-    logger.info(
-        "[SEO keywords] user_id=%s domain=%s competitors=%s location_code=%s",
-        request.user.id,
-        domain,
-        ",".join(competitor_domains) or "(none)",
-        location_code,
-    )
-
-    if not competitor_domains:
-        return Response({"keywords": []})
-
-    gap_items = get_keyword_gap_keywords(
-        domain,
-        competitor_domains,
-        location_code=location_code,
-        language_code=language_code,
-    )
+            .order_by("-last_fetched_at")
+            .first()
+        )
 
     results: list[dict] = []
-    for item in gap_items:
+    snapshot_keywords = list(getattr(snapshot, "top_keywords", None) or [])
+    for item in snapshot_keywords:
         kw = item.get("keyword")
         if not kw:
             continue
-        search_volume = item.get("search_volume")
         competitors = item.get("competitors") or []
+        top_comp_domain = str(item.get("top_competitor_domain") or "").strip()
+        # Gap rows are those enriched from domain_intersection competitor data.
+        if not (top_comp_domain or competitors):
+            continue
+        search_volume = item.get("search_volume")
         results.append(
             {
                 "keyword": kw,
                 "avg_monthly_searches": int(search_volume) if search_volume is not None else None,
                 "intent": classify_intent(kw),
-                # For keyword gap items the site typically does not rank yet.
-                "current_position": 0,
+                "current_position": int(item.get("rank") or 0),
                 "position_change": None,
                 "impressions": 0,
                 "clicks": 0,
                 "ctr": 0,
                 "top_competitor": item.get("top_competitor"),
-                "top_competitor_domain": item.get("top_competitor_domain"),
+                "top_competitor_domain": top_comp_domain or None,
                 "top_competitor_rank": item.get("top_competitor_rank"),
                 "competitors": [
                     {
@@ -1238,7 +1229,7 @@ def seo_keywords(request: HttpRequest) -> Response:
                         "rank": c.get("rank"),
                     }
                     for c in competitors
-                    if c.get("url")
+                    if isinstance(c, dict) and (c.get("url") or c.get("domain"))
                 ],
             },
         )
@@ -1253,13 +1244,8 @@ def seo_keywords(request: HttpRequest) -> Response:
     results.sort(key=sort_key)
     top_results = results[:100]
 
-    # Cache the computed keyword gaps for this user.
-    cache_ttl = int(timedelta(days=7).total_seconds())
-    cache.set(cache_key, top_results, cache_ttl)
-    cache.set(domain_cache_key, domain, cache_ttl)
-
     logger.info(
-        "[SEO keywords] Returning %s fresh DataForSEO keyword gap items for user_id=%s.",
+        "[SEO keywords] Returning %s snapshot keyword gap items for user_id=%s.",
         len(top_results),
         request.user.id,
     )
@@ -1625,23 +1611,18 @@ def seo_profile_data(request: HttpRequest) -> Response:
     payload = dict(serializer.data)
 
     # Expose SEO score trend from historical snapshots for dashboard charting.
-    snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
     website = str(getattr(profile, "website_url", "") or "").strip()
-    parsed_domain = (urlparse(website).netloc or "").lower().replace("www.", "")
-    if not parsed_domain and website:
-        parsed_domain = website.lower().replace("https://", "").replace("http://", "").split("/")[0].replace("www.", "")
+    parsed_domain = normalize_domain(website) if website else ""
 
     snapshots_qs = SEOOverviewSnapshot.objects.filter(
         user=request.user,
-        cached_location_mode=snapshot_mode,
-        cached_location_code=snapshot_location_code,
     )
     if parsed_domain:
         snapshots_qs = snapshots_qs.filter(cached_domain__iexact=parsed_domain)
 
     seo_score_history = [
         {
-            "date": snap.period_start.isoformat(),
+            "period_started_at": snap.period_start.isoformat(),
             "seo_score": int(snap.search_performance_score),
         }
         for snap in snapshots_qs.order_by("period_start", "id")
@@ -1649,6 +1630,83 @@ def seo_profile_data(request: HttpRequest) -> Response:
     ]
     payload["seo_score_history"] = seo_score_history
     return Response(payload)
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def seo_score_history_data(request: HttpRequest) -> Response:
+    """
+    Return SEO score points (search_performance_score) from all matching
+    SEOOverviewSnapshot rows for the authenticated user + current profile domain.
+    """
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response({"points": []})
+
+    website = str(getattr(profile, "website_url", "") or "").strip()
+    parsed_domain = normalize_domain(website) if website else ""
+    start_current = datetime.now(timezone.utc).date().replace(day=1)
+
+    # Ensure current-period snapshot is present in history (without forcing a refresh).
+    if website:
+        try:
+            get_or_refresh_seo_score_for_user(
+                request.user,
+                site_url=website,
+                force_refresh=False,
+            )
+        except Exception:
+            logger.exception(
+                "[seo_score_history] failed to warm current snapshot user_id=%s website=%s",
+                getattr(request.user, "id", None),
+                website,
+            )
+
+    snapshots_qs = SEOOverviewSnapshot.objects.filter(
+        user=request.user,
+    )
+    if parsed_domain:
+        snapshots_qs = snapshots_qs.filter(cached_domain__iexact=parsed_domain)
+
+    points = [
+        {
+            "period_started_at": snap.period_start.isoformat(),
+            "seo_score": int(snap.search_performance_score),
+        }
+        for snap in snapshots_qs.order_by("period_start", "id")
+        if snap.search_performance_score is not None
+    ]
+
+    # Defensive fallback: if current period exists but score is missing from points,
+    # append current seo_score from the warm call so chart includes "now".
+    has_current_point = any(p.get("period_started_at") == start_current.isoformat() for p in points)
+    if not has_current_point and website:
+        try:
+            current_bundle = get_or_refresh_seo_score_for_user(
+                request.user,
+                site_url=website,
+                force_refresh=False,
+            ) or {}
+            current_score = current_bundle.get("seo_score")
+            if current_score is not None:
+                points.append(
+                    {
+                        "period_started_at": start_current.isoformat(),
+                        "seo_score": int(current_score),
+                    }
+                )
+                points.sort(key=lambda p: str(p.get("period_started_at") or ""))
+        except Exception:
+            logger.exception(
+                "[seo_score_history] failed fallback current-point append user_id=%s",
+                getattr(request.user, "id", None),
+            )
+    return Response({"points": points})
 
 
 @csrf_exempt
