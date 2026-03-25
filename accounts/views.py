@@ -1622,7 +1622,33 @@ def seo_profile_data(request: HttpRequest) -> Response:
     if not profile:
         profile = BusinessProfile.objects.create(user=request.user, is_main=True)
     serializer = BusinessProfileSEOSerializer(profile)
-    return Response(serializer.data)
+    payload = dict(serializer.data)
+
+    # Expose SEO score trend from historical snapshots for dashboard charting.
+    snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
+    website = str(getattr(profile, "website_url", "") or "").strip()
+    parsed_domain = (urlparse(website).netloc or "").lower().replace("www.", "")
+    if not parsed_domain and website:
+        parsed_domain = website.lower().replace("https://", "").replace("http://", "").split("/")[0].replace("www.", "")
+
+    snapshots_qs = SEOOverviewSnapshot.objects.filter(
+        user=request.user,
+        cached_location_mode=snapshot_mode,
+        cached_location_code=snapshot_location_code,
+    )
+    if parsed_domain:
+        snapshots_qs = snapshots_qs.filter(cached_domain__iexact=parsed_domain)
+
+    seo_score_history = [
+        {
+            "date": snap.period_start.isoformat(),
+            "seo_score": int(snap.search_performance_score),
+        }
+        for snap in snapshots_qs.order_by("period_start", "id")
+        if snap.search_performance_score is not None
+    ]
+    payload["seo_score_history"] = seo_score_history
+    return Response(payload)
 
 
 @csrf_exempt
