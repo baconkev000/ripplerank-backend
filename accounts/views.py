@@ -1766,6 +1766,9 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
         AEOResponseSnapshot.objects.filter(profile=profile)
         .order_by("-created_at", "-id")
     )
+    selected_prompt_count = len(
+        [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
+    )
     prompts: list[dict] = []
     for resp in responses:
         latest_ex = resp.extraction_snapshots.order_by("-created_at", "-id").first()
@@ -1780,13 +1783,14 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
                 "id": resp.id,
                 "prompt": (resp.prompt_text or "").strip(),
                 "prompt_type": str(resp.prompt_type or ""),
+                "platform": str(resp.platform or ""),
                 "weight": float(resp.weight or 1.0),
                 "cited": cited,
                 "competitors_cited": competitors_count,
                 "response_created_at": resp.created_at.isoformat() if resp.created_at else None,
             }
         )
-    return Response({"prompts": prompts, "monitored_count": len(prompts)})
+    return Response({"prompts": prompts, "monitored_count": selected_prompt_count})
 
 
 @csrf_exempt
