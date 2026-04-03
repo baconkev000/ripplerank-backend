@@ -18,7 +18,13 @@ from typing import Any, Protocol, Sequence
 from django.db.models import Prefetch
 
 from ..models import AEOExtractionSnapshot, AEOScoreSnapshot, AEOResponseSnapshot, BusinessProfile
-from .aeo_extraction_utils import parse_competitor_raw_item
+from .aeo_extraction_utils import (
+    _normalize_for_brand_match,
+    brand_effectively_cited,
+    parse_competitor_raw_item,
+    registered_root_domains_match,
+    root_domain_from_fragment,
+)
 
 PRIMARY_AEO_SCORING_PLATFORM = "openai"
 
@@ -47,20 +53,39 @@ _POSITION_WEIGHTS: dict[str, float] = {
 }
 
 
-def calculate_visibility_score(extractions: Sequence[_ExtractionLike]) -> float:
+def calculate_visibility_score(
+    extractions: Sequence[_ExtractionLike],
+    *,
+    tracked_website_url: str = "",
+) -> float:
     """
     Percentage of prompts where the target brand was mentioned.
 
     Formula: (count where brand_mentioned) / (total prompts) × 100
+
+    Counts a row when ``brand_mentioned`` is true or the profile website matches a competitor URL
+    in ``competitors_json`` (models often list the target only there).
     """
     n = len(extractions)
     if n == 0:
         return 0.0
-    mentioned = sum(1 for e in extractions if e.brand_mentioned)
+    mentioned = sum(
+        1
+        for e in extractions
+        if brand_effectively_cited(
+            bool(getattr(e, "brand_mentioned", False)),
+            getattr(e, "competitors_json", None),
+            tracked_website_url_or_domain=tracked_website_url,
+        )
+    )
     return round(100.0 * mentioned / n, 4)
 
 
-def calculate_weighted_position_score(extractions: Sequence[_ExtractionLike]) -> float:
+def calculate_weighted_position_score(
+    extractions: Sequence[_ExtractionLike],
+    *,
+    tracked_website_url: str = "",
+) -> float:
     """
     Average positional weight across prompts, expressed as a percentage of the max (1.0).
 
@@ -74,7 +99,11 @@ def calculate_weighted_position_score(extractions: Sequence[_ExtractionLike]) ->
         return 0.0
     total_w = 0.0
     for e in extractions:
-        if not e.brand_mentioned:
+        if not brand_effectively_cited(
+            bool(getattr(e, "brand_mentioned", False)),
+            getattr(e, "competitors_json", None),
+            tracked_website_url_or_domain=tracked_website_url,
+        ):
             continue
         pos = (e.mention_position or AEOExtractionSnapshot.MENTION_NONE).lower()
         total_w += _POSITION_WEIGHTS.get(pos, 0.0)
@@ -158,12 +187,21 @@ def aggregate_aeo_share_of_voice_from_extractions(
     competitor mentions). Percentages sum to ~100 when total_units > 0.
     """
     n = len(extractions)
+    site = (business_website_url or "").strip()
+    target_root = root_domain_from_fragment(site) or ""
     your_units = 0
     for e in extractions:
         try:
-            your_units += max(0, int(e.mention_count))
+            mc = max(0, int(e.mention_count))
         except (TypeError, ValueError):
-            pass
+            mc = 0
+        your_units += mc
+        if mc == 0 and brand_effectively_cited(
+            bool(getattr(e, "brand_mentioned", False)),
+            getattr(e, "competitors_json", None),
+            tracked_website_url_or_domain=site,
+        ):
+            your_units += 1
 
     counter: Counter[str] = Counter()
     display: dict[str, str] = {}
@@ -173,13 +211,17 @@ def aggregate_aeo_share_of_voice_from_extractions(
         if not isinstance(comps, list):
             continue
         for raw in comps:
-            name = _competitor_entry_name(raw)
+            parsed = parse_competitor_raw_item(raw)
+            name = (parsed.get("name") or "").strip()
             if not name:
+                continue
+            dom = root_domain_from_fragment(parsed.get("url") or "") or ""
+            if target_root and dom and registered_root_domains_match(target_root, dom):
                 continue
             key = name.casefold()
             counter[key] += 1
             display.setdefault(key, name)
-            u = _competitor_entry_url(raw)
+            u = (parsed.get("url") or "").strip()[:2048]
             if u and key not in url_by_name_key:
                 url_by_name_key[key] = u
 
@@ -251,6 +293,221 @@ def aggregate_aeo_share_of_voice(business_profile: BusinessProfile) -> dict[str,
         business_display_name=name,
         business_website_url=site,
     )
+
+
+def _visibility_brand_key(name: str) -> str:
+    """Collapse brand variants using the same normalization as entity / brand matching."""
+    return _normalize_for_brand_match((name or "").strip())
+
+
+def _pick_three_onboarding_competitor_rows(
+    full_sorted: list[dict[str, Any]],
+    target_idx: int,
+) -> list[dict[str, Any]]:
+    """
+    Pick up to 3 rows: rules from onboarding Search Analytics spec (target always included).
+
+    ``full_sorted`` is all brands sorted by appearances descending (ties: name).
+    ``target_idx`` is the index of the onboarded business in that list.
+    """
+    n = len(full_sorted)
+    if n == 0:
+        return []
+    if n == 1:
+        return [full_sorted[0]]
+    tr = target_idx + 1
+    if tr == 1:
+        return full_sorted[: min(3, n)]
+    if tr == 2:
+        if n >= 3:
+            return [full_sorted[0], full_sorted[1], full_sorted[2]]
+        return [full_sorted[0], full_sorted[1]]
+    if n >= 3:
+        return [full_sorted[0], full_sorted[1], full_sorted[target_idx]]
+    return full_sorted
+
+
+def _aeo_onboarding_response_extractions(
+    business_profile: BusinessProfile,
+) -> list[tuple[AEOResponseSnapshot, AEOExtractionSnapshot | None]]:
+    """
+    One row per stored LLM response (every platform). Includes responses with no extraction yet.
+    """
+    rsp_qs = business_profile.aeo_response_snapshots.all()
+    responses = list(
+        rsp_qs.prefetch_related(
+            Prefetch(
+                "extraction_snapshots",
+                queryset=AEOExtractionSnapshot.objects.select_related("response_snapshot").order_by(
+                    "-created_at",
+                ),
+            ),
+        )
+    )
+    return [(resp, _pick_extraction_for_response(resp)) for resp in responses]
+
+
+def _target_citation_units_for_onboarding(
+    extraction: AEOExtractionSnapshot | None,
+    *,
+    tracked_website_url_or_domain: str,
+) -> int:
+    """Mention units for visibility numerator (aligned with share-of-voice when mention_count is set)."""
+    if extraction is None:
+        return 0
+    if not brand_effectively_cited(
+        bool(getattr(extraction, "brand_mentioned", False)),
+        getattr(extraction, "competitors_json", None),
+        tracked_website_url_or_domain=tracked_website_url_or_domain,
+    ):
+        return 0
+    try:
+        mc = max(0, int(getattr(extraction, "mention_count", 0)))
+    except (TypeError, ValueError):
+        mc = 0
+    return mc if mc > 0 else 1
+
+
+def aeo_onboarding_competitors_visibility(business_profile: BusinessProfile) -> dict[str, Any]:
+    """
+    Competitor + target visibility for onboarding Search Analytics (all LLM platforms).
+
+    Visibility % = (total citation events for the brand) / (total LLM response slots) × 100.
+    Denominator is every ``AEOResponseSnapshot`` row (each prompt × each platform run).
+
+    Target citation units: sum of ``mention_count`` when the brand is cited, or 1 when cited only
+    via ``brand_mentioned`` / profile URL in ``competitors_json`` (no positive mention_count).
+
+    Competitors: one count per matching entry in ``competitors_json`` (repeats in the same answer
+    count separately). Brands are keyed with ``_normalize_for_brand_match`` on extracted names.
+    """
+    slots = _aeo_onboarding_response_extractions(business_profile)
+    total = len(slots)
+    if total == 0:
+        return {
+            "has_data": False,
+            "total_prompts": 0,
+            "rows": [],
+        }
+
+    display_name = (getattr(business_profile, "business_name", None) or "").strip() or "Your business"
+    target_key = _visibility_brand_key(display_name)
+    site = (getattr(business_profile, "website_url", None) or "").strip()
+    target_domain = root_domain_from_fragment(site) or ""
+
+    target_appearances = sum(
+        _target_citation_units_for_onboarding(ex, tracked_website_url_or_domain=site) for _, ex in slots
+    )
+
+    # Competitors: count every list row (same brand twice in one response = two cites)
+    competitor_appearances: dict[str, int] = {}
+    competitor_display: dict[str, str] = {}
+    competitor_domain: dict[str, str] = {}
+    for _resp, e in slots:
+        if e is None:
+            continue
+        comps = getattr(e, "competitors_json", None) or []
+        if not isinstance(comps, list):
+            continue
+        for raw in comps:
+            parsed = parse_competitor_raw_item(raw)
+            name = parsed["name"]
+            if not name:
+                continue
+            key = _visibility_brand_key(name)
+            if not key:
+                continue
+            if target_key and key == target_key:
+                continue
+            dom = root_domain_from_fragment(parsed["url"]) or ""
+            if target_domain and dom and registered_root_domains_match(target_domain, dom):
+                continue
+            competitor_appearances[key] = competitor_appearances.get(key, 0) + 1
+            competitor_display.setdefault(key, name.strip())
+            if dom and key not in competitor_domain:
+                competitor_domain[key] = dom
+
+    def pct(appearances: int) -> float:
+        return round(100.0 * float(appearances) / float(total), 1)
+
+    rows_build: list[dict[str, Any]] = []
+    for key, app in competitor_appearances.items():
+        rows_build.append(
+            {
+                "brand_key": key,
+                "brand": competitor_display.get(key, key),
+                "appearances": app,
+                "visibility_pct": pct(app),
+                "is_target": False,
+                "domain": competitor_domain.get(key, ""),
+                "sentiment": None,
+            }
+        )
+
+    rows_build.append(
+        {
+            "brand_key": target_key or "__target__",
+            "brand": display_name,
+            "appearances": target_appearances,
+            "visibility_pct": pct(target_appearances),
+            "is_target": True,
+            "domain": target_domain,
+            "sentiment": None,
+        }
+    )
+
+    rows_build.sort(key=lambda r: (-r["appearances"], str(r["brand"]).lower()))
+
+    for i, r in enumerate(rows_build):
+        r["rank"] = i + 1
+
+    target_idx = next((i for i, r in enumerate(rows_build) if r["is_target"]), 0)
+    chosen = _pick_three_onboarding_competitor_rows(rows_build, target_idx)
+
+    # Target sentiment: mode across extractions where the brand is cited
+    sents: list[str] = []
+    for _resp, e in slots:
+        if e is None:
+            continue
+        if not brand_effectively_cited(
+            bool(getattr(e, "brand_mentioned", False)),
+            getattr(e, "competitors_json", None),
+            tracked_website_url_or_domain=site,
+        ):
+            continue
+        s = str(getattr(e, "sentiment", "") or "").strip().lower()
+        if s in (
+            AEOExtractionSnapshot.SENTIMENT_POSITIVE,
+            AEOExtractionSnapshot.SENTIMENT_NEUTRAL,
+            AEOExtractionSnapshot.SENTIMENT_NEGATIVE,
+        ):
+            sents.append(s)
+    target_sentiment = None
+    if sents:
+        target_sentiment = Counter(sents).most_common(1)[0][0]
+
+    for r in chosen:
+        if r["is_target"]:
+            r["sentiment"] = target_sentiment
+
+    out_rows: list[dict[str, Any]] = []
+    for r in sorted(chosen, key=lambda x: int(x["rank"])):
+        out_rows.append(
+            {
+                "position": int(r["rank"]),
+                "brand": r["brand"],
+                "visibility_pct": float(r["visibility_pct"]),
+                "sentiment": r["sentiment"],
+                "domain": r.get("domain") or "",
+                "is_target": bool(r["is_target"]),
+            }
+        )
+
+    return {
+        "has_data": True,
+        "total_prompts": total,
+        "rows": out_rows,
+    }
 
 
 def latest_extraction_per_response(
@@ -338,9 +595,10 @@ def calculate_aeo_scores_for_business(
 
     Returns computed values plus snapshot_id when saved.
     """
+    site = (getattr(business_profile, "website_url", None) or "").strip()
     extractions = latest_extraction_per_response(business_profile)
-    visibility = calculate_visibility_score(extractions)
-    weighted_pos = calculate_weighted_position_score(extractions)
+    visibility = calculate_visibility_score(extractions, tracked_website_url=site)
+    weighted_pos = calculate_weighted_position_score(extractions, tracked_website_url=site)
     cite_share = calculate_citation_share(extractions)
     comp_dom = calculate_competitor_dominance(extractions)
 

@@ -1547,6 +1547,171 @@ def _crawl_pages_for_aeo(
         sleep_seconds = min(15.0, sleep_seconds * 1.7)
 
 
+def crawl_pages_for_onboarding(
+    *,
+    target_domain: Optional[str],
+    location_code: Optional[int] = None,
+    language_code: str = "en",
+    max_pages: int = 10,
+    timeout_seconds: int = 150,
+) -> Dict[str, Any]:
+    """
+    On-Page crawl for onboarding (bounded pages, separate cache locks from AEO).
+
+    Returns:
+        pages: list of raw DataForSEO page dicts (up to max_pages)
+        exit_reason, task_id, crawl_status: ready | error | timed_out | processing
+    """
+    normalized_domain = normalize_domain(target_domain) if target_domain else None
+    out_base: Dict[str, Any] = {
+        "pages": [],
+        "exit_reason": "",
+        "task_id": None,
+        "crawl_status": "error",
+    }
+    if not normalized_domain:
+        out_base["exit_reason"] = "no_domain"
+        return out_base
+
+    resolved_location_code = int(
+        location_code if location_code is not None else getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840)
+    )
+    lock_key = f"onboarding_onpage_lock:{normalized_domain}"
+    task_key = f"onboarding_onpage_task:{normalized_domain}"
+    lock_ttl = max(60, min(180, int(timeout_seconds)))
+    task_id: Optional[str] = None
+    lock_acquired = cache.add(lock_key, "1", lock_ttl)
+
+    if lock_acquired:
+        task_data = _post(
+            "/v3/on_page/task_post",
+            [
+                {
+                    "target": normalized_domain,
+                    "max_crawl_pages": max(1, min(int(max_pages), 10)),
+                    "load_resources": False,
+                    "enable_javascript": True,
+                },
+            ],
+        )
+        if not task_data:
+            cache.delete(lock_key)
+            out_base["exit_reason"] = "task_post_empty"
+            return out_base
+        try:
+            task_id = ((task_data.get("tasks") or [])[0] or {}).get("id")
+        except Exception:
+            task_id = None
+        if not task_id:
+            cache.delete(lock_key)
+            out_base["exit_reason"] = "missing_task_id"
+            return out_base
+        cache.set(task_key, str(task_id), lock_ttl)
+    else:
+        cached_task_id = cache.get(task_key)
+        if isinstance(cached_task_id, str) and cached_task_id.strip():
+            task_id = cached_task_id.strip()
+            logger.info(
+                "[onboarding onpage] Reusing task domain=%s task_id=%s",
+                normalized_domain,
+                task_id,
+            )
+        else:
+            out_base["exit_reason"] = "lock_in_progress"
+            out_base["crawl_status"] = "processing"
+            return out_base
+
+    started_at = time.monotonic()
+    attempt = 0
+    sleep_seconds = 2.0
+    cap = max(1, min(int(max_pages), 10))
+    while True:
+        attempt += 1
+        elapsed = float(time.monotonic() - started_at)
+        if elapsed >= float(timeout_seconds):
+            out_base["exit_reason"] = "timeout"
+            out_base["task_id"] = task_id
+            out_base["crawl_status"] = "timed_out"
+            return out_base
+
+        pages_data = _post(
+            "/v3/on_page/pages",
+            [
+                {
+                    "id": task_id,
+                    "location_code": resolved_location_code,
+                    "language_code": language_code,
+                    "limit": cap,
+                    "offset": 0,
+                    "order_by": ["page_rank,desc"],
+                },
+            ],
+        )
+        if not pages_data:
+            out_base["exit_reason"] = "api_error"
+            out_base["task_id"] = task_id
+            return out_base
+
+        pages: List[Dict[str, Any]] = []
+        task_status_code = 0
+        task_status_message = ""
+        try:
+            tasks = pages_data.get("tasks") or []
+            if tasks:
+                task_status_code = int((tasks[0] or {}).get("status_code") or 0)
+                task_status_message = str((tasks[0] or {}).get("status_message") or "")
+            for task in tasks:
+                for page_result in (task.get("result") or []):
+                    pages.extend((page_result.get("items") or [])[:cap])
+        except Exception:
+            out_base["exit_reason"] = "parse_error"
+            out_base["task_id"] = task_id
+            return out_base
+
+        if pages:
+            logger.info(
+                "[onboarding onpage] done domain=%s pages=%s task_id=%s",
+                normalized_domain,
+                len(pages[:cap]),
+                task_id,
+            )
+            if lock_acquired:
+                cache.delete(lock_key)
+            return {
+                "pages": pages[:cap],
+                "exit_reason": "finished_with_pages",
+                "task_id": task_id,
+                "crawl_status": "ready",
+            }
+
+        if task_status_code >= 40000:
+            if lock_acquired:
+                cache.delete(lock_key)
+            homepage_page = _fetch_homepage_page_for_aeo(normalized_domain)
+            if homepage_page:
+                return {
+                    "pages": [homepage_page],
+                    "exit_reason": "fallback_used",
+                    "task_id": task_id,
+                    "crawl_status": "ready",
+                }
+            logger.warning(
+                "[onboarding onpage] terminal_error domain=%s task_id=%s status=%s msg=%s",
+                normalized_domain,
+                task_id,
+                task_status_code,
+                task_status_message,
+            )
+            out_base["exit_reason"] = "api_error"
+            out_base["task_id"] = task_id
+            return out_base
+
+        next_sleep = min(15.0, sleep_seconds * random.uniform(0.8, 1.2))
+        remaining = float(timeout_seconds) - elapsed
+        time.sleep(min(next_sleep, max(0.05, remaining)))
+        sleep_seconds = min(15.0, sleep_seconds * 1.7)
+
+
 def _fetch_homepage_page_for_aeo(normalized_domain: str) -> Dict[str, Any] | None:
     """
     Minimal fallback when DataForSEO On-Page returns no page rows.
@@ -2455,6 +2620,26 @@ def normalize_domain(site_url: Optional[str]) -> Optional[str]:
     return domain if domain else None
 
 
+def seo_snapshot_context_for_profile(
+    profile: Optional[BusinessProfile],
+) -> tuple[str, int]:
+    """
+    Resolve (cached_location_mode, cached_location_code) for SEOOverviewSnapshot rows.
+
+    Matches the snapshot scoping used in views and get_cached_seo_snapshot.
+    """
+    if profile is None:
+        return "organic", 0
+    mode = str(getattr(profile, "seo_location_mode", "organic") or "organic").strip().lower()
+    if mode != "local":
+        return "organic", 0
+    default_location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
+    resolved_code, _fallback, _label = get_profile_location_code(
+        profile, default_location_code
+    )
+    return "local", int(resolved_code or 0)
+
+
 def get_cached_seo_snapshot(
     user,
     domain: str,
@@ -2493,9 +2678,11 @@ def fetch_ranked_keyword_items(
     location_code: int,
     language_code: str,
     user=None,
+    *,
+    limit: int = 100,
 ) -> List[Dict[str, Any]]:
     """
-    Call DataForSEO ranked_keywords/live and return parsed items list.
+    Call DataForSEO Labs ranked_keywords/live and return parsed items list.
     Returns [] on any failure. Logs request and first-item preview.
     """
     payload = [
@@ -2503,7 +2690,7 @@ def fetch_ranked_keyword_items(
             "target": domain,
             "location_code": int(location_code),
             "language_code": language_code,
-            "limit": 100,
+            "limit": int(limit),
         },
     ]
     logger.info(

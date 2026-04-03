@@ -22,6 +22,7 @@ from ..models import (
     BusinessProfile,
 )
 from ..openai_utils import _get_client, _get_model
+from .aeo_extraction_utils import brand_effectively_cited
 from .aeo_prompts import AEO_RECOMMENDATION_NL_SYSTEM_PROMPT
 from .aeo_scoring_utils import (
     calculate_citation_share,
@@ -86,6 +87,8 @@ def _top_competitors_from_score(score: AEOScoreSnapshot | None, limit: int = 3) 
 def analyze_visibility_gaps(
     score_snapshot: AEOScoreSnapshot | None,
     extraction_snapshots: list[AEOExtractionSnapshot],
+    *,
+    tracked_website_url: str = "",
 ) -> list[dict[str, Any]]:
     """
     Gaps where the target brand did not appear in the modeled answer for a prompt.
@@ -94,7 +97,11 @@ def analyze_visibility_gaps(
     """
     gaps: list[dict[str, Any]] = []
     for ex in extraction_snapshots:
-        if ex.brand_mentioned:
+        if brand_effectively_cited(
+            bool(ex.brand_mentioned),
+            ex.competitors_json,
+            tracked_website_url_or_domain=tracked_website_url,
+        ):
             continue
         resp = ex.response_snapshot
         gaps.append(
@@ -435,19 +442,20 @@ def generate_aeo_recommendations(
         business_profile.aeo_score_snapshots.order_by("-created_at").select_related("profile").first()
     )
     extractions = latest_extraction_per_response(business_profile)
+    site = (getattr(business_profile, "website_url", None) or "").strip()
 
     if score:
         visibility = float(score.visibility_score)
         weighted_pos = float(score.weighted_position_score)
         citation = float(score.citation_share)
     else:
-        visibility = calculate_visibility_score(extractions)
-        weighted_pos = calculate_weighted_position_score(extractions)
+        visibility = calculate_visibility_score(extractions, tracked_website_url=site)
+        weighted_pos = calculate_weighted_position_score(extractions, tracked_website_url=site)
         citation = calculate_citation_share(extractions)
 
     priority = _priority_from_scores(visibility, citation)
 
-    vis_gaps = analyze_visibility_gaps(score, extractions)
+    vis_gaps = analyze_visibility_gaps(score, extractions, tracked_website_url=site)
     cite_gaps = analyze_citation_gaps(score, extractions, citation_share=citation)
 
     recommendations: list[dict[str, Any]] = []

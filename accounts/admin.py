@@ -15,6 +15,7 @@ from .models import (
     GoogleBusinessProfileConnection,
     GoogleAdsConnection,
     MetaAdsConnection,
+    OnboardingOnPageCrawl,
     SEOOverviewSnapshot,
     ReviewsOverviewSnapshot,
     GoogleAdsKeywordIdea,
@@ -175,6 +176,32 @@ class GoogleAdsConnectionAdmin(CsvExportAdminMixin, admin.ModelAdmin):
 class MetaAdsConnectionAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "user", "expires_at", "created_at", "updated_at")
     search_fields = ("user__email", "user__username")
+
+
+@admin.register(OnboardingOnPageCrawl)
+class OnboardingOnPageCrawlAdmin(CsvExportAdminMixin, admin.ModelAdmin):
+    list_display = (
+        "id",
+        "user",
+        "business_profile",
+        "domain",
+        "status",
+        "max_pages",
+        "task_id",
+        "exit_reason",
+        "created_at",
+    )
+    list_filter = ("status", "created_at")
+    search_fields = (
+        "domain",
+        "user__email",
+        "user__username",
+        "business_profile__business_name",
+        "task_id",
+        "exit_reason",
+    )
+    raw_id_fields = ("user", "business_profile")
+    readonly_fields = ("created_at", "updated_at")
 
 
 @admin.register(ReviewsOverviewSnapshot)

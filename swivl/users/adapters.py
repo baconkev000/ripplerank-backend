@@ -36,6 +36,24 @@ class AccountAdapter(DefaultAccountAdapter):
     def is_open_for_signup(self, request: HttpRequest) -> bool:
         return getattr(settings, "ACCOUNT_ALLOW_REGISTRATION", True)
 
+    def get_login_redirect_url(self, request: HttpRequest) -> str:
+        """
+        After Google/social login, send fully onboarded users to /app even if ?next= pointed
+        at /onboarding. Incomplete users keep the normal ``next`` destination.
+        """
+        url = super().get_login_redirect_url(request)
+        user = getattr(request, "user", None)
+        if user is not None and user.is_authenticated:
+            from accounts.onboarding_completion import user_has_completed_full_onboarding
+
+            if user_has_completed_full_onboarding(user):
+                base = (getattr(settings, "FRONTEND_BASE_URL", "") or "").strip().rstrip("/")
+                if base and "://" not in base:
+                    base = f"https://{base.lstrip('/')}"
+                if base:
+                    return f"{base}/app"
+        return url
+
     def is_safe_url(self, url: str) -> bool:
         """
         Allow ?next= redirects to FRONTEND_BASE_URL even when host differs from the API host
@@ -58,6 +76,18 @@ class SocialAccountAdapter(DefaultSocialAccountAdapter):
         sociallogin: SocialLogin,
     ) -> bool:
         return getattr(settings, "ACCOUNT_ALLOW_REGISTRATION", True)
+
+    def save_user(self, request: HttpRequest, sociallogin: SocialLogin, form=None):
+        """
+        After Google (or other social) signup/login, ensure a main BusinessProfile exists
+        so onboarding can PATCH /api/business-profile/.
+        """
+        from accounts.models import BusinessProfile
+
+        user = super().save_user(request, sociallogin, form)
+        if not BusinessProfile.objects.filter(user=user).exists():
+            BusinessProfile.objects.create(user=user, is_main=True)
+        return user
 
     def populate_user(
         self,

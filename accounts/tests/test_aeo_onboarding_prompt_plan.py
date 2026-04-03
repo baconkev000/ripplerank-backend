@@ -291,3 +291,52 @@ def test_aeo_onboarding_prompt_plan_openai_shortfall_meta(monkeypatch, settings)
     assert body["meta"]["openai_prompt_count"] == 1
     assert body["groups"]["fixed"] == []
     assert body["groups"]["dynamic"] == []
+
+
+@pytest.mark.django_db
+def test_aeo_onboarding_step2_reuses_db_prompts_same_domain_no_openai(monkeypatch, settings):
+    """Step-2 POST must return saved prompts when domain matches; no build_full_aeo_prompt_plan."""
+    settings.AEO_TESTING_MODE = True
+    user = User.objects.create_user(
+        username="u-aeo-step2-cache",
+        email="u-aeo-step2-cache@example.com",
+        password="pw",
+    )
+    saved_prompts = [f"cached prompt {i}" for i in range(10)]
+    BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Cached Co",
+        business_address="US",
+        website_url="https://example.com",
+        selected_aeo_prompts=saved_prompts,
+    )
+
+    def boom(*args, **kwargs):
+        raise AssertionError("build_full_aeo_prompt_plan must not be called when DB prompts match domain")
+
+    monkeypatch.setattr("accounts.views.build_full_aeo_prompt_plan", boom)
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    resp = client.post(
+        "/api/aeo/onboarding-prompt-plan/",
+        {
+            "onboarding_step2_prompt_plan": True,
+            "selected_topics": ["Alpha", "Beta"],
+            "onboarding_context": {
+                "business_name": "Cached Co",
+                "website_url": "https://www.example.com/about",
+                "location": "US",
+                "language": "English",
+            },
+        },
+        format="json",
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["meta"]["openai_status"] == "reused_saved"
+    pbt = body["prompts_by_topic"]
+    assert set(pbt.keys()) == {"Alpha", "Beta"}
+    assert len(pbt["Alpha"]) + len(pbt["Beta"]) == 10
+    assert all(len(pbt[k]) > 0 for k in pbt)

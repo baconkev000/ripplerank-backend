@@ -18,3 +18,6 @@ SEO_LOCATIONS_SEARCH_CACHE_TTL = timedelta(days=1)
 
 # Non-SEO third-party API cache cadence.
 THIRD_PARTY_API_CACHE_TTL = timedelta(hours=1)
+
+# Onboarding: DataForSEO Labs ranked_keywords/live — cap requests and stored rows.
+ONBOARDING_RANKED_KEYWORDS_LIMIT = 50

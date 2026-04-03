@@ -12,6 +12,7 @@ from .dataforseo_utils import (
     get_aeo_content_readiness_for_site,
     get_profile_location_code,
     normalize_domain,
+    seo_snapshot_context_for_profile,
 )
 from .openai_utils import generate_aeo_recommendations
 from . import debug_log as _debug
@@ -19,6 +20,34 @@ from . import debug_log as _debug
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+
+def _fallback_top_keywords_from_stored_snapshots(profile: BusinessProfile) -> list:
+    """
+    When get_or_refresh_seo_score_for_user returns no keywords (TTL, Labs failure, etc.),
+    still surface the latest non-empty top_keywords saved on SEOOverviewSnapshot for this
+    user, domain, and location scope (same keys as snapshot pipeline).
+    """
+    site = str(getattr(profile, "website_url", "") or "").strip()
+    domain = normalize_domain(site) if site else None
+    if not domain:
+        return []
+    loc_mode, loc_code = seo_snapshot_context_for_profile(profile)
+    qs = (
+        SEOOverviewSnapshot.objects.filter(
+            user=profile.user,
+            cached_domain__iexact=domain,
+            cached_location_mode=str(loc_mode or "organic"),
+            cached_location_code=int(loc_code or 0),
+        )
+        .order_by("-last_fetched_at", "-id")
+        .only("top_keywords")
+    )
+    for snap in qs.iterator(chunk_size=32):
+        tk = getattr(snap, "top_keywords", None) or []
+        if isinstance(tk, list) and len(tk) > 0:
+            return list(tk)
+    return []
 
 
 def _aeo_prompt_target_count() -> int:
@@ -76,6 +105,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         required=False,
         allow_empty=True,
     )
+    aeo_onboarding_prompt_target_count = serializers.SerializerMethodField()
 
     class Meta:
         model = BusinessProfile
@@ -91,6 +121,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "description",
             "website_url",
             "selected_aeo_prompts",
+            "aeo_onboarding_prompt_target_count",
             "plan",
             "is_main",
             "seo_competitor_domains_override",
@@ -125,7 +156,16 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "email", "created_at", "updated_at"]
+        read_only_fields = [
+            "id",
+            "email",
+            "aeo_onboarding_prompt_target_count",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_aeo_onboarding_prompt_target_count(self, obj: BusinessProfile) -> int:
+        return _aeo_prompt_target_count()
 
     def validate_website_url(self, value):
         """Normalize URL to include scheme."""
@@ -260,10 +300,28 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         return int(val) if val is not None else None
 
     def get_top_keywords(self, obj: BusinessProfile):
-        bundle = self._get_seo_bundle(obj)
-        if not bundle:
+        context = getattr(self, "context", {}) or {}
+        if context.get("skip_heavy_profile_metrics"):
+            # Cached snapshot only — lets onboarding hydrate keyword topics without DataForSEO.
+            snap = (
+                SEOOverviewSnapshot.objects.filter(user=obj.user)
+                .order_by("-last_fetched_at", "-id")
+                .only("top_keywords")
+                .first()
+            )
+            if snap is not None:
+                tk = getattr(snap, "top_keywords", None) or []
+                return list(tk) if isinstance(tk, list) else []
             return []
-        return bundle.get("top_keywords") or []
+        bundle = self._get_seo_bundle(obj)
+        from_bundle: list = []
+        if bundle:
+            raw = bundle.get("top_keywords")
+            if isinstance(raw, list):
+                from_bundle = list(raw)
+        if from_bundle:
+            return from_bundle
+        return _fallback_top_keywords_from_stored_snapshots(obj)
 
     def get_seo_next_steps(self, obj: BusinessProfile):
         bundle = self._get_seo_bundle(obj)

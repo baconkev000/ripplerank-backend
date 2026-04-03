@@ -8,13 +8,13 @@ from django.conf import settings
 from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone as django_timezone
-from django.contrib.auth import get_user_model, login, logout as django_logout
+from django.contrib.auth import authenticate, get_user_model, login, logout as django_logout
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import redirect
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import api_view, permission_classes, authentication_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from .models import (
@@ -27,6 +27,7 @@ from .models import (
     ReviewsOverviewSnapshot,
     AgentConversation,
     AgentMessage,
+    OnboardingOnPageCrawl,
 )
 
 # Third-party API cache: only refetch from GSC/GBP if last fetch was >= this long ago.
@@ -46,12 +47,15 @@ from .dataforseo_utils import (
     get_or_refresh_seo_score_for_user,
     get_profile_location_code,
     normalize_domain,
+    seo_snapshot_context_for_profile,
 )
 from .constants import SEO_SNAPSHOT_TTL
+from .onboarding_completion import user_has_completed_full_onboarding
 from . import openai_utils
 from . import debug_log as _debug
 from .aeo.aeo_utils import (
     AEO_ONBOARDING_PROMPT_COUNT,
+    aeo_business_input_from_onboarding_payload,
     aeo_business_input_from_profile,
     build_full_aeo_prompt_plan,
     plan_items_from_saved_prompt_strings,
@@ -64,12 +68,7 @@ User = get_user_model()
 
 def _seo_snapshot_context_for_profile(profile: BusinessProfile | None) -> tuple[str, int]:
     """Resolve snapshot identity context for SEO snapshots."""
-    mode = str(getattr(profile, "seo_location_mode", "organic") or "organic").strip().lower()
-    if mode != "local":
-        return "organic", 0
-    default_location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
-    resolved_code, _fallback, _label = get_profile_location_code(profile, default_location_code)
-    return "local", int(resolved_code or 0)
+    return seo_snapshot_context_for_profile(profile)
 
 
 def classify_intent(keyword: str) -> str:
@@ -105,6 +104,210 @@ class CsrfExemptSessionAuthentication(SessionAuthentication):
 
 def health_check(_: HttpRequest) -> JsonResponse:
     return JsonResponse({"status": "ok"})
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([AllowAny])
+def auth_status(request: HttpRequest) -> Response:
+    """
+    Session-aware status for the Next.js app: whether the browser has a Django session
+    and whether the main BusinessProfile looks onboarded (matches google_callback rules).
+    """
+    if not request.user.is_authenticated:
+        return Response({"authenticated": False, "onboarding_complete": False})
+    try:
+        onboarding_complete = user_has_completed_full_onboarding(request.user)
+    except Exception:
+        logger.exception("[auth_status] business profile check failed")
+        onboarding_complete = False
+    return Response(
+        {"authenticated": True, "onboarding_complete": onboarding_complete},
+    )
+
+
+def _onboarding_domain_claimed_by_other_user(domain: str, user) -> bool:
+    """True if any other user's business profile uses this normalized domain."""
+    if not domain:
+        return False
+    for bp in BusinessProfile.objects.exclude(user=user).exclude(website_url="").only("id", "website_url"):
+        if normalize_domain(bp.website_url or "") == domain:
+            return True
+    return False
+
+
+def _onboarding_reusable_crawl_for_user(user, domain: str) -> OnboardingOnPageCrawl | None:
+    """Latest completed onboarding crawl for this user/domain with stored ranked keywords."""
+    if not domain:
+        return None
+    qs = OnboardingOnPageCrawl.objects.filter(
+        user=user,
+        domain=domain,
+        status=OnboardingOnPageCrawl.STATUS_COMPLETED,
+    ).order_by("-created_at")
+    for crawl in qs[:5]:
+        if crawl.ranked_keywords:
+            return crawl
+    return None
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
+    """
+    Queue DataForSEO On-Page crawl (max 10 pages) after onboarding step 1.
+
+    If the domain is already on another user's business profile, returns 409.
+    If this user already has a completed crawl with ranked keywords for the domain,
+    returns that row without enqueueing a new crawl.
+    """
+    from .tasks import onboarding_onpage_crawl_task
+
+    website_url = (request.data.get("website_url") or "").strip()
+    business_name = (request.data.get("business_name") or "").strip()
+    location = (request.data.get("location") or "").strip()
+    domain = normalize_domain(website_url)
+    if not domain:
+        return Response({"error": "A valid website_url is required"}, status=400)
+
+    if _onboarding_domain_claimed_by_other_user(domain, request.user):
+        return Response(
+            {
+                "error": (
+                    "This website is already linked to another account. "
+                    "Use a different URL or sign in with the account that owns it."
+                ),
+            },
+            status=409,
+        )
+
+    reused = _onboarding_reusable_crawl_for_user(request.user, domain)
+    if reused is not None:
+        return Response(
+            {
+                "id": reused.id,
+                "status": reused.status,
+                "domain": domain,
+                "reused": True,
+                "ranked_keywords": reused.ranked_keywords or [],
+            },
+        )
+
+    try:
+        profile_qs = BusinessProfile.objects.filter(user=request.user)
+        profile = profile_qs.filter(is_main=True).first() or profile_qs.first()
+        if profile is None:
+            profile = BusinessProfile.objects.create(user=request.user, is_main=True)
+
+        crawl = OnboardingOnPageCrawl.objects.create(
+            user=request.user,
+            business_profile=profile,
+            domain=domain,
+            max_pages=10,
+            context={"business_name": business_name, "location": location},
+            status=OnboardingOnPageCrawl.STATUS_PENDING,
+        )
+        cid = crawl.id
+
+        def _enqueue() -> None:
+            onboarding_onpage_crawl_task.delay(cid)
+
+        transaction.on_commit(_enqueue)
+        return Response({"id": crawl.id, "status": crawl.status, "domain": domain})
+    except Exception:
+        logger.exception(
+            "[onboarding_onpage_crawl_start] failed user_id=%s domain=%s",
+            getattr(request.user, "id", None),
+            domain,
+        )
+        return Response(
+            {"error": "Crawl could not be started. Contact your administrator."},
+            status=500,
+        )
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def onboarding_crawl_latest(request: HttpRequest) -> Response:
+    """Latest onboarding crawl for polling (ranked keywords up to ONBOARDING_RANKED_KEYWORDS_LIMIT)."""
+    domain_param = (request.GET.get("domain") or "").strip().lower()
+    base = OnboardingOnPageCrawl.objects.filter(user=request.user)
+    if domain_param:
+        crawl = base.filter(domain=domain_param).order_by("-created_at").first()
+    else:
+        crawl = base.order_by("-created_at").first()
+    if not crawl:
+        return Response(
+            {"id": None, "status": "none", "ranked_keywords": [], "domain": None},
+        )
+    return Response(
+        {
+            "id": crawl.id,
+            "status": crawl.status,
+            "domain": crawl.domain,
+            "ranked_keywords": crawl.ranked_keywords or [],
+            "exit_reason": crawl.exit_reason,
+            "ranked_keywords_error": crawl.ranked_keywords_error or "",
+        },
+    )
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([AllowAny])
+def api_auth_login(request: HttpRequest) -> Response:
+    """Email + password login; establishes Django session for the Next.js app."""
+    email = (request.data.get("email") or "").strip()
+    password = request.data.get("password") or ""
+    if not email or not password:
+        return Response({"error": "Email and password are required"}, status=400)
+    user = User.objects.filter(email__iexact=email).first()
+    if user is not None:
+        if not user.check_password(password):
+            return Response({"error": "Invalid email or password"}, status=400)
+    else:
+        user = authenticate(request, username=email, password=password)
+        if user is None:
+            return Response({"error": "Invalid email or password"}, status=400)
+    if not user.is_active:
+        return Response({"error": "Account is disabled"}, status=400)
+    login(request, user)
+    try:
+        done = user_has_completed_full_onboarding(user)
+    except Exception:
+        logger.exception("[api_auth_login] onboarding check failed")
+        done = False
+    return Response({"ok": True, "redirect": "/app" if done else "/onboarding"})
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([AllowAny])
+def api_auth_register(request: HttpRequest) -> Response:
+    """Create a local user, main BusinessProfile, and session (SPA signup)."""
+    email = (request.data.get("email") or "").strip().lower()
+    password = request.data.get("password") or ""
+    if not email or len(password) < 6:
+        return Response(
+            {"error": "Valid email and password (min 6 characters) required"},
+            status=400,
+        )
+    if User.objects.filter(email__iexact=email).exists() or User.objects.filter(
+        username__iexact=email
+    ).exists():
+        return Response({"error": "An account with this email already exists"}, status=400)
+    user = User.objects.create_user(username=email, email=email, password=password)
+    if not BusinessProfile.objects.filter(user=user).exists():
+        BusinessProfile.objects.create(user=user, is_main=True)
+    login(request, user)
+    return Response({"ok": True, "redirect": "/onboarding"})
 
 
 def google_login(request: HttpRequest) -> HttpResponse:
@@ -226,21 +429,16 @@ def google_callback(request: HttpRequest) -> HttpResponse:
 
     login(request, user)
 
-    # Require a filled BusinessProfile before entering the app.
-    # Django's business_profile endpoint auto-creates a blank row; treat that as "not onboarded".
+    # Align with auth/status: profile + keywords + saved AEO prompts + AEO responses + extractions.
     try:
-        qs = BusinessProfile.objects.filter(user=user)
-        profile = qs.filter(is_main=True).first() or qs.first()
-        if not profile:
+        if user_has_completed_full_onboarding(user):
+            next_url = frontend_base + "/app"
+        elif not session_next:
             next_url = frontend_base + "/onboarding"
-        else:
-            has_business_name = bool((profile.business_name or "").strip())
-            has_website_url = bool((profile.website_url or "").strip())
-            has_business_address = bool((profile.business_address or "").strip())
-            if not has_business_name or not has_website_url or not has_business_address:
-                next_url = frontend_base + "/onboarding"
+        # else keep ``next_url`` from session (set above)
     except Exception:
-        logger.exception("[auth] business_profile existence check failed; continuing to next_url")
+        logger.exception("[auth] onboarding check failed; sending to onboarding")
+        next_url = frontend_base + "/onboarding"
 
     return redirect(next_url)
 
@@ -1745,27 +1943,24 @@ def aeo_profile_data(request: HttpRequest) -> Response:
     return Response(serializer.data)
 
 
-@csrf_exempt
-@api_view(["GET"])
-@authentication_classes([CsrfExemptSessionAuthentication])
-@permission_classes([IsAuthenticated])
-def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
+def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
     """
-    Cached-only prompt coverage read for AI Visibility UI.
-    One row per unique prompt text; per-platform (OpenAI / Gemini) citation from latest snapshot each.
+    One row per monitored / seen prompt; per-platform (OpenAI / Gemini) cells from latest snapshot each.
     """
-    from .models import AEOResponseSnapshot
-
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
+    from .aeo.aeo_extraction_utils import (
+        brand_effectively_cited,
+        citations_ranking_for_prompt_coverage,
+        merge_citations_rankings_across_platform_cells,
+        merged_target_url_position,
+        unique_business_count_excluding_target,
     )
-    if not profile:
-        return Response({"prompts": [], "monitored_count": 0})
+    from .models import AEOResponseSnapshot
 
     selected_prompt_count = len(
         [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
     )
+    profile_site = (getattr(profile, "website_url", None) or "").strip()
+    profile_business_name = (getattr(profile, "business_name", None) or "").strip()
 
     responses = list(
         AEOResponseSnapshot.objects.filter(profile=profile).order_by("-created_at", "-id")
@@ -1800,18 +1995,40 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
         latest_ex = resp.extraction_snapshots.order_by("-created_at", "-id").first()
         competitors_count = 0
         cited = False
+        ranking: list = []
+        target_url_position = None
         if latest_ex is not None:
-            cited = bool(latest_ex.brand_mentioned)
+            cited = brand_effectively_cited(
+                bool(latest_ex.brand_mentioned),
+                latest_ex.competitors_json,
+                tracked_website_url_or_domain=profile_site,
+            )
             comps = latest_ex.competitors_json or []
             competitors_count = len(comps) if isinstance(comps, list) else 0
+            ranking, target_url_position = citations_ranking_for_prompt_coverage(
+                latest_ex.citations_json,
+                latest_ex.competitors_json,
+                tracked_website_url_or_domain=profile_site,
+                brand_mentioned=bool(latest_ex.brand_mentioned),
+                tracked_business_name=profile_business_name,
+            )
         return {
             "has_data": True,
             "cited": cited,
             "competitors_cited": competitors_count,
             "response_created_at": resp.created_at.isoformat() if resp.created_at else None,
+            "target_url_position": target_url_position,
+            "citations_ranking": ranking,
         }
 
-    empty_cell = {"has_data": False, "cited": None, "competitors_cited": None, "response_created_at": None}
+    empty_cell = {
+        "has_data": False,
+        "cited": None,
+        "competitors_cited": None,
+        "response_created_at": None,
+        "target_url_position": None,
+        "citations_ranking": [],
+    }
 
     ordered_keys: list[str] = []
     seen: set[str] = set()
@@ -1833,24 +2050,214 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
             "openai": platform_cell(plat_latest["openai"]) if "openai" in plat_latest else dict(empty_cell),
             "gemini": platform_cell(plat_latest["gemini"]) if "gemini" in plat_latest else dict(empty_cell),
         }
-        max_comp = 0
-        for cell in platforms.values():
-            if cell["has_data"] and isinstance(cell.get("competitors_cited"), int):
-                max_comp = max(max_comp, int(cell["competitors_cited"]))
         any_row = next(iter(rows), None)
         prompt_type = ""
         if any_row is not None:
             prompt_type = str(any_row.prompt_type or "")
+        o_cell = platforms["openai"]
+        g_cell = platforms["gemini"]
+        pos_candidates: list[int] = []
+        if o_cell.get("has_data") and o_cell.get("cited") and o_cell.get("target_url_position") is not None:
+            pos_candidates.append(int(o_cell["target_url_position"]))
+        if g_cell.get("has_data") and g_cell.get("cited") and g_cell.get("target_url_position") is not None:
+            pos_candidates.append(int(g_cell["target_url_position"]))
+        target_url_position_best = min(pos_candidates) if pos_candidates else None
+
+        merged_ranking = merge_citations_rankings_across_platform_cells([o_cell, g_cell])
+        target_from_merged = merged_target_url_position(merged_ranking)
+        combined_ranking = merged_ranking
+        combined_target = (
+            target_from_merged if target_from_merged is not None else target_url_position_best
+        )
+        comp_other_businesses = unique_business_count_excluding_target(merged_ranking)
+
         prompts.append(
             {
                 "prompt": key,
                 "prompt_type": prompt_type,
-                "competitors_cited": max_comp,
+                "competitors_cited": comp_other_businesses,
                 "platforms": platforms,
+                "target_url_position": combined_target,
+                "citations_ranking": combined_ranking,
             }
         )
 
-    return Response({"prompts": prompts, "monitored_count": selected_prompt_count})
+    tracked_name = profile_business_name
+    return {
+        "prompts": prompts,
+        "monitored_count": selected_prompt_count,
+        "tracked_business_name": tracked_name,
+    }
+
+
+def _aeo_profile_visibility_pending(profile: BusinessProfile) -> bool:
+    """
+    True while prompt LLM responses or extraction snapshots are still in flight for monitored
+    prompts — dashboard should show a loading state instead of partial visibility %.
+    """
+    from .models import AEOResponseSnapshot, AEOExecutionRun
+
+    monitored = [str(x).strip() for x in (profile.selected_aeo_prompts or []) if str(x).strip()]
+    if not monitored:
+        return False
+
+    if AEOExecutionRun.objects.filter(
+        profile=profile,
+        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+    ).exists():
+        return True
+
+    latest_run = (
+        AEOExecutionRun.objects.filter(profile=profile).order_by("-created_at", "-id").first()
+    )
+    if latest_run is not None and latest_run.status == AEOExecutionRun.STATUS_COMPLETED:
+        if latest_run.extraction_status in (
+            AEOExecutionRun.STAGE_PENDING,
+            AEOExecutionRun.STAGE_RUNNING,
+        ):
+            return True
+
+    responses = list(
+        AEOResponseSnapshot.objects.filter(profile=profile)
+        .order_by("-created_at", "-id")
+        .prefetch_related("extraction_snapshots")
+    )
+    by_prompt: dict[str, list] = {}
+    for resp in responses:
+        key = (resp.prompt_text or "").strip()
+        if not key:
+            continue
+        by_prompt.setdefault(key, []).append(resp)
+
+    def _response_sort_key(x):
+        c = x.created_at
+        if c is None:
+            return (datetime.min.replace(tzinfo=timezone.utc), x.id)
+        if django_timezone.is_naive(c):
+            c = django_timezone.make_aware(c, timezone.utc)
+        return (c, x.id)
+
+    def latest_snapshot_per_platform(rows: list) -> dict[str, object]:
+        best: dict[str, object] = {}
+        for r in sorted(rows, key=_response_sort_key, reverse=True):
+            plat = str(r.platform or "").strip().lower()
+            if plat not in ("openai", "gemini"):
+                continue
+            if plat not in best:
+                best[plat] = r
+        return best
+
+    for key in monitored:
+        rows = by_prompt.get(key, [])
+        plat_latest = latest_snapshot_per_platform(rows)
+        for plat in ("openai", "gemini"):
+            if plat not in plat_latest:
+                continue
+            resp = plat_latest[plat]
+            if len(resp.extraction_snapshots.all()) == 0:
+                return True
+    return False
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
+    """
+    Cached-only prompt coverage read for AI Visibility UI.
+    One row per unique prompt text; per-platform (OpenAI / Gemini) citation from latest snapshot each.
+    """
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response({"prompts": [], "monitored_count": 0, "tracked_business_name": ""})
+    return Response(_build_aeo_prompt_coverage_payload(profile))
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_platform_visibility_data(request: HttpRequest) -> Response:
+    """
+    Per-LLM visibility % from extractions: share of prompts with a scan where the brand is cited.
+
+    OpenAI (ChatGPT) and Gemini are computed from stored snapshots. Other platforms return 0%
+    until integrations exist (frontend still shows them).
+    """
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response({"platforms": []})
+
+    payload = _build_aeo_prompt_coverage_payload(profile)
+    prompts = payload.get("prompts") or []
+
+    def aggregate(api_key: str) -> tuple[int, int]:
+        with_data = 0
+        cited = 0
+        for row in prompts:
+            cell = (row.get("platforms") or {}).get(api_key) or {}
+            if not cell.get("has_data"):
+                continue
+            with_data += 1
+            if cell.get("cited"):
+                cited += 1
+        return with_data, cited
+
+    def pct(with_data: int, cited_count: int) -> float:
+        if with_data <= 0:
+            return 0.0
+        return round(100.0 * float(cited_count) / float(with_data), 1)
+
+    o_w, o_c = aggregate("openai")
+    g_w, g_c = aggregate("gemini")
+
+    platforms_out = [
+        {
+            "key": "openai",
+            "label": "ChatGPT",
+            "visibility_pct": pct(o_w, o_c),
+            "has_data": o_w > 0,
+            "prompts_with_data": o_w,
+            "prompts_cited": o_c,
+            "has_backend": True,
+        },
+        {
+            "key": "perplexity",
+            "label": "Perplexity",
+            "visibility_pct": 0.0,
+            "has_data": False,
+            "prompts_with_data": 0,
+            "prompts_cited": 0,
+            "has_backend": False,
+        },
+        {
+            "key": "gemini",
+            "label": "Gemini",
+            "visibility_pct": pct(g_w, g_c),
+            "has_data": g_w > 0,
+            "prompts_with_data": g_w,
+            "prompts_cited": g_c,
+            "has_backend": True,
+        },
+        {
+            "key": "grok",
+            "label": "Grok",
+            "visibility_pct": 0.0,
+            "has_data": False,
+            "prompts_with_data": 0,
+            "prompts_cited": 0,
+            "has_backend": False,
+        },
+    ]
+    visibility_pending = _aeo_profile_visibility_pending(profile)
+    return Response({"platforms": platforms_out, "visibility_pending": visibility_pending})
 
 
 @csrf_exempt
@@ -1881,6 +2288,26 @@ def aeo_share_of_voice_data(request: HttpRequest) -> Response:
         )
     payload = aggregate_aeo_share_of_voice(profile)
     return Response(payload)
+
+
+@csrf_exempt
+@api_view(["GET"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def aeo_onboarding_competitors_data(request: HttpRequest) -> Response:
+    """
+    Onboarding Search Analytics: up to 3 brands (top 2 competitors + target) with visibility %
+    from AEO extraction snapshots across all LLM platforms.
+    """
+    from .aeo.aeo_scoring_utils import aeo_onboarding_competitors_visibility
+
+    profile = (
+        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
+        or BusinessProfile.objects.filter(user=request.user).first()
+    )
+    if not profile:
+        return Response({"has_data": False, "total_prompts": 0, "rows": []})
+    return Response(aeo_onboarding_competitors_visibility(profile))
 
 
 @csrf_exempt
@@ -2240,6 +2667,16 @@ def _onboarding_reuse_saved_prompts(request: HttpRequest, body: dict) -> bool:
     return _truthy_openai_param(request.GET.get("reuse_saved"))
 
 
+def _onboarding_skip_execution(request: HttpRequest, body: dict) -> bool:
+    """When true with reuse_saved, return saved prompts without enqueueing phase 1."""
+    v = body.get("skip_execution") if isinstance(body, dict) else None
+    if isinstance(v, bool):
+        return v
+    if v is not None:
+        return _truthy_openai_param(str(v))
+    return _truthy_openai_param(request.GET.get("skip_execution"))
+
+
 def _aeo_prompt_target_count() -> int:
     testing_mode = bool(getattr(settings, "AEO_TESTING_MODE", False))
     if testing_mode:
@@ -2263,6 +2700,60 @@ def _first_nonempty_str(*vals) -> str | None:
     return None
 
 
+def _normalize_onboarding_topic_details(
+    selected_topics: list[str],
+    topic_details_raw: object,
+) -> list[dict[str, object]]:
+    """Merge client topic rows with optional Labs/AEO metadata keyed by keyword."""
+    by_kw: dict[str, dict[str, object]] = {}
+    if isinstance(topic_details_raw, list):
+        for item in topic_details_raw:
+            if isinstance(item, dict):
+                kw = str(item.get("keyword") or "").strip()
+                if kw:
+                    by_kw[kw.casefold()] = item
+    out: list[dict[str, object]] = []
+    for t in selected_topics:
+        t = str(t).strip()
+        if not t:
+            continue
+        base: dict[str, object] = {"keyword": t}
+        extra = by_kw.get(t.casefold())
+        if extra:
+            for key in ("search_volume", "rank", "rank_group", "aeo_score", "aeo_category", "aeo_reason"):
+                if key in extra and extra[key] is not None and str(extra[key]).strip() != "":
+                    base[key] = extra[key]
+        out.append(base)
+    return out
+
+
+def _saved_prompts_domain_matches_onboarding_context(
+    profile: BusinessProfile,
+    website_url_from_context: str,
+) -> bool:
+    """True when stored profile URL and onboarding context URL normalize to the same domain."""
+    prof = normalize_domain(profile.website_url or "") or ""
+    ctx = normalize_domain(website_url_from_context or "") or ""
+    if not prof or not ctx:
+        return False
+    return prof == ctx
+
+
+def _assign_saved_prompts_to_selected_topics(
+    prompt_texts: list[str],
+    topics: list[str],
+) -> dict[str, list[str]]:
+    """Round-robin assign flat saved prompts onto topic tabs (same shape as onboarding UI)."""
+    topics_list = [str(t).strip() for t in topics if str(t).strip()]
+    out: dict[str, list[str]] = {t: [] for t in topics_list}
+    if not topics_list:
+        return out
+    clean = [str(p).strip() for p in prompt_texts if str(p).strip()]
+    for i, p in enumerate(clean):
+        out[topics_list[i % len(topics_list)]].append(p)
+    return out
+
+
 @csrf_exempt
 @api_view(["GET", "POST"])
 @authentication_classes([CsrfExemptSessionAuthentication])
@@ -2283,6 +2774,14 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     - ``industry`` — explicit industry override for prompt context.
     - ``reuse_saved`` — when ``true`` and the profile already has ``selected_aeo_prompts`` of length
       ``AEO_ONBOARDING_PROMPT_COUNT``, return that list without calling OpenAI or rebuilding templates.
+    - ``skip_execution`` — with ``reuse_saved``, do not enqueue AEO phase 1 (read-only for onboarding resume).
+
+    **Onboarding step 2 → prompts** (POST JSON): set ``onboarding_step2_prompt_plan`` to ``true`` and send
+    ``selected_topics`` (strings), optional ``topic_details`` (per-keyword metadata), and
+    ``onboarding_context`` with ``business_name``, ``website_url``, ``location``, ``language``.
+    If the profile already has a full ``selected_aeo_prompts`` list for the **same** normalized domain as
+    ``website_url`` in context, returns those prompts (with ``prompts_by_topic``) without OpenAI or
+    DataForSEO. Otherwise builds a new plan via OpenAI.
 
     Response ``meta`` includes ``openai_status`` (``ok`` | ``partial`` | ``failed_empty`` |
     ``reused_saved``) and ``openai_message`` when generation cannot hit target count.
@@ -2302,12 +2801,76 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     industry_override = _first_nonempty_str(body.get("industry"), request.GET.get("industry"))
     include_openai = _onboarding_plan_include_openai(request, body)
     reuse_saved = _onboarding_reuse_saved_prompts(request, body)
+    skip_execution = _onboarding_skip_execution(request, body)
+
+    onboarding_step2 = bool(body.get("onboarding_step2_prompt_plan"))
+    selected_topics_raw = body.get("selected_topics")
 
     target_prompt_count = _aeo_prompt_target_count()
+    saved_raw = list(profile.selected_aeo_prompts or [])
 
-    saved = profile.selected_aeo_prompts or []
-    if reuse_saved and isinstance(saved, list) and len(saved) == target_prompt_count:
-        raw_items = plan_items_from_saved_prompt_strings([str(x) for x in saved])
+    selected_topics: list[str] = []
+    if onboarding_step2:
+        if not isinstance(selected_topics_raw, list):
+            return Response(
+                {"error": "selected_topics must be a non-empty list when onboarding_step2_prompt_plan is set."},
+                status=400,
+            )
+        selected_topics = [str(s).strip() for s in selected_topics_raw if str(s).strip()]
+        if not selected_topics:
+            return Response(
+                {"error": "selected_topics must be a non-empty list when onboarding_step2_prompt_plan is set."},
+                status=400,
+            )
+        oc_early = body.get("onboarding_context") if isinstance(body.get("onboarding_context"), dict) else {}
+        website_url_ctx = str(oc_early.get("website_url") or "").strip()
+        if (
+            len(saved_raw) == target_prompt_count
+            and _saved_prompts_domain_matches_onboarding_context(profile, website_url_ctx)
+        ):
+            raw_items = plan_items_from_saved_prompt_strings([str(x) for x in saved_raw])
+            if len(raw_items) == target_prompt_count:
+                ser = _serialize_aeo_prompt_items(raw_items)
+                prompt_texts = [
+                    str(x.get("prompt") or "").strip() for x in ser if str(x.get("prompt") or "").strip()
+                ]
+                if len(prompt_texts) == target_prompt_count:
+                    pbt = _assign_saved_prompts_to_selected_topics(prompt_texts, selected_topics)
+                    if all(len(pbt.get(t, [])) > 0 for t in selected_topics):
+                        business_input = aeo_business_input_from_onboarding_payload(
+                            business_name=str(oc_early.get("business_name") or ""),
+                            website_url=website_url_ctx,
+                            location=str(oc_early.get("location") or ""),
+                            language=str(oc_early.get("language") or ""),
+                            selected_topics=selected_topics,
+                        )
+                        return Response(
+                            {
+                                "groups": {
+                                    "fixed": [],
+                                    "dynamic": [],
+                                    "openai_generated": [],
+                                    "saved": ser,
+                                },
+                                "combined": ser,
+                                "business": business_input.as_dict(),
+                                "meta": {
+                                    "openai_status": "reused_saved",
+                                    "openai_message": "",
+                                    "openai_prompt_count": 0,
+                                    "combined_count": len(ser),
+                                    "combined_target": target_prompt_count,
+                                    "combined_shortfall": 0,
+                                },
+                                "prompts_by_topic": pbt,
+                            }
+                        )
+
+    if onboarding_step2:
+        reuse_saved = False
+
+    if reuse_saved and isinstance(saved_raw, list) and len(saved_raw) == target_prompt_count:
+        raw_items = plan_items_from_saved_prompt_strings([str(x) for x in saved_raw])
         if len(raw_items) == target_prompt_count:
             ser = _serialize_aeo_prompt_items(raw_items)
             biz = aeo_business_input_from_profile(
@@ -2315,27 +2878,28 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
                 city=city_override,
                 industry=industry_override,
             ).as_dict()
-            try:
-                from .models import AEOExecutionRun
-                from .tasks import run_aeo_phase1_execution_task
+            if not skip_execution:
+                try:
+                    from .models import AEOExecutionRun
+                    from .tasks import run_aeo_phase1_execution_task
 
-                inflight = AEOExecutionRun.objects.filter(
-                    profile=profile,
-                    status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
-                ).exists()
-                if not inflight:
-                    run = AEOExecutionRun.objects.create(
+                    inflight = AEOExecutionRun.objects.filter(
                         profile=profile,
-                        prompt_count_requested=len(ser),
-                        status=AEOExecutionRun.STATUS_PENDING,
-                    )
-                    transaction.on_commit(
-                        lambda run_id=run.id, prompt_payload=ser: run_aeo_phase1_execution_task.delay(
-                            run_id, prompt_payload
+                        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+                    ).exists()
+                    if not inflight:
+                        run = AEOExecutionRun.objects.create(
+                            profile=profile,
+                            prompt_count_requested=len(ser),
+                            status=AEOExecutionRun.STATUS_PENDING,
                         )
-                    )
-            except Exception:
-                logger.exception("[AEO onboarding] failed to enqueue phase1 execution (reuse_saved)")
+                        transaction.on_commit(
+                            lambda run_id=run.id, prompt_payload=ser: run_aeo_phase1_execution_task.delay(
+                                run_id, prompt_payload
+                            )
+                        )
+                except Exception:
+                    logger.exception("[AEO onboarding] failed to enqueue phase1 execution (reuse_saved)")
             return Response(
                 {
                     "groups": {
@@ -2354,16 +2918,35 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
                         "combined_target": target_prompt_count,
                         "combined_shortfall": 0,
                     },
+                    "prompts_by_topic": {},
                 }
             )
 
-    plan = build_full_aeo_prompt_plan(
-        profile,
-        city=city_override,
-        industry=industry_override,
-        include_openai=include_openai,
-        target_combined_count=target_prompt_count,
-    )
+    if onboarding_step2:
+        oc = body.get("onboarding_context") if isinstance(body.get("onboarding_context"), dict) else {}
+        details_norm = _normalize_onboarding_topic_details(selected_topics, body.get("topic_details"))
+        business_input = aeo_business_input_from_onboarding_payload(
+            business_name=str(oc.get("business_name") or ""),
+            website_url=str(oc.get("website_url") or ""),
+            location=str(oc.get("location") or ""),
+            language=str(oc.get("language") or ""),
+            selected_topics=selected_topics,
+        )
+        plan = build_full_aeo_prompt_plan(
+            profile,
+            business_input=business_input,
+            onboarding_topic_details=details_norm,
+            include_openai=include_openai,
+            target_combined_count=target_prompt_count,
+        )
+    else:
+        plan = build_full_aeo_prompt_plan(
+            profile,
+            city=city_override,
+            industry=industry_override,
+            include_openai=include_openai,
+            target_combined_count=target_prompt_count,
+        )
     fixed = _serialize_aeo_prompt_items(plan.get("fixed") or [])
     dynamic = _serialize_aeo_prompt_items(plan.get("dynamic") or [])
     openai_generated = _serialize_aeo_prompt_items(plan.get("openai_generated") or [])
@@ -2396,6 +2979,10 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     except Exception:
         logger.exception("[AEO onboarding] failed to enqueue phase1 execution")
 
+    prompts_by_topic = plan.get("prompts_by_topic") or {}
+    if not isinstance(prompts_by_topic, dict):
+        prompts_by_topic = {}
+
     return Response(
         {
             "groups": {
@@ -2407,6 +2994,7 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
             "combined": combined,
             "business": plan.get("business") or {},
             "meta": plan.get("meta") or {},
+            "prompts_by_topic": prompts_by_topic,
         }
     )
 
@@ -2908,11 +3496,12 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
 @csrf_exempt
 @api_view(["POST"])
 @authentication_classes([CsrfExemptSessionAuthentication])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
 def api_logout(request: HttpRequest) -> Response:
     """
     Log out the current user from the Django session (Google SSO).
     """
-    django_logout(request)
+    if request.user.is_authenticated:
+        django_logout(request)
     return Response({"success": True})
 

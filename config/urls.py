@@ -37,6 +37,19 @@ urlpatterns += [
     path("api/", include("config.api_router")),
     # DRF auth token
     path("api/auth-token/", obtain_auth_token, name="obtain_auth_token"),
+    path("api/auth/status/", accounts_views.auth_status, name="auth-status"),
+    path("api/auth/login/", accounts_views.api_auth_login, name="api-auth-login"),
+    path("api/auth/register/", accounts_views.api_auth_register, name="api-auth-register"),
+    path(
+        "api/onboarding/onpage-crawl/",
+        accounts_views.onboarding_onpage_crawl_start,
+        name="onboarding-onpage-crawl",
+    ),
+    path(
+        "api/onboarding/crawl/latest/",
+        accounts_views.onboarding_crawl_latest,
+        name="onboarding-crawl-latest",
+    ),
     # Business profile for settings page (main profile) + list/create/update profiles
     path("api/business-profile/", accounts_views.business_profile, name="business-profile"),
     path("api/business-profiles/", accounts_views.business_profile_list, name="business-profile-list"),
@@ -56,7 +69,17 @@ urlpatterns += [
     path("api/seo/score-history/", accounts_views.seo_score_history_data, name="seo-score-history-data"),
     path("api/aeo/profile/", accounts_views.aeo_profile_data, name="aeo-profile-data"),
     path("api/aeo/prompt-coverage/", accounts_views.aeo_prompt_coverage_data, name="aeo-prompt-coverage-data"),
+    path(
+        "api/aeo/platform-visibility/",
+        accounts_views.aeo_platform_visibility_data,
+        name="aeo-platform-visibility-data",
+    ),
     path("api/aeo/share-of-voice/", accounts_views.aeo_share_of_voice_data, name="aeo-share-of-voice-data"),
+    path(
+        "api/aeo/onboarding-competitors/",
+        accounts_views.aeo_onboarding_competitors_data,
+        name="aeo-onboarding-competitors-data",
+    ),
     path("api/aeo/pipeline-status/", accounts_views.aeo_pipeline_status_data, name="aeo-pipeline-status-data"),
     path("api/aeo/refresh-snapshot/", accounts_views.refresh_aeo_snapshot, name="refresh-aeo-snapshot"),
     path("api/aeo/refresh-gemini/", accounts_views.refresh_aeo_gemini, name="refresh-aeo-gemini"),

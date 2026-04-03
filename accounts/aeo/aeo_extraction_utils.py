@@ -34,102 +34,51 @@ from .aeo_prompts import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_KEY_ENV = "OPEN_AI_SEO_API_KEY"
-_VALID_POSITIONS = frozenset({"top", "middle", "bottom", "none"})
 _VALID_SENTIMENT = frozenset({"positive", "neutral", "negative"})
-_NAME_STOPWORDS = frozenset(
-    {
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "of",
-        "for",
-        "in",
-        "at",
-        "to",
-        "inc",
-        "llc",
-        "ltd",
-        "plc",
-        "pc",
-        "llp",
-        "co",
-    }
-)
 
 
 def _normalize_for_brand_match(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", (s or "").lower())).strip()
 
 
-def _significant_name_tokens(name: str) -> list[str]:
-    n = _normalize_for_brand_match(name)
-    toks = [t for t in n.split() if len(t) >= 2 and t not in _NAME_STOPWORDS]
-    return toks if toks else ([n] if n else [])
+def programmatic_tracked_brand_from_urls(
+    tracked_website_domain: str,
+    raw_response: str,
+    competitors: list[dict[str, str]],
+) -> tuple[bool, int]:
+    """
+    True when the tracked site's registrable root matches a host extracted from ``raw_response``
+    or from any sanitized competitor ``url`` (``registered_root_domains_match``; not LLM judgment).
+    ``mention_count`` is the number of distinct matched host roots (minimum 1 when cited).
+    """
+    tracked_root = root_domain_from_fragment(tracked_website_domain) or ""
+    tracked_root = tracked_root.strip().lower().rstrip(".")
+    if not tracked_root:
+        return False, 0
+    matched_hosts: set[str] = set()
+    for c in competitors:
+        url = (c.get("url") or "").strip()
+        if not url:
+            continue
+        h = root_domain_from_fragment(url)
+        if h and registered_root_domains_match(tracked_root, h):
+            matched_hosts.add(h)
+    for h in _extract_domains_from_raw_answer(raw_response):
+        if registered_root_domains_match(tracked_root, h):
+            matched_hosts.add(h)
+    if not matched_hosts:
+        return False, 0
+    return True, max(1, len(matched_hosts))
 
 
 def _domain_grounds_brand(raw_text: str, website_domain: str) -> bool:
-    if not website_domain:
-        return False
-    d = website_domain.strip().lower()
-    if not d:
-        return False
-    raw_compact = re.sub(r"\s+", "", (raw_text or "").lower())
-    if d in raw_compact:
-        return True
-    first = d.split(".", 1)[0]
-    if len(first) >= 4 and first in raw_compact:
-        return True
-    return False
-
-
-def _tracked_brand_grounded_in_text(
-    raw_text: str,
-    *,
-    business_name: str,
-    website_domain: str = "",
-) -> bool:
     """
-    True if the tracked business is present in the raw answer (case-insensitive),
-    via full-name substring, all significant name tokens, or website domain.
+    True only if the answer text contains a hostname whose registrable root matches the tracked
+    site (exact match, subdomain of tracked, or tracked is subdomain of host) via
+    registered_root_domains_match on roots from _extract_domains_from_raw_answer — never via a
+    naive first-label substring of the compact text (avoids saltlakedental inside saltlakedentalcare).
     """
-    raw_norm = _normalize_for_brand_match(raw_text)
-    if not raw_norm:
-        return False
-    if _domain_grounds_brand(raw_text, website_domain):
-        return True
-    bn = (business_name or "").strip()
-    if not bn:
-        return False
-    full = _normalize_for_brand_match(bn)
-    if len(full) >= 3 and full in raw_norm:
-        return True
-    tokens = _significant_name_tokens(bn)
-    if not tokens:
-        return False
-    if len(tokens) == 1:
-        t = tokens[0]
-        return len(t) >= 3 and t in raw_norm
-    return all(t in raw_norm for t in tokens)
-
-
-def _strict_parse_bool(value: Any) -> bool:
-    """
-    Strict bool parser for model outputs.
-    - Accept bool directly
-    - Accept "true"/"false" strings (case-insensitive)
-    - Default False for all other types/values
-    """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v == "true":
-            return True
-        if v == "false":
-            return False
-    return False
+    return programmatic_tracked_brand_from_urls(website_domain, raw_text, [])[0]
 
 
 def _extraction_model() -> str:
@@ -324,6 +273,299 @@ def flatten_competitor_url_field(value: Any) -> str:
     return str(value).strip()
 
 
+def registered_root_domains_match(tracked_root: str, host_root: str) -> bool:
+    """
+    True when ``host_root`` is the same site as ``tracked_root`` (subdomains count as the same brand).
+    Both inputs should be lowercase host-style roots (e.g. ``saltlakedentalcare.com``).
+    """
+    a = (tracked_root or "").strip().lower().rstrip(".")
+    b = (host_root or "").strip().lower().rstrip(".")
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if b.endswith("." + a):
+        return True
+    if a.endswith("." + b):
+        return True
+    return False
+
+
+def tracked_domain_listed_in_competitors(tracked_website_domain: str, competitors: Any) -> bool:
+    """
+    True when any structured competitor row links to the same site as the business website.
+
+    Extraction models often put the target business only inside ``competitors`` (with URL)
+    while setting ``brand_mentioned`` false; coverage and scoring should still count that as a cite.
+    """
+    t = (tracked_website_domain or "").strip().lower().rstrip(".")
+    if not t or not competitors:
+        return False
+    if not isinstance(competitors, (list, tuple)):
+        return False
+    for raw in competitors:
+        parsed = parse_competitor_raw_item(raw)
+        url = (parsed.get("url") or "").strip()
+        if not url:
+            continue
+        comp_dom = root_domain_from_fragment(url)
+        if comp_dom and registered_root_domains_match(t, comp_dom):
+            return True
+    return False
+
+
+def _domain_fallback_display(domain: str) -> str:
+    """Human-readable label when no competitor name maps to this citation domain."""
+    d = (domain or "").strip().lower().rstrip(".")
+    if not d:
+        return "Unknown"
+    first = d.split(".")[0].replace("-", " ").strip()
+    if not first:
+        return d
+    return first[0].upper() + first[1:].lower() if len(first) > 1 else first.upper()
+
+
+def competitor_display_name_for_citation_domain(competitors_json: Any, cite_domain: str) -> str | None:
+    """
+    First non-empty competitor ``name`` whose URL registrable root matches ``cite_domain``.
+    """
+    cite_root = root_domain_from_fragment(cite_domain) or (cite_domain or "").strip().lower().rstrip(".")
+    if not cite_root or not isinstance(competitors_json, list):
+        return None
+    for raw in competitors_json:
+        p = parse_competitor_raw_item(raw)
+        url = (p.get("url") or "").strip()
+        name = (p.get("name") or "").strip()
+        comp_dom = root_domain_from_fragment(url)
+        if comp_dom and registered_root_domains_match(cite_root, comp_dom) and len(name) >= 2:
+            return name
+    return None
+
+
+def competitor_url_for_citation_domain(competitors_json: Any, cite_domain: str) -> str | None:
+    """First competitor ``url`` whose registrable root matches ``cite_domain``."""
+    cite_root = root_domain_from_fragment(cite_domain) or (cite_domain or "").strip().lower().rstrip(".")
+    if not cite_root or not isinstance(competitors_json, list):
+        return None
+    for raw in competitors_json:
+        p = parse_competitor_raw_item(raw)
+        url = (p.get("url") or "").strip()
+        if not url:
+            continue
+        comp_dom = root_domain_from_fragment(url)
+        if comp_dom and registered_root_domains_match(cite_root, comp_dom):
+            return url.split("?")[0].rstrip("/")
+    return None
+
+
+def _citation_row_display_url(
+    raw_citation_item: str,
+    cite_domain: str,
+    competitors_json: Any,
+    *,
+    citation_is_tracked_domain: bool,
+    tracked_website_url_or_domain: str,
+    tracked_root: str,
+) -> str:
+    """Stable URL for tooltips: raw citation, tracked site when citation is yours, else competitor match or domain root."""
+    raw = str(raw_citation_item or "").strip()
+    if raw.lower().startswith(("http://", "https://")):
+        try:
+            parsed = urlparse(raw)
+            if parsed.netloc:
+                return raw.split("?")[0].rstrip("/")
+        except Exception:
+            pass
+    if citation_is_tracked_domain:
+        tw = (tracked_website_url_or_domain or "").strip()
+        if tw.lower().startswith(("http://", "https://")):
+            return tw.split("?")[0].rstrip("/")
+        if tracked_root:
+            return f"https://{tracked_root}/"
+    matched = competitor_url_for_citation_domain(competitors_json, cite_domain)
+    if matched:
+        return matched
+    return f"https://{cite_domain}/"
+
+
+def _pick_better_citation_url(a: str, b: str) -> str:
+    """Prefer https and longer (more specific) URLs when merging platform rows."""
+    a, b = (a or "").strip(), (b or "").strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    a_h = a.lower().startswith("https://")
+    b_h = b.lower().startswith("https://")
+    if a_h and not b_h:
+        return a
+    if b_h and not a_h:
+        return b
+    return a if len(a) >= len(b) else b
+
+
+def citations_ranking_for_prompt_coverage(
+    citations_json: Any,
+    competitors_json: Any,
+    *,
+    tracked_website_url_or_domain: str,
+    brand_mentioned: bool,
+    tracked_business_name: str,
+) -> tuple[list[dict[str, Any]], int | None]:
+    """
+    Build UI rows from stored ``citations_json`` (ordered root domains).
+
+    Display names come from ``competitors_json`` when a row's URL matches that domain; otherwise a
+    short label derived from the domain. When ``brand_mentioned`` is true and a citation domain
+    matches the profile site, the row uses ``tracked_business_name`` and ``is_target`` is true.
+
+    Returns ``(rows, target_url_position)`` where ``target_url_position`` is the 1-based index of
+    the first citation whose domain matches the tracked site, or ``None``.
+    """
+    tracked_root = root_domain_from_fragment(tracked_website_url_or_domain) or ""
+    tracked_root = (tracked_root or (tracked_website_url_or_domain or "").strip().lower()).rstrip(".")
+    rows: list[dict[str, Any]] = []
+    target_pos: int | None = None
+    raw_list = citations_json if isinstance(citations_json, list) else []
+    pos_counter = 0
+    for item in raw_list:
+        cite_dom = root_domain_from_fragment(str(item))
+        if not cite_dom:
+            continue
+        pos_counter += 1
+        is_domain_target = bool(tracked_root and registered_root_domains_match(tracked_root, cite_dom))
+        if is_domain_target and target_pos is None:
+            target_pos = pos_counter
+
+        is_target = bool(is_domain_target and brand_mentioned)
+        if brand_mentioned and is_domain_target:
+            tb = (tracked_business_name or "").strip()
+            display_name = tb if tb else _domain_fallback_display(cite_dom)
+        else:
+            looked = competitor_display_name_for_citation_domain(competitors_json, cite_dom)
+            display_name = looked if looked else _domain_fallback_display(cite_dom)
+
+        row_url = _citation_row_display_url(
+            str(item),
+            cite_dom,
+            competitors_json,
+            citation_is_tracked_domain=is_domain_target,
+            tracked_website_url_or_domain=tracked_website_url_or_domain,
+            tracked_root=tracked_root,
+        )
+        rows.append(
+            {
+                "name": display_name,
+                "position": pos_counter,
+                "is_target": is_target,
+                "url": row_url,
+            }
+        )
+    return rows, target_pos
+
+
+def merge_citations_rankings_across_platform_cells(platform_cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Merge ``citations_ranking`` from multiple platform cells (e.g. OpenAI + Gemini).
+
+    Union by case-insensitive display name: keep the best (lowest) 1-based citation position;
+    ``is_target`` is true if true on any platform. Sort by best position then name, then assign
+    contiguous positions 1..n for the combined rankings table.
+    """
+    aggregated: dict[str, dict[str, Any]] = {}
+    for cell in platform_cells:
+        if not isinstance(cell, dict) or not cell.get("has_data"):
+            continue
+        ranking = cell.get("citations_ranking") or []
+        if not isinstance(ranking, list):
+            continue
+        for row in ranking:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            key = name.casefold()
+            raw_pos = row.get("position")
+            try:
+                pos_int = int(raw_pos) if raw_pos is not None else 10**9
+            except (TypeError, ValueError):
+                pos_int = 10**9
+            is_target = bool(row.get("is_target"))
+            row_url = str(row.get("url") or "").strip()
+            if key not in aggregated:
+                aggregated[key] = {
+                    "name": name,
+                    "best_pos": pos_int,
+                    "is_target": is_target,
+                    "url": row_url,
+                }
+            else:
+                cur = aggregated[key]
+                cur["best_pos"] = min(int(cur["best_pos"]), pos_int)
+                cur["is_target"] = bool(cur["is_target"]) or is_target
+                if len(name) > len(str(cur["name"] or "")):
+                    cur["name"] = name
+                cur["url"] = _pick_better_citation_url(str(cur.get("url") or ""), row_url)
+    items = sorted(
+        aggregated.values(),
+        key=lambda x: (int(x["best_pos"]), str(x["name"] or "").lower()),
+    )
+    out: list[dict[str, Any]] = []
+    for i, it in enumerate(items, start=1):
+        out.append(
+            {
+                "name": str(it["name"]),
+                "position": i,
+                "is_target": bool(it["is_target"]),
+                "url": str(it.get("url") or ""),
+            }
+        )
+    return out
+
+
+def merged_target_url_position(merged_ranking: list[dict[str, Any]]) -> int | None:
+    """1-based position of the target row in a merged ranking list, if any."""
+    for row in merged_ranking:
+        if isinstance(row, dict) and row.get("is_target"):
+            try:
+                return int(row["position"])
+            except (TypeError, ValueError, KeyError):
+                continue
+    return None
+
+
+def unique_business_count_excluding_target(merged_ranking: list[dict[str, Any]]) -> int:
+    """
+    Count unique businesses in a merged ``citations_ranking``, excluding the tracked business
+    when it appears as ``is_target`` (so this is "other" brands in the extraction).
+    """
+    if not merged_ranking:
+        return 0
+    target_in = any(isinstance(r, dict) and bool(r.get("is_target")) for r in merged_ranking)
+    n = len(merged_ranking)
+    return max(0, n - (1 if target_in else 0))
+
+
+def brand_effectively_cited(
+    brand_mentioned: bool,
+    competitors_json: Any,
+    *,
+    tracked_website_url_or_domain: str = "",
+) -> bool:
+    """
+    Whether APIs and UI should treat the business as cited for this extraction.
+
+    Uses stored ``brand_mentioned`` or a URL match against ``competitors_json``.
+    ``tracked_website_url_or_domain`` may be a full URL or bare host; it is normalized.
+    """
+    if brand_mentioned:
+        return True
+    rooted = root_domain_from_fragment(tracked_website_url_or_domain) or ""
+    rooted = (rooted or (tracked_website_url_or_domain or "").strip().lower()).rstrip(".")
+    return tracked_domain_listed_in_competitors(rooted, competitors_json)
+
+
 def parse_competitor_raw_item(item: Any) -> dict[str, str]:
     """
     Normalize one competitor from the model or DB to ``{"name": str, "url": str}``.
@@ -446,71 +688,22 @@ def normalize_extraction_payload(
     """
     Coerce model JSON into canonical shape for storage and APIs.
 
-    When ``tracked_business_name`` and ``raw_response`` are provided, ``brand_mentioned`` is
-    grounded in the raw answer text (not only the model boolean). Competitors/citations from
-    the model are kept even when brand flags are cleared.
+    ``brand_mentioned``, ``mention_count``, and ``mention_position`` are derived only in code: the
+    tracked profile domain must match a host from URLs in the raw answer or from sanitized
+    competitor rows (``registered_root_domains_match``). The model must not supply brand fields;
+    any legacy keys in ``data`` are ignored for brand. ``tracked_business_name`` is accepted for
+    API compatibility only.
     """
-    brand = _strict_parse_bool(data.get("brand_mentioned"))
-    pos = str(data.get("mention_position") or "none").lower().strip()
-    if pos not in _VALID_POSITIONS:
-        pos = "none"
-
-    try:
-        count = int(data.get("mention_count", 0))
-    except (TypeError, ValueError):
-        count = 0
-    count = max(0, min(1000, count))
-
-    name = (tracked_business_name or "").strip()
     raw = (raw_response or "").strip()
-    domain = (tracked_website_domain or "").strip().lower()
-
-    if name and not raw:
-        if brand:
-            logger.warning(
-                "AEO extraction: brand_mentioned=True but no raw_response for grounding; overriding. business=%s",
-                name,
-            )
-        brand = False
-        pos = "none"
-        count = 0
-    elif name and raw:
-        grounded = _tracked_brand_grounded_in_text(
-            raw,
-            business_name=name,
-            website_domain=domain,
-        )
-        if brand and not grounded:
-            logger.warning(
-                "AEO extraction: model brand_mentioned=True but text did not ground target; overriding. "
-                "business=%s snippet=%s",
-                name,
-                raw[:200],
-            )
-        if not grounded:
-            brand = False
-            pos = "none"
-            count = 0
-        else:
-            brand = True
-            if count == 0 and pos == "none":
-                count = 1
-                pos = "middle"
-            elif count == 0:
-                count = 1
-            elif pos == "none":
-                pos = "middle"
-            count = max(1, count)
-
-    if count == 0 and pos == "none":
-        brand = False
-
-    if not brand:
-        pos = "none"
-    if not brand:
-        count = 0
+    domain = (tracked_website_domain or "").strip()
 
     competitors = _sanitize_competitors(data.get("competitors"))
+    brand, count = programmatic_tracked_brand_from_urls(domain, raw, competitors)
+    count = max(0, min(1000, count))
+    pos: str = "middle" if brand else "none"
+    if brand:
+        count = max(1, count)
+
     ranking_order = _sanitize_ranking_order(data.get("ranking_order"))
     # Keep ranking order useful for weighted scoring: include named mentions in order.
     if not ranking_order:
@@ -550,15 +743,14 @@ def normalize_extraction_payload(
 def _default_failed_payload() -> dict[str, Any]:
     return normalize_extraction_payload(
         {
-            "brand_mentioned": False,
-            "mention_position": "none",
-            "mention_count": 0,
             "competitors": [],
             "ranking_order": [],
             "citations": [],
             "sentiment": "neutral",
             "confidence_score": None,
-        }
+        },
+        raw_response="",
+        tracked_website_domain="",
     )
 
 
@@ -570,21 +762,9 @@ def _parse_extraction_json(raw_text: str) -> dict[str, Any] | None:
         return None
     if not isinstance(obj, dict):
         return None
-    required = (
-        "brand_mentioned",
-        "mention_position",
-        "mention_count",
-        "competitors",
-        "citations",
-        "sentiment",
-    )
+    required = ("competitors", "citations", "sentiment")
     if not all(k in obj for k in required):
         return None
-    # Strict type guard for brand_mentioned to avoid truthy coercion bugs.
-    bm = obj.get("brand_mentioned")
-    if not isinstance(bm, bool):
-        if not (isinstance(bm, str) and bm.strip().lower() in {"true", "false"}):
-            return None
     return obj
 
 
@@ -621,10 +801,11 @@ def _build_user_content(
     prompt_text: str = "",
 ) -> str:
     name = (getattr(business_profile, "business_name", None) or "").strip() or "(unknown)"
-    industry = (getattr(business_profile, "industry", None) or "").strip() or "(unknown)"
+    site = (getattr(business_profile, "website_url", None) or "").strip()
+    domain = (root_domain_from_fragment(site) or "").strip() or "(unknown)"
     return AEO_STRUCTURED_EXTRACTION_USER_TEMPLATE.format(
         business_name=name,
-        industry=industry,
+        business_domain=domain,
         competitor_hints=_format_competitor_hints(competitor_hints),
         prompt_text=(prompt_text or "").strip() or "(unknown)",
         raw_response=raw_response or "",

@@ -973,3 +973,11 @@ def trigger_seo_warmup_after_aeo_task(self, run_id: int) -> None:
             run.profile_id,
             run.status,
         )
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def onboarding_onpage_crawl_task(self, crawl_id: int) -> None:
+    """DataForSEO On-Page crawl for onboarding (10 pages, Celery)."""
+    from .onboarding_onpage import execute_onboarding_onpage_crawl
+
+    execute_onboarding_onpage_crawl(int(crawl_id))

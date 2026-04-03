@@ -58,7 +58,8 @@ def google_login_redirect_view(request: HttpRequest) -> HttpResponseRedirect:
     optional `next` parameter so that, after Google completes, the user is
     sent back to the desired frontend path (e.g. `/onboarding`).
     """
-    frontend_next = request.GET.get("next") or "/onboarding"
+    # Default /app: Next middleware sends incomplete users to /onboarding.
+    frontend_next = request.GET.get("next") or "/app"
     if not frontend_next.startswith(("http://", "https://")):
         base = getattr(settings, "FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
         path = frontend_next if frontend_next.startswith("/") else f"/{frontend_next}"

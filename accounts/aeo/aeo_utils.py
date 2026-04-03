@@ -61,9 +61,64 @@ class AEOPromptBusinessInput:
     services: list[str] = field(default_factory=list)
     niche_modifiers: list[str] = field(default_factory=list)
     differentiators: list[str] = field(default_factory=list)
+    language: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def aeo_business_input_from_onboarding_payload(
+    *,
+    business_name: str,
+    website_url: str,
+    location: str,
+    language: str = "",
+    selected_topics: Sequence[str],
+) -> AEOPromptBusinessInput:
+    """
+    Build prompt-plan context from onboarding step 1+2 POST body (not from profile fields).
+
+    ``industry`` is a short hint derived from selected topic labels so OpenAI has vertical
+    context without relying on BusinessProfile.industry mid-onboarding.
+    """
+    topics = [str(t).strip() for t in selected_topics if str(t).strip()]
+    loc = (location or "").strip()
+    city_guess = infer_city_from_address(loc) or _normalize_city(loc[:200])
+    industry_hint = ", ".join(topics[:6]) if topics else ""
+    return AEOPromptBusinessInput(
+        industry=industry_hint[:500],
+        city=city_guess,
+        business_name=(business_name or "").strip(),
+        website_domain=_website_domain_from_url(website_url or ""),
+        services=list(topics),
+        niche_modifiers=[],
+        differentiators=[],
+        language=(language or "").strip(),
+    )
+
+
+def assign_onboarding_prompts_to_selected_topics(
+    combined: Sequence[Mapping[str, Any]],
+    topic_order: Sequence[str],
+) -> dict[str, list[str]]:
+    """
+    Map flat combined prompts onto step-2 topic tabs for the onboarding UI.
+
+    Rule: total count matches len(combined); prompts are distributed in order so the first
+    topic gets prompt[0], second gets prompt[1], …, then remaining prompts round-robin.
+    This keeps AEO_ONBOARDING_PROMPT_COUNT (flat list) aligned with per-topic review in step 3.
+    """
+    texts = [str(p.get("prompt") or "").strip() for p in combined if str(p.get("prompt") or "").strip()]
+    topics = [str(t).strip() for t in topic_order if str(t).strip()]
+    out: dict[str, list[str]] = {t: [] for t in topics}
+    if not topics or not texts:
+        return out
+    n_t, n_p = len(topics), len(texts)
+    for i in range(min(n_t, n_p)):
+        out[topics[i]].append(texts[i])
+    for j in range(n_t, n_p):
+        out[topics[j % n_t]].append(texts[j])
+    return out
 
 
 def _strip_code_fence(text: str) -> str:
@@ -411,6 +466,8 @@ def build_openai_batch_user_content(
     business: AEOPromptBusinessInput,
     seed_prompts: Sequence[Mapping[str, Any]] | None,
     max_additional: int,
+    *,
+    onboarding_topic_details: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     lines = [
         AEO_BATCH_USER_PROMPT_INTRO,
@@ -419,9 +476,17 @@ def build_openai_batch_user_content(
         f"\n\nGenerate at most {max_additional} new prompts not overlapping the seed list.",
         "\n\nSeed prompts (JSON array, may be empty):\n",
         json.dumps(list(seed_prompts or []), ensure_ascii=False),
-        "\n\n",
-        AEO_BATCH_JSON_SCHEMA_INSTRUCTION,
     ]
+    if onboarding_topic_details:
+        lines.extend(
+            [
+                "\n\nUser-selected monitoring topics from onboarding (prioritize natural consumer "
+                "or buyer questions that relate to these themes; vary wording). "
+                "JSON may include Labs/AEO metadata (search volume, rank, category) — use as weak hints, not hard constraints:\n",
+                json.dumps(list(onboarding_topic_details), ensure_ascii=False),
+            ],
+        )
+    lines.extend(["\n\n", AEO_BATCH_JSON_SCHEMA_INSTRUCTION])
     return "".join(lines)
 
 
@@ -433,6 +498,7 @@ def run_prompt_batch_via_openai(
     system_prompt: str | None = None,
     api_key_env: str = "OPEN_AI_SEO_API_KEY",
     model: str | None = None,
+    onboarding_topic_details: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Ask OpenAI for additional prompts; returns normalized JSON-ready dicts.
@@ -440,7 +506,10 @@ def run_prompt_batch_via_openai(
     Uses the same API key resolution as SEO/AEO helpers in openai_utils.
     """
     user_content = build_openai_batch_user_content(
-        business, seed_prompts, max_additional=max_additional
+        business,
+        seed_prompts,
+        max_additional=max_additional,
+        onboarding_topic_details=onboarding_topic_details,
     )
     sys_p = system_prompt or AEO_PROMPT_ENGINE_SYSTEM_PROMPT
     use_model = model or _get_model()
@@ -511,26 +580,39 @@ def build_full_aeo_prompt_plan(
     include_openai: bool = False,
     max_openai_prompts: int | None = None,
     target_combined_count: int | None = None,
+    business_input: AEOPromptBusinessInput | None = None,
+    onboarding_topic_details: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Build onboarding prompt plan using OpenAI generation only.
+
+    Total combined prompt count = ``target_combined_count`` or ``AEO_ONBOARDING_PROMPT_COUNT``
+    (typically 50). Prompts are one flat list for ``selected_aeo_prompts`` persistence.
+
+    When ``onboarding_topic_details`` is set (step-2 onboarding flow), OpenAI batches receive
+    those topics + Labs/AEO metadata; ``prompts_by_topic`` maps the same flat list onto
+    each selected topic for the review UI (see ``assign_onboarding_prompts_to_selected_topics``).
 
     Output schema remains backward compatible:
     - fixed: []
     - dynamic: []
     - openai_generated: generated prompts
     - combined: same generated prompts (capped to target)
+    - prompts_by_topic: optional dict topic -> prompt strings (onboarding only)
     """
     target = int(target_combined_count or AEO_ONBOARDING_PROMPT_COUNT)
 
-    ctx = aeo_business_input_from_profile(
-        profile,
-        city=city,
-        industry=industry,
-        services=services,
-        niche_modifiers=niche_modifiers,
-        differentiators=differentiators,
-    )
+    if business_input is not None:
+        ctx = business_input
+    else:
+        ctx = aeo_business_input_from_profile(
+            profile,
+            city=city,
+            industry=industry,
+            services=services,
+            niche_modifiers=niche_modifiers,
+            differentiators=differentiators,
+        )
     _ = include_openai  # kept for API compatibility; onboarding plan is OpenAI-only.
     type_prompts: dict[str, str] = {
         AEOPromptType.TRANSACTIONAL.value: AEO_PROMPT_ENGINE_SYSTEM_PROMPT_TRANSACTIONAL,
@@ -596,6 +678,7 @@ def build_full_aeo_prompt_plan(
                 seed_prompts=combined,
                 max_additional=req,
                 system_prompt=type_prompts[prompt_type],
+                onboarding_topic_details=onboarding_topic_details,
             )
             rounds += 1
             typed = _typed_batch(batch, prompt_type)
@@ -623,6 +706,7 @@ def build_full_aeo_prompt_plan(
                 seed_prompts=combined,
                 max_additional=req,
                 system_prompt=type_prompts[prompt_type],
+                onboarding_topic_details=onboarding_topic_details,
             )
             typed = _typed_batch(batch, prompt_type)
             if not typed:
@@ -639,6 +723,16 @@ def build_full_aeo_prompt_plan(
 
     if len(combined) > target:
         combined = combined[:target]
+
+    prompts_by_topic: dict[str, list[str]] = {}
+    if onboarding_topic_details:
+        topic_order = [
+            str(d.get("keyword") or "").strip()
+            for d in onboarding_topic_details
+            if str(d.get("keyword") or "").strip()
+        ]
+        if topic_order:
+            prompts_by_topic = assign_onboarding_prompts_to_selected_topics(combined, topic_order)
 
     shortfall = max(0, target - len(combined))
     if len(combined) >= target:
@@ -669,4 +763,5 @@ def build_full_aeo_prompt_plan(
         "openai_generated": out_openai,
         "combined": combined,
         "meta": meta,
+        "prompts_by_topic": prompts_by_topic,
     }

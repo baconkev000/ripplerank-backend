@@ -372,3 +372,4 @@ AEO_GEMINI_EXECUTION_MODEL = env("AEO_GEMINI_EXECUTION_MODEL", default="gemini-2
 # Meta (Facebook) – Ads app: OAuth login + Marketing API (connect button and ad campaigns)
 META_ADS_APP_ID = os.environ.get("META_ADS_APP_ID", "")
 META_ADS_APP_SECRET = os.environ.get("META_ADS_APP_SECRET", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")

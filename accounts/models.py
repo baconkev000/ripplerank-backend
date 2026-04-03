@@ -660,6 +660,77 @@ class OnPageAuditSnapshot(models.Model):
         return f"OnPageAuditSnapshot(user={self.user!s}, domain={self.domain})"
 
 
+class OnboardingOnPageCrawl(models.Model):
+    """
+    Stores DataForSEO On-Page crawl results during onboarding (up to 10 pages).
+    """
+
+    STATUS_PENDING = "pending"
+    STATUS_RUNNING = "running"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_RUNNING, "Running"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="onboarding_onpage_crawls",
+    )
+    business_profile = models.ForeignKey(
+        "BusinessProfile",
+        on_delete=models.CASCADE,
+        related_name="onboarding_onpage_crawls",
+    )
+    domain = models.CharField(max_length=255)
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    max_pages = models.PositiveSmallIntegerField(default=10)
+    pages = models.JSONField(default=list, blank=True)
+    # DataForSEO Labs ranked_keywords/live (domain) + topic clustering vs on-page seeds
+    ranked_keywords = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Normalized ranked keyword rows from Labs (keyword, rank, volume).",
+    )
+    topic_clusters = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Topic clusters: crawl seeds matched to ranked keywords (clusters, unclustered, stats).",
+    )
+    crawl_topic_seeds = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Service/topic phrases extracted from the on-page crawl only.",
+    )
+    ranked_keywords_error = models.TextField(
+        blank=True,
+        default="",
+        help_text="Set when Labs ranked_keywords call fails (crawl may still succeed).",
+    )
+    task_id = models.CharField(max_length=128, blank=True, default="")
+    exit_reason = models.CharField(max_length=64, blank=True, default="")
+    error_message = models.TextField(blank=True, default="")
+    context = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Optional business_name, location for mention detection.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        verbose_name = "Onboarding on-page crawl"
+        verbose_name_plural = "Onboarding on-page crawls"
+
+    def __str__(self) -> str:
+        return f"OnboardingOnPageCrawl(profile_id={self.business_profile_id}, {self.status})"
+
+
 class ReviewsOverviewSnapshot(models.Model):
     """
     Cached reviews/GBP overview metrics per user (star rating, total reviews, response rate, etc.).
