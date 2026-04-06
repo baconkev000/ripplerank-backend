@@ -101,7 +101,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         required=False,
         allow_blank=True,
     )
-    email = serializers.EmailField(source="user.email", read_only=True)
+    email = serializers.EmailField(source="user.email", required=False)
     seo_score = serializers.SerializerMethodField()
     search_performance_score = serializers.SerializerMethodField()
     search_visibility_percent = serializers.SerializerMethodField()
@@ -233,6 +233,68 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                         }
                     )
         return attrs
+
+    def validate_email(self, value: str) -> str:
+        email = (value or "").strip().lower()
+        if not email:
+            raise serializers.ValidationError("Email is required.")
+        user = getattr(getattr(self, "instance", None), "user", None)
+        exists = User.objects.filter(email__iexact=email)
+        if user is not None:
+            exists = exists.exclude(pk=user.pk)
+        if exists.exists():
+            raise serializers.ValidationError("An account with this email already exists.")
+        return email
+
+    @staticmethod
+    def _split_full_name(full_name: str) -> tuple[str, str]:
+        parts = [p for p in (full_name or "").strip().split() if p]
+        if not parts:
+            return "", ""
+        if len(parts) == 1:
+            return parts[0], ""
+        return parts[0], " ".join(parts[1:])
+
+    def update(self, instance: BusinessProfile, validated_data: dict) -> BusinessProfile:
+        user_data = validated_data.pop("user", {}) or {}
+        full_name = validated_data.get("full_name", None)
+        user = getattr(instance, "user", None)
+
+        if user is not None:
+            email = user_data.get("email", None)
+            user_changed_fields: list[str] = []
+            if email is not None:
+                email = str(email).strip().lower()
+                if email and user.email != email:
+                    user.email = email
+                    user_changed_fields.append("email")
+                if email and getattr(user, "username", "") != email:
+                    user.username = email
+                    user_changed_fields.append("username")
+            if full_name is not None:
+                first_name, last_name = self._split_full_name(str(full_name))
+                if getattr(user, "first_name", "") != first_name:
+                    user.first_name = first_name
+                    user_changed_fields.append("first_name")
+                if getattr(user, "last_name", "") != last_name:
+                    user.last_name = last_name
+                    user_changed_fields.append("last_name")
+            if user_changed_fields:
+                user.save(update_fields=sorted(set(user_changed_fields)))
+
+        return super().update(instance, validated_data)
+
+    def to_representation(self, instance: BusinessProfile) -> dict:
+        data = super().to_representation(instance)
+        user = getattr(instance, "user", None)
+        if user is not None:
+            first = str(getattr(user, "first_name", "") or "").strip()
+            last = str(getattr(user, "last_name", "") or "").strip()
+            full = " ".join([x for x in [first, last] if x]).strip()
+            if full:
+                data["full_name"] = full
+            data["email"] = str(getattr(user, "email", "") or "")
+        return data
 
     def _get_seo_bundle(self, obj: BusinessProfile) -> dict | None:
         context = getattr(self, "context", {}) or {}
