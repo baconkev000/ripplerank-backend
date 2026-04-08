@@ -14,18 +14,10 @@ from .models import (
     BusinessProfile,
     ThirdPartyApiErrorLog,
     ThirdPartyApiRequestLog,
-    GoogleSearchConsoleConnection,
-    GoogleBusinessProfileConnection,
-    GoogleAdsConnection,
-    MetaAdsConnection,
     OnboardingOnPageCrawl,
     SEOOverviewSnapshot,
-    ReviewsOverviewSnapshot,
-    GoogleAdsKeywordIdea,
     AgentConversation,
     AgentMessage,
-    ReviewsConversation,
-    ReviewsMessage,
 )
 
 
@@ -220,30 +212,6 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_filter = ("industry", "tone_of_voice", "created_at")
 
 
-@admin.register(GoogleSearchConsoleConnection)
-class GoogleSearchConsoleConnectionAdmin(CsvExportAdminMixin, admin.ModelAdmin):
-    list_display = ("id", "user", "created_at", "updated_at")
-    search_fields = ("user__email", "user__username")
-
-
-@admin.register(GoogleBusinessProfileConnection)
-class GoogleBusinessProfileConnectionAdmin(CsvExportAdminMixin, admin.ModelAdmin):
-    list_display = ("id", "user", "created_at", "updated_at")
-    search_fields = ("user__email", "user__username")
-
-
-@admin.register(GoogleAdsConnection)
-class GoogleAdsConnectionAdmin(CsvExportAdminMixin, admin.ModelAdmin):
-    list_display = ("id", "user", "created_at", "updated_at")
-    search_fields = ("user__email", "user__username")
-
-
-@admin.register(MetaAdsConnection)
-class MetaAdsConnectionAdmin(CsvExportAdminMixin, admin.ModelAdmin):
-    list_display = ("id", "user", "expires_at", "created_at", "updated_at")
-    search_fields = ("user__email", "user__username")
-
-
 @admin.register(OnboardingOnPageCrawl)
 class OnboardingOnPageCrawlAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = (
@@ -274,22 +242,10 @@ class OnboardingOnPageCrawlAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     readonly_fields = ("created_at", "updated_at")
 
 
-@admin.register(ReviewsOverviewSnapshot)
-class ReviewsOverviewSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
-    list_display = ("id", "user", "star_rating", "total_reviews", "response_rate_pct", "last_fetched_at")
-    search_fields = ("user__email", "user__username")
-
-
 @admin.register(SEOOverviewSnapshot)
 class SEOOverviewSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "user", "period_start", "organic_visitors", "keywords_ranking", "top3_positions", "last_fetched_at")
     search_fields = ("user__email", "user__username")
-
-
-@admin.register(GoogleAdsKeywordIdea)
-class GoogleAdsKeywordIdeaAdmin(CsvExportAdminMixin, admin.ModelAdmin):
-    list_display = ("id", "user", "keyword", "avg_monthly_searches", "competition", "last_fetched_at")
-    search_fields = ("user__email", "user__username", "keyword")
 
 
 @admin.register(AgentConversation)
@@ -300,18 +256,6 @@ class AgentConversationAdmin(CsvExportAdminMixin, admin.ModelAdmin):
 
 @admin.register(AgentMessage)
 class AgentMessageAdmin(CsvExportAdminMixin, admin.ModelAdmin):
-    list_display = ("id", "conversation", "role", "created_at")
-    search_fields = ("conversation__user__email", "conversation__user__username", "content")
-
-
-@admin.register(ReviewsConversation)
-class ReviewsConversationAdmin(CsvExportAdminMixin, admin.ModelAdmin):
-    list_display = ("id", "user", "title", "created_at", "updated_at")
-    search_fields = ("user__email", "user__username", "title")
-
-
-@admin.register(ReviewsMessage)
-class ReviewsMessageAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = ("id", "conversation", "role", "created_at")
     search_fields = ("conversation__user__email", "conversation__user__username", "content")
 

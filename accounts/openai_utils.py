@@ -18,8 +18,6 @@ from .models import (
     AgentConversation,
     AgentMessage,
     BusinessProfile,
-    ReviewsConversation,
-    ReviewsMessage,
 )
 from .dataforseo_utils import (
     get_or_refresh_seo_score_for_user,
@@ -528,38 +526,6 @@ def generate_aeo_recommendations(aeo_data: dict, seo_data: dict | None = None) -
         return []
 
 
-def summarize_reviews_conversation(
-    messages: list[ReviewsMessage],
-    *,
-    business_profile: BusinessProfile | None = None,
-) -> str:
-    """
-    Ask OpenAI to summarize a Reviews conversation into concise memory notes.
-    """
-    payload: list[dict[str, str]] = [
-        {
-            "role": "system",
-            "content": (
-                "Summarize the following Reviews/Reputation conversation into concise memory notes. "
-                "Capture key goals, tone preferences, and decisions. 5-10 bullet points max."
-            ),
-        },
-    ]
-    for m in messages:
-        payload.append({"role": m.role, "content": m.content})
-
-    client = _get_client("OPEN_AI_REVIEWS_API_KEY")
-    model = _get_model()
-    completion = chat_completion_create_logged(
-        client,
-        operation="openai.chat.summarize_reviews_conversation",
-        business_profile=business_profile,
-        model=model,
-        messages=payload,
-    )
-    return (completion.choices[0].message.content or "").strip()
-
-
 def seo_chat(request: HttpRequest) -> Response:
     """
     Core implementation of the SEO agent chat endpoint backed by OpenAI.
@@ -665,78 +631,3 @@ def seo_chat(request: HttpRequest) -> Response:
     )
 
 
-def reviews_chat(request: HttpRequest) -> Response:
-    """
-    Core implementation of the Reviews Agent chat endpoint. Same pattern as SEO chat
-    but uses ReviewsConversation and ReviewsMessage (separate tables) and a different system role.
-    """
-    data = request.data
-    message = (data.get("message") or "").strip()
-    if not message:
-        return Response({"detail": "Message is required."}, status=400)
-
-    conversation_id = data.get("conversation_id")
-
-    conversation: ReviewsConversation | None = None
-    if conversation_id:
-        try:
-            conversation = ReviewsConversation.objects.get(
-                id=conversation_id,
-                user=request.user,
-            )
-        except ReviewsConversation.DoesNotExist:
-            conversation = None
-
-    if not conversation:
-        conversation = ReviewsConversation.objects.create(
-            user=request.user,
-            title="Reviews Agent Chat",
-        )
-
-    ReviewsMessage.objects.create(
-        conversation=conversation,
-        role="user",
-        content=message,
-    )
-
-    recent_messages = list(
-        conversation.messages.order_by("-created_at")[:20],
-    )
-    recent_messages.reverse()
-
-    profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
-    )
-    system_prompt = build_reviews_system_prompt(request.user, profile)
-    assistant_reply = _get_chat_reply(
-        system_prompt,
-        recent_messages,
-        conversation_summary=conversation.summary or None,
-        api_key_env="OPEN_AI_REVIEWS_API_KEY",
-        business_profile=profile,
-    )
-
-    ReviewsMessage.objects.create(
-        conversation=conversation,
-        role="assistant",
-        content=assistant_reply,
-    )
-
-    total_messages = conversation.messages.count()
-    if total_messages > 40:
-        summary_messages = list(
-            conversation.messages.order_by("created_at")[:80],
-        )
-        conversation.summary = summarize_reviews_conversation(
-            summary_messages,
-            business_profile=profile,
-        )
-        conversation.save(update_fields=["summary", "updated_at"])
-
-    return Response(
-        {
-            "conversation_id": conversation.id,
-            "reply": assistant_reply,
-        },
-    )
