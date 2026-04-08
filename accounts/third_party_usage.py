@@ -778,6 +778,21 @@ def build_aeo_pass_count_analytics_context(
         "needed_third": [by_run[k]["needed_third"] for k in run_labels],
         "third_completed": [by_run[k]["third_completed"] for k in run_labels],
     }
+    top_competitors: dict[str, int] = defaultdict(int)
+    top_citations: dict[str, int] = defaultdict(int)
+    for r in rows:
+        for k, v in dict(r.combined_competitor_counts or {}).items():
+            try:
+                top_competitors[str(k)] += int(v or 0)
+            except Exception:
+                continue
+        for k, v in dict(r.combined_citation_counts or {}).items():
+            try:
+                top_citations[str(k)] += int(v or 0)
+            except Exception:
+                continue
+    top_competitors_sorted = sorted(top_competitors.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+    top_citations_sorted = sorted(top_citations.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
     return {
         "total_prompts": total_prompts,
         "prompts_stable_at_2": prompts_stable_at_2,
@@ -785,4 +800,6 @@ def build_aeo_pass_count_analytics_context(
         "prompts_ran_3rd": prompts_ran_3rd,
         "providers": {"openai": openai, "gemini": gemini},
         "grouped_by_run": run_grouped,
+        "top_competitors": [{"key": k, "count": c} for k, c in top_competitors_sorted],
+        "top_citations": [{"key": k, "count": c} for k, c in top_citations_sorted],
     }

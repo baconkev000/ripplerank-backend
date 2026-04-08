@@ -262,3 +262,50 @@ def test_per_provider_totals_unstable_unstable_ends_at_six_not_global_three_cap(
     assert len(agg.openai_pass_history_json) == 3
     assert len(agg.gemini_pass_history_json) == 3
 
+
+@pytest.mark.django_db
+def test_combined_rollups_dedupe_within_pass_and_provider_breakdown_deterministic():
+    user = User.objects.create_user(username="ps8", email="ps8@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    run = AEOExecutionRun.objects.create(profile=profile)
+    prompt = "invisalign options"
+    ro1 = _mk_response(profile, run, prompt, PLATFORM_OPENAI, 1)
+    ex1 = _mk_extraction(
+        ro1,
+        True,
+        competitors=[{"name": "Acme Dental"}, {"name": "acme   dental"}],
+        citations=[{"url": "https://www.example.com/a"}, {"url": "http://example.com/b"}],
+    )
+    update_prompt_aggregate_from_extraction(
+        profile=profile, execution_run_id=run.id, response_snapshot=ro1, extraction_snapshot=ex1, prompt_category="service"
+    )
+    ro2 = _mk_response(profile, run, prompt, PLATFORM_OPENAI, 2)
+    ex2 = _mk_extraction(
+        ro2,
+        True,
+        competitors=[{"name": "Acme Dental", "url": "https://acme.test"}],
+        citations=[{"url": "https://example.com/c"}],
+    )
+    update_prompt_aggregate_from_extraction(
+        profile=profile, execution_run_id=run.id, response_snapshot=ro2, extraction_snapshot=ex2, prompt_category="service"
+    )
+    rg1 = _mk_response(profile, run, prompt, PLATFORM_GEMINI, 1)
+    eg1 = _mk_extraction(
+        rg1,
+        False,
+        competitors=[{"name": "Beta Ortho"}],
+        citations=[{"url": "https://sample.org/1"}],
+    )
+    agg = update_prompt_aggregate_from_extraction(
+        profile=profile, execution_run_id=run.id, response_snapshot=rg1, extraction_snapshot=eg1, prompt_category="service"
+    )
+    # dedupe within pass counts once; then sum across passes
+    assert agg.combined_competitor_counts["acme dental"] == 1
+    assert agg.combined_competitor_counts["acme dental|acme.test"] == 1
+    assert agg.combined_citation_counts["example.com"] == 2
+    assert agg.combined_provider_breakdown["openai"]["citations"]["example.com"] == 2
+    assert agg.combined_provider_breakdown["gemini"]["citations"]["sample.org"] == 1
+    assert agg.combined_total_passes_observed == 3
+    assert agg.combined_total_unique_competitors >= 2
+    assert agg.combined_total_unique_citations >= 2
+

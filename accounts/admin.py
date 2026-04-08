@@ -174,6 +174,9 @@ class AEOPromptExecutionAggregateAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "gemini_third_pass_required",
         "openai_third_pass_ran",
         "gemini_third_pass_ran",
+        "combined_total_unique_competitors",
+        "combined_total_unique_citations",
+        "combined_total_passes_observed",
         "stability_status",
         "updated_at",
     )

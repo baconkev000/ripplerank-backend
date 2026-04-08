@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections import defaultdict
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlparse
 
 from django.db import transaction
+from django.utils import timezone
 
 from ..models import AEOPromptExecutionAggregate, AEOExtractionSnapshot, AEOResponseSnapshot, BusinessProfile
 from .aeo_execution_utils import PLATFORM_GEMINI, PLATFORM_OPENAI, hash_prompt, normalize_aeo_prompt_dict
@@ -115,6 +118,104 @@ def _material_set(v: Any) -> set[str]:
         else:
             out.add(str(item or "").strip().casefold())
     return {x for x in out if x}
+
+
+def _clean_token(s: str) -> str:
+    x = re.sub(r"[\s\W_]+", " ", (s or "").strip().lower()).strip()
+    return x
+
+
+def _normalize_domain_like(s: str) -> str:
+    raw = str(s or "").strip().lower()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    try:
+        host = (urlparse(raw).hostname or "").strip().lower()
+    except Exception:
+        host = ""
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        return _clean_token(str(s or ""))
+    parts = [p for p in host.split(".") if p]
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host
+
+
+def _normalize_competitor_identity(item: Any) -> str:
+    if isinstance(item, dict):
+        name = _clean_token(str(item.get("name") or ""))
+        dom = _normalize_domain_like(str(item.get("url") or item.get("domain") or ""))
+        if name and dom:
+            return f"{name}|{dom}"
+        return name or dom
+    s = _clean_token(str(item or ""))
+    return s
+
+
+def _normalize_citation_identity(item: Any) -> str:
+    if isinstance(item, dict):
+        src = str(item.get("url") or item.get("domain") or item.get("source") or item.get("name") or "")
+    else:
+        src = str(item or "")
+    return _normalize_domain_like(src)
+
+
+def _recompute_combined_rollups(agg: AEOPromptExecutionAggregate) -> None:
+    """
+    Counting semantics:
+    - normalize competitor/citation identities case-insensitively
+    - dedupe within each pass (count max once/pass for a normalized key)
+    - sum occurrences across all passes/providers
+    """
+    comp_counts: dict[str, int] = defaultdict(int)
+    cit_counts: dict[str, int] = defaultdict(int)
+    provider_breakdown: dict[str, dict[str, dict[str, int]]] = {
+        PLATFORM_OPENAI: {"competitors": defaultdict(int), "citations": defaultdict(int)},
+        PLATFORM_GEMINI: {"competitors": defaultdict(int), "citations": defaultdict(int)},
+    }
+
+    for provider, history in (
+        (PLATFORM_OPENAI, list(agg.openai_pass_history_json or [])),
+        (PLATFORM_GEMINI, list(agg.gemini_pass_history_json or [])),
+    ):
+        for row in history:
+            if not isinstance(row, dict):
+                continue
+            seen_comp: set[str] = set()
+            for c in list(row.get("competitors") or []):
+                key = _normalize_competitor_identity(c)
+                if key:
+                    seen_comp.add(key)
+            for key in seen_comp:
+                comp_counts[key] += 1
+                provider_breakdown[provider]["competitors"][key] += 1
+
+            seen_cit: set[str] = set()
+            for c in list(row.get("citations") or []):
+                key = _normalize_citation_identity(c)
+                if key:
+                    seen_cit.add(key)
+            for key in seen_cit:
+                cit_counts[key] += 1
+                provider_breakdown[provider]["citations"][key] += 1
+
+    agg.combined_competitor_counts = {k: comp_counts[k] for k in sorted(comp_counts.keys())}
+    agg.combined_citation_counts = {k: cit_counts[k] for k in sorted(cit_counts.keys())}
+    agg.combined_provider_breakdown = {
+        provider: {
+            "competitors": {k: provider_breakdown[provider]["competitors"][k] for k in sorted(provider_breakdown[provider]["competitors"].keys())},
+            "citations": {k: provider_breakdown[provider]["citations"][k] for k in sorted(provider_breakdown[provider]["citations"].keys())},
+        }
+        for provider in (PLATFORM_OPENAI, PLATFORM_GEMINI)
+    }
+    agg.combined_total_passes_observed = int(agg.openai_pass_count or 0) + int(agg.gemini_pass_count or 0)
+    agg.combined_total_unique_competitors = len(agg.combined_competitor_counts)
+    agg.combined_total_unique_citations = len(agg.combined_citation_counts)
+    agg.combined_last_recomputed_at = timezone.now()
 
 
 def _provider_stability_from_history(history: list[bool]) -> tuple[str, bool]:
@@ -252,6 +353,7 @@ def update_prompt_aggregate_from_extraction(
 
     agg.total_pass_count = agg.openai_pass_count + agg.gemini_pass_count
     agg.total_brand_cited_count = agg.openai_brand_cited_count + agg.gemini_brand_cited_count
+    _recompute_combined_rollups(agg)
     status, reasons = recompute_stability(agg)
     agg.stability_status = status
     agg.stability_reasons = reasons

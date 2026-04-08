@@ -547,6 +547,13 @@ class AEOPromptExecutionAggregate(models.Model):
     gemini_brand_mention_history = models.JSONField(default=list, blank=True)
     openai_pass_history_json = models.JSONField(default=list, blank=True)
     gemini_pass_history_json = models.JSONField(default=list, blank=True)
+    combined_competitor_counts = models.JSONField(default=dict, blank=True)
+    combined_citation_counts = models.JSONField(default=dict, blank=True)
+    combined_provider_breakdown = models.JSONField(default=dict, blank=True)
+    combined_total_passes_observed = models.IntegerField(default=0)
+    combined_total_unique_competitors = models.IntegerField(default=0)
+    combined_total_unique_citations = models.IntegerField(default=0)
+    combined_last_recomputed_at = models.DateTimeField(null=True, blank=True)
     openai_stability_status = models.CharField(
         max_length=28,
         choices=STABILITY_CHOICES,
