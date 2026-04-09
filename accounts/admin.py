@@ -12,6 +12,7 @@ from .models import (
     AEOExecutionRun,
     AEOScoreSnapshot,
     BusinessProfile,
+    TrackedCompetitor,
     ThirdPartyApiErrorLog,
     ThirdPartyApiRequestLog,
     OnboardingOnPageCrawl,
@@ -204,12 +205,20 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "user",
         "business_name",
         "industry",
-        "tone_of_voice",
+        "plan",
         "created_at",
         "updated_at",
     )
     search_fields = ("user__email", "user__username", "business_name", "industry")
-    list_filter = ("industry", "tone_of_voice", "created_at")
+    list_filter = ("industry", "plan", "created_at")
+    filter_horizontal = ("tracked_competitors",)
+
+
+@admin.register(TrackedCompetitor)
+class TrackedCompetitorAdmin(CsvExportAdminMixin, admin.ModelAdmin):
+    list_display = ("id", "name", "domain", "created_at", "updated_at")
+    search_fields = ("name", "domain")
+    ordering = ("domain",)
 
 
 @admin.register(OnboardingOnPageCrawl)
@@ -239,7 +248,7 @@ class OnboardingOnPageCrawlAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "prompt_plan_task_id",
     )
     raw_id_fields = ("user", "business_profile")
-    readonly_fields = ("created_at", "updated_at")
+    readonly_fields = ("created_at", "updated_at", "review_topics", "review_topics_error")
 
 
 @admin.register(SEOOverviewSnapshot)

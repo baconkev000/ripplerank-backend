@@ -65,8 +65,6 @@ def build_reviews_system_prompt(user, profile: BusinessProfile | None) -> str:
             details.append(f"Business name: {profile.business_name}.")
         if profile.industry:
             details.append(f"Industry: {profile.industry}.")
-        if profile.tone_of_voice:
-            details.append(f"Tone of voice: {profile.tone_of_voice}.")
         if profile.description:
             details.append(f"Business description: {profile.description}.")
         if details:

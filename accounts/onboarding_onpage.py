@@ -352,8 +352,20 @@ def execute_onboarding_onpage_crawl(crawl_id: int) -> None:
             "updated_at",
         ]
         crawl.save(update_fields=save_fields)
-        if crawl.status == OnboardingOnPageCrawl.STATUS_COMPLETED and crawl.ranked_keywords:
-            # Trigger prompt generation immediately after keyword pipeline completion.
+
+        # AEO Step 2 topics: Gemini from root domain only (SEO ranked keywords stay separate above).
+        from .onboarding_review_topics import generate_review_topics_for_domain
+
+        rt_list, rt_err = generate_review_topics_for_domain(
+            domain=crawl.domain,
+            business_profile=crawl.business_profile,
+        )
+        crawl.review_topics = rt_list
+        crawl.review_topics_error = (rt_err or "")[:2000]
+        crawl.save(update_fields=["review_topics", "review_topics_error", "updated_at"])
+
+        if crawl.status == OnboardingOnPageCrawl.STATUS_COMPLETED and crawl.review_topics:
+            # Prompt plan follows LLM review topics, not ranked keyword rows.
             if crawl.prompt_plan_status not in {
                 OnboardingOnPageCrawl.PROMPT_PLAN_QUEUED,
                 OnboardingOnPageCrawl.PROMPT_PLAN_RUNNING,

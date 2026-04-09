@@ -1,5 +1,47 @@
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
+
+from .domain_utils import normalize_tracked_competitor_domain
+
+
+class TrackedCompetitor(models.Model):
+    """
+    Canonical competitor identity by normalized base domain.
+
+    Multiple business profiles may reference the same row; this model does not
+    record which profiles use it (no reverse relation from competitor → profiles).
+    """
+
+    name = models.CharField(max_length=255)
+    domain = models.CharField(
+        max_length=253,
+        unique=True,
+        db_index=True,
+        help_text="Normalized base host (no path, no scheme, lowercase, no leading www.).",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Tracked competitor"
+        verbose_name_plural = "Tracked competitors"
+        ordering = ("domain",)
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.domain})"
+
+    def clean(self) -> None:
+        nd = normalize_tracked_competitor_domain(self.domain)
+        if not nd:
+            raise ValidationError({"domain": "Enter a valid domain."})
+        self.domain = nd
+        if not (self.name or "").strip():
+            raise ValidationError({"name": "Name is required."})
+
+    def save(self, *args, **kwargs) -> None:
+        self.full_clean()
+        super().save(*args, **kwargs)
 
 
 class BusinessProfile(models.Model):
@@ -30,11 +72,19 @@ class BusinessProfile(models.Model):
     # Industry is intentionally a free-text field (no choices).
     industry = models.CharField(max_length=255, blank=True)
 
-    # Plan type for this business (free, pro, scale, etc.).
-    plan = models.CharField(max_length=64, blank=True)
-
-    # Tone of voice for marketing/communications.
-    tone_of_voice = models.CharField(max_length=64, blank=True)
+    PLAN_STARTER = "starter"
+    PLAN_PRO = "pro"
+    PLAN_ADVANCED = "advanced"
+    PLAN_CHOICES = [
+        (PLAN_STARTER, "Starter"),
+        (PLAN_PRO, "Pro"),
+        (PLAN_ADVANCED, "Advanced"),
+    ]
+    plan = models.CharField(
+        max_length=16,
+        choices=PLAN_CHOICES,
+        default=PLAN_STARTER,
+    )
 
     phone = models.CharField(max_length=50, blank=True)
     description = models.TextField(blank=True)
@@ -47,6 +97,11 @@ class BusinessProfile(models.Model):
     # When provided, these are preferred over DataForSEO auto-competitors.
     # Example: "smilebright.com, nocavityclinic.com, oakdentalcare.com"
     seo_competitor_domains_override = models.TextField(blank=True, default="")
+    tracked_competitors = models.ManyToManyField(
+        TrackedCompetitor,
+        blank=True,
+        related_name="+",
+    )
     seo_location_mode = models.CharField(
         max_length=16,
         choices=SEO_LOCATION_MODE_CHOICES,
@@ -732,10 +787,27 @@ class OnboardingOnPageCrawl(models.Model):
         blank=True,
         help_text="Service/topic phrases extracted from the on-page crawl only.",
     )
+    # Some deployments added this column for an earlier onboarding experiment; ORM must populate it (default []).
+    business_topics = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Unused; onboarding review topics use ``review_topics``. Kept for database compatibility.",
+    )
     ranked_keywords_error = models.TextField(
         blank=True,
         default="",
         help_text="Set when Labs ranked_keywords call fails (crawl may still succeed).",
+    )
+    # Gemini (or future LLM) review topics for onboarding Step 2 — independent of ranked_keywords.
+    review_topics = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='LLM-generated business topics, e.g. [{"topic": "...", "category": "...", "rationale": "..."}].',
+    )
+    review_topics_error = models.TextField(
+        blank=True,
+        default="",
+        help_text="Set when review topic generation fails or returns nothing usable.",
     )
     task_id = models.CharField(max_length=128, blank=True, default="")
     exit_reason = models.CharField(max_length=64, blank=True, default="")

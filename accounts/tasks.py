@@ -1493,14 +1493,15 @@ def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
 
     profile = crawl.business_profile
     ctx = crawl.context if isinstance(crawl.context, dict) else {}
+    review_rows = crawl.review_topics if isinstance(crawl.review_topics, list) else []
     selected_topics = [
-        str(r.get("keyword") or "").strip()
-        for r in (crawl.ranked_keywords or [])
-        if str(r.get("keyword") or "").strip()
+        str((row or {}).get("topic") or "").strip()
+        for row in review_rows
+        if str((row or {}).get("topic") or "").strip()
     ]
     if not selected_topics:
         crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_FAILED
-        crawl.prompt_plan_error = "no_ranked_keywords"
+        crawl.prompt_plan_error = "no_review_topics"
         crawl.prompt_plan_finished_at = django_tz.now()
         crawl.save(
             update_fields=[
@@ -1512,15 +1513,19 @@ def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
         )
         return
 
+    # Map LLM review rows onto legacy ``keyword`` + aeo_* keys for prompt-plan compatibility.
     details = []
-    for row in crawl.ranked_keywords or []:
-        kw = str((row or {}).get("keyword") or "").strip()
-        if not kw:
+    for row in review_rows:
+        topic = str((row or {}).get("topic") or "").strip()
+        if not topic:
             continue
-        d = {"keyword": kw}
-        for key in ("search_volume", "rank", "rank_group", "aeo_score", "aeo_category", "aeo_reason"):
-            if key in row and row.get(key) not in (None, ""):
-                d[key] = row.get(key)
+        d: dict[str, object] = {"keyword": topic}
+        cat = (row or {}).get("category")
+        if isinstance(cat, str) and cat.strip():
+            d["aeo_category"] = cat.strip()
+        rat = (row or {}).get("rationale")
+        if isinstance(rat, str) and rat.strip():
+            d["aeo_reason"] = rat.strip()
         details.append(d)
 
     crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_RUNNING
@@ -1712,3 +1717,51 @@ def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
             ]
         )
         logger.exception("[onboarding prompt-plan] failed crawl_id=%s", crawl_id)
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def onboarding_review_topics_backfill_task(self, crawl_id: int) -> None:
+    """
+    Fill ``review_topics`` for legacy crawls that have ranked_keywords but no LLM topics yet.
+    May enqueue ``onboarding_prompt_generation_task`` when topics appear and prompt plan is still pending.
+    """
+    from .models import OnboardingOnPageCrawl
+    from .onboarding_review_topics import generate_review_topics_for_domain
+
+    crawl = (
+        OnboardingOnPageCrawl.objects.select_related("business_profile")
+        .filter(pk=int(crawl_id))
+        .first()
+    )
+    if not crawl:
+        logger.warning("[onboarding review_topics backfill] crawl id=%s not found", crawl_id)
+        return
+    if crawl.status != OnboardingOnPageCrawl.STATUS_COMPLETED:
+        return
+    if crawl.review_topics:
+        return
+
+    rt_list, rt_err = generate_review_topics_for_domain(
+        domain=crawl.domain,
+        business_profile=crawl.business_profile,
+    )
+    crawl.review_topics = rt_list
+    crawl.review_topics_error = (rt_err or "")[:2000]
+    crawl.save(update_fields=["review_topics", "review_topics_error", "updated_at"])
+
+    if not rt_list:
+        return
+
+    if crawl.prompt_plan_status in {
+        OnboardingOnPageCrawl.PROMPT_PLAN_QUEUED,
+        OnboardingOnPageCrawl.PROMPT_PLAN_RUNNING,
+        OnboardingOnPageCrawl.PROMPT_PLAN_COMPLETED,
+    }:
+        return
+
+    crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_QUEUED
+    crawl.prompt_plan_error = ""
+    crawl.save(update_fields=["prompt_plan_status", "prompt_plan_error", "updated_at"])
+    task = onboarding_prompt_generation_task.delay(crawl.id)
+    crawl.prompt_plan_task_id = str(getattr(task, "id", "") or "")[:128]
+    crawl.save(update_fields=["prompt_plan_task_id", "updated_at"])

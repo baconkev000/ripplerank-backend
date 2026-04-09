@@ -138,7 +138,7 @@ def _onboarding_domain_claimed_by_other_user(domain: str, user) -> bool:
 
 
 def _onboarding_reusable_crawl_for_user(user, domain: str) -> OnboardingOnPageCrawl | None:
-    """Latest completed onboarding crawl for this user/domain with stored ranked keywords."""
+    """Latest completed onboarding crawl for this user/domain with keywords and/or review topics."""
     if not domain:
         return None
     qs = OnboardingOnPageCrawl.objects.filter(
@@ -147,7 +147,7 @@ def _onboarding_reusable_crawl_for_user(user, domain: str) -> OnboardingOnPageCr
         status=OnboardingOnPageCrawl.STATUS_COMPLETED,
     ).order_by("-created_at")
     for crawl in qs[:5]:
-        if crawl.ranked_keywords:
+        if crawl.ranked_keywords or crawl.review_topics:
             return crawl
     return None
 
@@ -164,7 +164,7 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
     If this user already has a completed crawl with ranked keywords for the domain,
     returns that row without enqueueing a new crawl.
     """
-    from .tasks import onboarding_onpage_crawl_task
+    from .tasks import onboarding_onpage_crawl_task, onboarding_review_topics_backfill_task
 
     website_url = (request.data.get("website_url") or "").strip()
     business_name = (request.data.get("business_name") or "").strip()
@@ -186,6 +186,12 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
 
     reused = _onboarding_reusable_crawl_for_user(request.user, domain)
     if reused is not None:
+        if (reused.ranked_keywords or []) and not (reused.review_topics or []):
+
+            def _enqueue_backfill() -> None:
+                onboarding_review_topics_backfill_task.delay(reused.id)
+
+            transaction.on_commit(_enqueue_backfill)
         return Response(
             {
                 "id": reused.id,
@@ -193,6 +199,8 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
                 "domain": domain,
                 "reused": True,
                 "ranked_keywords": reused.ranked_keywords or [],
+                "review_topics": reused.review_topics or [],
+                "review_topics_error": reused.review_topics_error or "",
                 "prompt_plan_status": reused.prompt_plan_status,
                 "prompt_plan_prompt_count": int(reused.prompt_plan_prompt_count or 0),
                 "prompt_plan_error": reused.prompt_plan_error or "",
@@ -255,7 +263,14 @@ def onboarding_crawl_latest(request: HttpRequest) -> Response:
         crawl = base.order_by("-created_at").first()
     if not crawl:
         return Response(
-            {"id": None, "status": "none", "ranked_keywords": [], "domain": None},
+            {
+                "id": None,
+                "status": "none",
+                "ranked_keywords": [],
+                "review_topics": [],
+                "review_topics_error": "",
+                "domain": None,
+            },
         )
     return Response(
         {
@@ -263,6 +278,8 @@ def onboarding_crawl_latest(request: HttpRequest) -> Response:
             "status": crawl.status,
             "domain": crawl.domain,
             "ranked_keywords": crawl.ranked_keywords or [],
+            "review_topics": crawl.review_topics or [],
+            "review_topics_error": crawl.review_topics_error or "",
             "exit_reason": crawl.exit_reason,
             "ranked_keywords_error": crawl.ranked_keywords_error or "",
             "prompt_plan_status": crawl.prompt_plan_status,
@@ -1029,7 +1046,9 @@ def business_profile(request: HttpRequest) -> Response:
     in the serializer (returns null/empty SEO fields and a stub AEO bundle). Use during onboarding
     to avoid paid API calls when only updating basic fields.
     """
-    profile_qs = BusinessProfile.objects.filter(user=request.user)
+    profile_qs = BusinessProfile.objects.filter(user=request.user).prefetch_related(
+        "tracked_competitors",
+    )
     profile = profile_qs.filter(is_main=True).first()
     if profile is None:
         # If the user has no profiles yet, create a main profile for them.
@@ -1092,8 +1111,12 @@ def business_profile(request: HttpRequest) -> Response:
 @permission_classes([IsAuthenticated])
 def seo_profile_data(request: HttpRequest) -> Response:
     profile = (
-        BusinessProfile.objects.filter(user=request.user, is_main=True).first()
-        or BusinessProfile.objects.filter(user=request.user).first()
+        BusinessProfile.objects.filter(user=request.user, is_main=True)
+        .prefetch_related("tracked_competitors")
+        .first()
+        or BusinessProfile.objects.filter(user=request.user)
+        .prefetch_related("tracked_competitors")
+        .first()
     )
     if not profile:
         profile = BusinessProfile.objects.create(user=request.user, is_main=True)
@@ -2498,7 +2521,11 @@ def business_profile_list(request: HttpRequest) -> Response:
       The first profile for a user is always created as is_main=True.
     """
     if request.method == "GET":
-        profiles = BusinessProfile.objects.filter(user=request.user).order_by("-is_main", "created_at", "id")
+        profiles = (
+            BusinessProfile.objects.filter(user=request.user)
+            .prefetch_related("tracked_competitors")
+            .order_by("-is_main", "created_at", "id")
+        )
         serializer = BusinessProfileSerializer(profiles, many=True)
         return Response(serializer.data)
 
@@ -2944,7 +2971,10 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
     Primarily used by the Settings page to update a specific profile or mark it as main.
     """
     try:
-        profile = BusinessProfile.objects.get(id=pk, user=request.user)
+        profile = BusinessProfile.objects.prefetch_related("tracked_competitors").get(
+            id=pk,
+            user=request.user,
+        )
     except BusinessProfile.DoesNotExist:
         return Response({"detail": "Not found."}, status=404)
 

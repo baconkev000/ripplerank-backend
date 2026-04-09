@@ -371,6 +371,8 @@ AEO_RECOMMENDATION_USE_OPENAI = env.bool("AEO_RECOMMENDATION_USE_OPENAI", defaul
 # Also accepted: GOOGLE_GEMINI_API_KEY if this is empty (read in gemini_utils).
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="").strip()
 AEO_GEMINI_EXECUTION_MODEL = env("AEO_GEMINI_EXECUTION_MODEL", default="gemini-2.5-flash")
+# Empty → use AEO_GEMINI_EXECUTION_MODEL (see accounts.gemini_utils.get_gemini_review_topics_model).
+GEMINI_REVIEW_TOPICS_MODEL = env("GEMINI_REVIEW_TOPICS_MODEL", default="").strip()
 # Perplexity Sonar — optional Phase 2 AEO execution alongside OpenAI/Gemini (see accounts.aeo.perplexity_execution_utils).
 PERPLEXITY_API_KEY = env("PERPLEXITY_API_KEY", default="").strip()
 PERPLEXITY_AEO_MODEL = env("PERPLEXITY_AEO_MODEL", default="sonar").strip() or "sonar"

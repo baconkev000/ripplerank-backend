@@ -79,6 +79,8 @@ def generate_gemini_execution_text(
     temperature: float,
     max_output_tokens: int,
     business_profile: BusinessProfile | None = None,
+    log_operation: str | None = None,
+    model_name_override: str | None = None,
 ) -> tuple[str, str | None]:
     """
     Call Gemini with system + user content.
@@ -95,7 +97,8 @@ def generate_gemini_execution_text(
         logger.warning("google-generativeai not installed: %s", exc)
         return "", "gemini_sdk_missing"
 
-    model_name = get_gemini_execution_model()
+    operation = (log_operation or "").strip() or "gemini.generate_content.aeo_execution"
+    model_name = (model_name_override or "").strip() or get_gemini_execution_model()
     timeout = _gemini_timeout_seconds()
     attempts = _gemini_max_attempts()
     err: str | None = None
@@ -118,7 +121,7 @@ def generate_gemini_execution_text(
                 request_options={"timeout": int(timeout)},
             )
             record_gemini_request(
-                operation="gemini.generate_content.aeo_execution",
+                operation=operation,
                 response=response,
                 business_profile=business_profile,
             )
@@ -162,7 +165,7 @@ def generate_gemini_execution_text(
             ek = ThirdPartyApiErrorLog.ErrorKind.UNKNOWN_EXCEPTION
         record_third_party_api_error(
             provider=ThirdPartyApiProvider.GEMINI,
-            operation="gemini.generate_content.aeo_execution",
+            operation=operation,
             error_kind=ek,
             message=err[:1024],
             detail=err,

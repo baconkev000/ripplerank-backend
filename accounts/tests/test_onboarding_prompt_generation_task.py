@@ -29,7 +29,7 @@ def test_onboarding_prompt_generation_task_empty_plan_marks_failed(monkeypatch):
         business_profile=profile,
         domain="example.com",
         status=OnboardingOnPageCrawl.STATUS_COMPLETED,
-        ranked_keywords=[{"keyword": "best dentist", "rank": 3}],
+        review_topics=[{"topic": "Family dentistry", "category": "service", "rationale": "Core offering"}],
         context={"business_name": "Biz", "location": "US"},
     )
     monkeypatch.setattr("accounts.aeo.aeo_utils.aeo_business_input_from_onboarding_payload", lambda **kwargs: _BizInput())
@@ -58,7 +58,7 @@ def test_onboarding_prompt_generation_task_valid_plan_saves_prompts_and_enqueues
         business_profile=profile,
         domain="example.com",
         status=OnboardingOnPageCrawl.STATUS_COMPLETED,
-        ranked_keywords=[{"keyword": "best dentist", "rank": 3}],
+        review_topics=[{"topic": "Teeth whitening", "category": "service"}],
         context={"business_name": "Biz", "location": "US"},
     )
     monkeypatch.setattr("accounts.aeo.aeo_utils.aeo_business_input_from_onboarding_payload", lambda **kwargs: _BizInput())
@@ -106,7 +106,7 @@ def test_onboarding_prompt_generation_task_marks_stale_inflight_failed_then_enqu
         business_profile=profile,
         domain="example.com",
         status=OnboardingOnPageCrawl.STATUS_COMPLETED,
-        ranked_keywords=[{"keyword": "best dentist", "rank": 3}],
+        review_topics=[{"topic": "Dental implants", "category": "service"}],
         context={"business_name": "Biz", "location": "US"},
     )
     monkeypatch.setattr("accounts.aeo.aeo_utils.aeo_business_input_from_onboarding_payload", lambda **kwargs: _BizInput())
@@ -124,4 +124,33 @@ def test_onboarding_prompt_generation_task_marks_stale_inflight_failed_then_enqu
     assert stale.status == AEOExecutionRun.STATUS_FAILED
     assert "stale_inflight" in (stale.error_message or "")
     assert len(calls) == 1
+
+
+@pytest.mark.django_db
+def test_onboarding_prompt_generation_task_fails_without_review_topics(monkeypatch):
+    user = User.objects.create_user(username="opt5", email="opt5@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Biz",
+        website_url="https://example.com",
+        business_address="US",
+    )
+    crawl = OnboardingOnPageCrawl.objects.create(
+        user=user,
+        business_profile=profile,
+        domain="example.com",
+        status=OnboardingOnPageCrawl.STATUS_COMPLETED,
+        review_topics=[],
+        ranked_keywords=[{"keyword": "legacy only", "rank": 1}],
+        context={"business_name": "Biz", "location": "US"},
+    )
+    def _boom(*_a, **_k):
+        raise AssertionError("build_full_aeo_prompt_plan must not run without review_topics")
+
+    monkeypatch.setattr("accounts.aeo.aeo_utils.build_full_aeo_prompt_plan", _boom)
+    onboarding_prompt_generation_task(crawl.id)
+    crawl.refresh_from_db()
+    assert crawl.prompt_plan_status == OnboardingOnPageCrawl.PROMPT_PLAN_FAILED
+    assert crawl.prompt_plan_error == "no_review_topics"
 

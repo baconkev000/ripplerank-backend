@@ -1,5 +1,6 @@
 import pytest
 from django.contrib.auth import get_user_model
+from django.db import transaction as django_transaction
 from rest_framework.test import APIClient
 
 from accounts.models import BusinessProfile, OnboardingOnPageCrawl
@@ -46,13 +47,22 @@ def test_onpage_crawl_409_when_domain_on_other_users_profile():
 @pytest.mark.django_db
 def test_onpage_crawl_reuses_completed_crawl_with_keywords(monkeypatch):
     calls = []
+    backfill_calls = []
 
     def fake_delay(_cid):
         calls.append(_cid)
 
+    def fake_backfill(cid):
+        backfill_calls.append(cid)
+
+    monkeypatch.setattr(django_transaction, "on_commit", lambda cb: cb())
     monkeypatch.setattr(
         "accounts.tasks.onboarding_onpage_crawl_task.delay",
         fake_delay,
+    )
+    monkeypatch.setattr(
+        "accounts.tasks.onboarding_review_topics_backfill_task.delay",
+        fake_backfill,
     )
 
     user = User.objects.create_user(
@@ -85,7 +95,9 @@ def test_onpage_crawl_reuses_completed_crawl_with_keywords(monkeypatch):
     assert resp.status_code == 200
     assert resp.data.get("reused") is True
     assert len(resp.data.get("ranked_keywords") or []) == 1
+    assert resp.data.get("review_topics") == []
     assert calls == []
+    assert len(backfill_calls) == 1
     assert OnboardingOnPageCrawl.objects.filter(user=user).count() == 1
 
 
@@ -96,6 +108,7 @@ def test_onpage_crawl_enqueues_when_no_reusable_rows(monkeypatch):
     def fake_delay(cid):
         calls.append(cid)
 
+    monkeypatch.setattr(django_transaction, "on_commit", lambda cb: cb())
     monkeypatch.setattr(
         "accounts.tasks.onboarding_onpage_crawl_task.delay",
         fake_delay,
@@ -152,9 +165,11 @@ def test_onboarding_crawl_latest_filters_by_domain():
     client.force_authenticate(user=user)
     r_new = client.get("/api/onboarding/crawl/latest/")
     assert r_new.status_code == 200
-    assert r_new.data["domain"] == "b.com"
+    # Latest by created_at: a.com row is created after b.com
+    assert r_new.data["domain"] == "a.com"
 
     r_a = client.get("/api/onboarding/crawl/latest/", {"domain": "a.com"})
     assert r_a.status_code == 200
     assert r_a.data["domain"] == "a.com"
     assert (r_a.data["ranked_keywords"] or [{}])[0].get("keyword") == "a"
+    assert r_a.data.get("review_topics") == []

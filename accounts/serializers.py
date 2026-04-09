@@ -7,7 +7,8 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from .constants import AEO_RECOMMENDATIONS_TTL, AEO_SNAPSHOT_TTL, SEO_SNAPSHOT_TTL
-from .models import BusinessProfile, SEOOverviewSnapshot, AEOOverviewSnapshot
+from .domain_utils import normalize_tracked_competitor_domain
+from .models import BusinessProfile, SEOOverviewSnapshot, AEOOverviewSnapshot, TrackedCompetitor
 from .aeo.aeo_utils import AEO_ONBOARDING_PROMPT_COUNT
 from .dataforseo_utils import get_or_refresh_seo_score_for_user
 from .dataforseo_utils import (
@@ -102,6 +103,15 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         allow_blank=True,
     )
     email = serializers.EmailField(source="user.email", required=False)
+    plan = serializers.ChoiceField(
+        choices=[
+            BusinessProfile.PLAN_STARTER,
+            BusinessProfile.PLAN_PRO,
+            BusinessProfile.PLAN_ADVANCED,
+        ],
+        required=False,
+    )
+    tracked_competitors = serializers.SerializerMethodField()
     seo_score = serializers.SerializerMethodField()
     search_performance_score = serializers.SerializerMethodField()
     search_visibility_percent = serializers.SerializerMethodField()
@@ -149,7 +159,6 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "business_name",
             "business_address",
             "industry",
-            "tone_of_voice",
             "phone",
             "description",
             "website_url",
@@ -157,6 +166,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "aeo_onboarding_prompt_target_count",
             "plan",
             "is_main",
+            "tracked_competitors",
             "seo_competitor_domains_override",
             "seo_location_mode",
             "seo_score",
@@ -200,6 +210,50 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     def get_aeo_onboarding_prompt_target_count(self, obj: BusinessProfile) -> int:
         return _aeo_prompt_target_count()
 
+    def get_tracked_competitors(self, obj: BusinessProfile) -> list[dict]:
+        return [
+            {"id": c.id, "name": c.name, "domain": c.domain}
+            for c in obj.tracked_competitors.order_by("domain").all()
+        ]
+
+    @staticmethod
+    def _normalize_tracked_competitors_input(raw: list) -> list[dict[str, str]]:
+        seen: set[str] = set()
+        out: list[dict[str, str]] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise serializers.ValidationError(
+                    {"tracked_competitors": f"Item {i} must be an object with name and domain."}
+                )
+            name = str(item.get("name") or "").strip()
+            raw_dom = str(item.get("domain") or "").strip()
+            nd = normalize_tracked_competitor_domain(raw_dom)
+            if not nd:
+                raise serializers.ValidationError(
+                    {"tracked_competitors": f"Invalid domain at index {i}: {raw_dom!r}."}
+                )
+            if not name:
+                name = nd
+            if nd in seen:
+                continue
+            seen.add(nd)
+            out.append({"name": name, "domain": nd})
+        return out
+
+    @staticmethod
+    def _apply_tracked_competitors(instance: BusinessProfile, items: list[dict[str, str]]) -> None:
+        ids: list[int] = []
+        for item in items:
+            obj, _created = TrackedCompetitor.objects.get_or_create(
+                domain=item["domain"],
+                defaults={"name": item["name"]},
+            )
+            if obj.name != item["name"]:
+                obj.name = item["name"]
+                obj.save(update_fields=["name", "updated_at"])
+            ids.append(obj.id)
+        instance.tracked_competitors.set(ids)
+
     def validate_website_url(self, value):
         """Normalize to origin (scheme + host only) so paths/query strings do not exceed URLField(200)."""
         if value is None or str(value).strip() == "":
@@ -219,6 +273,16 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        if "tracked_competitors" in self.initial_data:
+            raw = self.initial_data.get("tracked_competitors")
+            if raw is None:
+                attrs["_tracked_competitors"] = []
+            elif not isinstance(raw, list):
+                raise serializers.ValidationError(
+                    {"tracked_competitors": "Expected a list of objects with name and domain."}
+                )
+            else:
+                attrs["_tracked_competitors"] = self._normalize_tracked_competitors_input(raw)
         if "selected_aeo_prompts" in attrs:
             sp = attrs.get("selected_aeo_prompts")
             if sp is not None:
@@ -255,7 +319,15 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             return parts[0], ""
         return parts[0], " ".join(parts[1:])
 
+    def create(self, validated_data: dict) -> BusinessProfile:
+        tc = validated_data.pop("_tracked_competitors", None)
+        instance = super().create(validated_data)
+        if tc is not None:
+            self._apply_tracked_competitors(instance, tc)
+        return instance
+
     def update(self, instance: BusinessProfile, validated_data: dict) -> BusinessProfile:
+        tc = validated_data.pop("_tracked_competitors", None)
         user_data = validated_data.pop("user", {}) or {}
         full_name = validated_data.get("full_name", None)
         user = getattr(instance, "user", None)
@@ -282,7 +354,10 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             if user_changed_fields:
                 user.save(update_fields=sorted(set(user_changed_fields)))
 
-        return super().update(instance, validated_data)
+        instance = super().update(instance, validated_data)
+        if tc is not None:
+            self._apply_tracked_competitors(instance, tc)
+        return instance
 
     def to_representation(self, instance: BusinessProfile) -> dict:
         data = super().to_representation(instance)
@@ -812,12 +887,12 @@ class BusinessProfileSEOSerializer(BusinessProfileSerializer):
             "business_name",
             "business_address",
             "industry",
-            "tone_of_voice",
             "phone",
             "description",
             "website_url",
             "plan",
             "is_main",
+            "tracked_competitors",
             "seo_competitor_domains_override",
             "seo_location_mode",
             "seo_score",
@@ -856,13 +931,13 @@ class BusinessProfileAEOSerializer(BusinessProfileSerializer):
             "business_name",
             "business_address",
             "industry",
-            "tone_of_voice",
             "phone",
             "description",
             "website_url",
             "selected_aeo_prompts",
             "plan",
             "is_main",
+            "tracked_competitors",
             "seo_location_mode",
             "aeo_score",
             "question_coverage_score",
