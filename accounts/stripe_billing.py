@@ -61,6 +61,17 @@ def _safe_dt_from_unix(ts: int | None) -> datetime | None:
         return None
 
 
+def _as_dict(x) -> dict:
+    if isinstance(x, dict):
+        return x
+    if hasattr(x, "to_dict_recursive"):
+        try:
+            return x.to_dict_recursive()
+        except Exception:
+            return {}
+    return {}
+
+
 def _plan_from_price(price_id: str) -> str | None:
     pid = (price_id or "").strip()
     if not pid:
@@ -80,7 +91,8 @@ def _plan_from_price(price_id: str) -> str | None:
 
 
 def _resolve_profile_for_event(data: dict) -> BusinessProfile | None:
-    obj = data.get("object") if isinstance(data.get("object"), dict) else {}
+    d = _as_dict(data)
+    obj = _as_dict(d.get("object"))
     customer_id = str(obj.get("customer") or "").strip()
     if customer_id:
         profile = (
@@ -97,6 +109,8 @@ def _resolve_profile_for_event(data: dict) -> BusinessProfile | None:
 
     details = obj.get("customer_details") if isinstance(obj.get("customer_details"), dict) else {}
     email = str(details.get("email") or "").strip().lower()
+    if not email:
+        email = str(obj.get("customer_email") or obj.get("receipt_email") or "").strip().lower()
     if email:
         return (
             BusinessProfile.objects.filter(user__email__iexact=email)
@@ -152,12 +166,14 @@ def sync_from_checkout_session(payload: dict) -> bool:
     if profile is None:
         logger.error("[stripe] checkout session: no matching profile")
         return False
-    obj = payload.get("object") if isinstance(payload.get("object"), dict) else {}
+    obj = _as_dict(_as_dict(payload).get("object"))
     subscription = str(obj.get("subscription") or "").strip()
     customer = str(obj.get("customer") or "").strip()
     payment_link = str(obj.get("payment_link") or "").strip()
-    details = obj.get("customer_details") if isinstance(obj.get("customer_details"), dict) else {}
+    details = _as_dict(obj.get("customer_details"))
     email = str(details.get("email") or "").strip()
+    if not email:
+        email = str(obj.get("customer_email") or "").strip()
     if email and not profile.user.email:
         profile.user.email = email
         profile.user.save(update_fields=["email"])
@@ -175,14 +191,15 @@ def sync_from_invoice_paid(payload: dict) -> bool:
     if profile is None:
         logger.error("[stripe] invoice paid: no matching profile")
         return False
-    obj = payload.get("object") if isinstance(payload.get("object"), dict) else {}
+    obj = _as_dict(_as_dict(payload).get("object"))
     customer = str(obj.get("customer") or "").strip()
     subscription = str(obj.get("subscription") or "").strip()
-    lines = obj.get("lines") if isinstance(obj.get("lines"), dict) else {}
+    lines = _as_dict(obj.get("lines"))
     first = None
     if isinstance(lines.get("data"), list) and lines.get("data"):
         first = lines.get("data")[0]
-    price = first.get("price") if isinstance(first, dict) and isinstance(first.get("price"), dict) else {}
+    first_d = _as_dict(first)
+    price = _as_dict(first_d.get("price"))
     price_id = str(price.get("id") or "").strip()
     apply_subscription_payload_to_profile(
         profile,
@@ -195,7 +212,7 @@ def sync_from_invoice_paid(payload: dict) -> bool:
 
 
 def sync_from_subscription(payload: dict) -> bool:
-    obj = payload.get("object") if isinstance(payload.get("object"), dict) else {}
+    obj = _as_dict(_as_dict(payload).get("object"))
     customer = str(obj.get("customer") or "").strip()
     subscription = str(obj.get("id") or "").strip()
     profile = None
