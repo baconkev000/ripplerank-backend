@@ -64,7 +64,9 @@ from .stripe_billing import sync_from_checkout_session
 from .stripe_billing import sync_from_invoice_paid
 from .stripe_billing import sync_from_subscription
 from .stripe_billing import normalize_stripe_payload
-from .stripe_billing import extract_match_debug_fields
+from .stripe_billing import extract_sync_debug_fields
+from .stripe_billing import infer_sync_failure_reason
+from .stripe_billing import mask_email
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +148,12 @@ def stripe_webhook(request: HttpRequest) -> Response:
     secret = str(getattr(settings, "STRIPE_WEBHOOK_SECRET", "") or "").strip()
     api_key = str(getattr(settings, "STRIPE_SECRET_KEY", "") or "").strip()
     if not secret or not api_key:
-        logger.error("[stripe webhook] missing STRIPE_WEBHOOK_SECRET / STRIPE_SECRET_KEY")
+        logger.error(
+            "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s",
+            "missing_required_env",
+            "",
+            "",
+        )
         return Response({"error": "Stripe webhook is not configured."}, status=503)
 
     stripe.api_key = api_key
@@ -155,40 +162,128 @@ def stripe_webhook(request: HttpRequest) -> Response:
     try:
         event = stripe.Webhook.construct_event(payload, sig, secret)
     except ValueError:
+        logger.error(
+            "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s",
+            "invalid_payload",
+            "",
+            "",
+        )
         return Response({"error": "Invalid payload."}, status=400)
     except stripe.error.SignatureVerificationError:
+        logger.error(
+            "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s",
+            "invalid_signature",
+            "",
+            "",
+        )
         return Response({"error": "Invalid signature."}, status=400)
 
     # Normalize recursively to plain dict/list before dispatch.
     event_dict = normalize_stripe_payload(event)
     if not isinstance(event_dict, dict):
         event_dict = {}
+    event_id = str(event_dict.get("id") or "")
     event_type = str(event_dict.get("type") or "")
+    livemode = bool(event_dict.get("livemode"))
+    api_version = str(event_dict.get("api_version") or "")
+    logger.info(
+        "stripe.webhook.received event_id=%s event_type=%s livemode=%s api_version=%s request_path=%s has_signature_header=%s",
+        event_id,
+        event_type,
+        livemode,
+        api_version,
+        request.path,
+        bool(sig),
+    )
     data = event_dict.get("data")
     if not isinstance(data, dict):
         data = {}
+    dbg_identity = extract_sync_debug_fields(data, event_type=event_type, did_update=False)
+    obj = data.get("object") if isinstance(data.get("object"), dict) else {}
+    lines = obj.get("lines") if isinstance(obj.get("lines"), dict) else {}
+    line0 = lines.get("data")[0] if isinstance(lines.get("data"), list) and lines.get("data") else {}
+    line0_price = line0.get("price") if isinstance(line0, dict) and isinstance(line0.get("price"), dict) else {}
+    items = obj.get("items") if isinstance(obj.get("items"), dict) else {}
+    item0 = items.get("data")[0] if isinstance(items.get("data"), list) and items.get("data") else {}
+    item0_price = item0.get("price") if isinstance(item0, dict) and isinstance(item0.get("price"), dict) else {}
+    extracted_price_id = str(obj.get("price") or line0_price.get("id") or item0_price.get("id") or "")
+    extracted_status = str(obj.get("status") or "")
+    logger.info(
+        "stripe.webhook.identity event_id=%s event_type=%s client_reference_id=%s customer_id=%s subscription_id=%s customer_details_email=%s payment_link_id=%s invoice_id=%s",
+        event_id,
+        event_type,
+        dbg_identity["client_reference_id"],
+        dbg_identity["customer"],
+        dbg_identity["subscription"],
+        dbg_identity["email"],
+        str(obj.get("payment_link") or ""),
+        str(obj.get("id") or ""),
+    )
     handled = False
+    result = None
     try:
         if event_type == "checkout.session.completed":
-            handled = sync_from_checkout_session(data)
+            result = sync_from_checkout_session(data, event_id=event_id)
+            handled = result.handled
         elif event_type == "invoice.paid":
-            handled = sync_from_invoice_paid(data)
+            result = sync_from_invoice_paid(data, event_id=event_id)
+            handled = result.handled
         elif event_type in {"customer.subscription.updated", "customer.subscription.deleted"}:
-            handled = sync_from_subscription(data)
+            result = sync_from_subscription(data, event_id=event_id)
+            handled = result.handled
         else:
             handled = True
     except Exception:
-        logger.exception("[stripe webhook] handler failed for %s", event_type)
+        logger.exception(
+            "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s",
+            "handler_exception",
+            event_id,
+            event_type,
+        )
         return Response({"error": "Webhook handler failed."}, status=500)
 
-    if not handled:
-        dbg = extract_match_debug_fields(data)
-        logger.error(
-            "[stripe webhook] ignored event without profile match: event_type=%s client_reference_id=%s customer=%s customer_details.email=%s",
+    if result is not None:
+        profile_email = None
+        profile_user_id = None
+        if result.matched_profile_id is not None:
+            p = BusinessProfile.objects.filter(id=result.matched_profile_id).only("id", "user_id", "user__email").first()
+            if p is not None:
+                profile_user_id = p.user_id
+                profile_email = mask_email(p.user.email if p.user else "")
+        logger.info(
+            "stripe.webhook.profile_resolution event_id=%s event_type=%s matched_profile_id=%s matched_by=%s profile_user_id=%s profile_email=%s",
+            event_id,
             event_type,
+            result.matched_profile_id if result.matched_profile_id is not None else "",
+            result.matched_by or "none",
+            profile_user_id if profile_user_id is not None else "",
+            profile_email or "",
+        )
+        logger.info(
+            "stripe.webhook.update_result event_id=%s event_type=%s did_update=%s updated_fields=%s stripe_customer_id_present=%s stripe_subscription_id_present=%s stripe_price_id_present=%s stripe_subscription_status_present=%s",
+            event_id,
+            event_type,
+            result.did_update,
+            ",".join(result.updated_fields) if result.updated_fields else "",
+            bool(dbg_identity["customer"]),
+            bool(dbg_identity["subscription"]),
+            bool(extracted_price_id),
+            bool(extracted_status),
+        )
+    if not handled:
+        dbg = extract_sync_debug_fields(data, event_type=event_type, did_update=False)
+        reason = (result.reason_code if result is not None and result.reason_code else None) or infer_sync_failure_reason(event_type, data)
+        logger.error(
+            "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s client_reference_id=%s customer=%s subscription=%s email=%s matched_profile_id=%s did_update=%s",
+            reason,
+            event_id,
+            dbg["event_type"],
             dbg["client_reference_id"],
             dbg["customer"],
-            dbg["customer_details_email"],
+            dbg["subscription"],
+            dbg["email"],
+            dbg["matched_profile_id"],
+            dbg["did_update"],
         )
     return Response({"received": True})
 

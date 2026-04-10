@@ -22,6 +22,16 @@ class StripePlanMapping:
     billing_cycle: str
 
 
+@dataclass(frozen=True)
+class StripeSyncResult:
+    handled: bool
+    did_update: bool
+    matched_profile_id: int | None
+    matched_by: str | None
+    updated_fields: list[str]
+    reason_code: str | None = None
+
+
 def _normalize_link_id(link_or_url: str) -> str:
     s = (link_or_url or "").strip()
     if not s:
@@ -98,6 +108,69 @@ def extract_match_debug_fields(payload) -> dict[str, str]:
     }
 
 
+def mask_email(email: str) -> str:
+    e = (email or "").strip().lower()
+    if "@" not in e:
+        return ""
+    local, domain = e.split("@", 1)
+    if not local:
+        return f"***@{domain}"
+    return f"{local[:1]}***@{domain}"
+
+
+def extract_sync_debug_fields(
+    payload,
+    *,
+    event_type: str,
+    matched_profile_id: int | None = None,
+    did_update: bool | None = None,
+) -> dict[str, str]:
+    d = _as_dict(payload)
+    obj = _as_dict(d.get("object"))
+    details = _as_dict(obj.get("customer_details"))
+    email = str(details.get("email") or obj.get("customer_email") or obj.get("receipt_email") or "").strip().lower()
+    out = {
+        "event_type": event_type,
+        "client_reference_id": str(obj.get("client_reference_id") or "").strip(),
+        "customer": str(obj.get("customer") or "").strip(),
+        "subscription": str(obj.get("subscription") or obj.get("id") or "").strip(),
+        "email": email,
+        "matched_profile_id": str(matched_profile_id or ""),
+        "did_update": "true" if did_update else "false",
+    }
+    return out
+
+
+def infer_sync_failure_reason(event_type: str, payload) -> str:
+    d = _as_dict(payload)
+    obj = _as_dict(d.get("object"))
+    details = _as_dict(obj.get("customer_details"))
+    customer = str(obj.get("customer") or "").strip()
+    subscription = str(obj.get("subscription") or obj.get("id") or "").strip()
+    client_ref = str(obj.get("client_reference_id") or "").strip()
+    email = str(details.get("email") or obj.get("customer_email") or obj.get("receipt_email") or "").strip().lower()
+    payment_link = str(obj.get("payment_link") or "").strip()
+    lines = _as_dict(obj.get("lines"))
+    line0 = lines.get("data")[0] if isinstance(lines.get("data"), list) and lines.get("data") else {}
+    price_id = str(_as_dict(_as_dict(line0).get("price")).get("id") or "").strip()
+    items = _as_dict(obj.get("items"))
+    item0 = items.get("data")[0] if isinstance(items.get("data"), list) and items.get("data") else {}
+    sub_price_id = str(_as_dict(_as_dict(item0).get("price")).get("id") or "").strip()
+    status = str(obj.get("status") or "").strip()
+
+    if not (client_ref or customer or subscription or email):
+        return "no_profile_identifiers"
+    if event_type == "checkout.session.completed" and not (customer or subscription or payment_link):
+        return "no_stripe_ids"
+    if event_type == "invoice.paid" and not (customer or subscription or price_id):
+        return "no_stripe_ids_or_price"
+    if event_type in {"customer.subscription.updated", "customer.subscription.deleted"} and not (
+        customer or subscription or sub_price_id or status
+    ):
+        return "no_price_status_or_ids"
+    return "no_profile_match_or_no_updates"
+
+
 def _plan_from_price(price_id: str) -> str | None:
     pid = (price_id or "").strip()
     if not pid:
@@ -137,7 +210,7 @@ def _resolve_profile_for_event(data: dict) -> tuple[BusinessProfile | None, str]
             .first()
         )
         if profile is not None:
-            return profile, "customer"
+            return profile, "customer_id"
         # First-time webhook for a customer not yet linked in DB:
         # fetch customer email from Stripe and resolve profile by email.
         try:
@@ -147,7 +220,7 @@ def _resolve_profile_for_event(data: dict) -> tuple[BusinessProfile | None, str]
             if customer_email:
                 profile_by_email = _unique_profile_by_email(customer_email)
                 if profile_by_email is not None:
-                    return profile_by_email, "customer_email_lookup"
+                    return profile_by_email, "email"
         except Exception:
             logger.exception("[stripe] failed retrieving customer %s for profile resolution", customer_id)
 
@@ -178,7 +251,7 @@ def apply_subscription_payload_to_profile(
     current_period_end_unix: int | None = None,
     cancel_at_period_end: bool | None = None,
     payment_link_id: str = "",
-) -> None:
+) -> tuple[bool, list[str]]:
     updates: dict[str, object] = {}
     if customer_id:
         updates["stripe_customer_id"] = customer_id
@@ -202,24 +275,35 @@ def apply_subscription_payload_to_profile(
         updates["plan"] = plan
 
     if not updates:
-        return
+        return False, []
     updates["updated_at"] = datetime.now(tz=timezone.utc)
     for k, v in updates.items():
         setattr(profile, k, v)
     profile.save(update_fields=list(updates.keys()))
+    return True, list(updates.keys())
 
 
-def sync_from_checkout_session(payload: dict) -> bool:
+def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSyncResult:
     profile, resolver = _resolve_profile_for_event(payload)
     if profile is None:
         dbg = extract_match_debug_fields(payload)
         logger.error(
-            "[stripe] checkout session: no matching profile client_reference_id=%s customer=%s customer_details.email=%s",
+            "stripe.webhook.skipped event_id=%s event_type=%s reason_code=%s client_reference_id=%s customer=%s customer_details_email=%s",
+            event_id,
+            "checkout.session.completed",
+            "missing_profile_match",
             dbg["client_reference_id"],
             dbg["customer"],
             dbg["customer_details_email"],
         )
-        return False
+        return StripeSyncResult(
+            handled=False,
+            did_update=False,
+            matched_profile_id=None,
+            matched_by="none",
+            updated_fields=[],
+            reason_code="missing_profile_match",
+        )
     obj = _as_dict(_as_dict(payload).get("object"))
     client_ref = str(obj.get("client_reference_id") or "").strip()
     details = _as_dict(obj.get("customer_details"))
@@ -243,39 +327,68 @@ def sync_from_checkout_session(payload: dict) -> bool:
     subscription = str(obj.get("subscription") or "").strip()
     customer = str(obj.get("customer") or "").strip()
     payment_link = str(obj.get("payment_link") or "").strip()
+    if not (customer or subscription or payment_link):
+        return StripeSyncResult(
+            handled=False,
+            did_update=False,
+            matched_profile_id=profile.id,
+            matched_by=resolver,
+            updated_fields=[],
+            reason_code="empty_update_payload",
+        )
     email = str(details.get("email") or "").strip()
     if not email:
         email = str(obj.get("customer_email") or "").strip()
     if email and not profile.user.email:
         profile.user.email = email
         profile.user.save(update_fields=["email"])
-    apply_subscription_payload_to_profile(
+    did_update, updated_fields = apply_subscription_payload_to_profile(
         profile,
         customer_id=customer,
         subscription_id=subscription,
         payment_link_id=payment_link,
     )
-    return True
+    if not did_update:
+        return StripeSyncResult(
+            handled=False,
+            did_update=False,
+            matched_profile_id=profile.id,
+            matched_by=resolver,
+            updated_fields=[],
+            reason_code="empty_update_payload",
+        )
+    return StripeSyncResult(
+        handled=True,
+        did_update=True,
+        matched_profile_id=profile.id,
+        matched_by=resolver,
+        updated_fields=updated_fields,
+        reason_code=None,
+    )
 
 
-def sync_from_invoice_paid(payload: dict) -> bool:
+def sync_from_invoice_paid(payload: dict, *, event_id: str = "") -> StripeSyncResult:
     profile, resolver = _resolve_profile_for_event(payload)
     if profile is None:
         dbg = extract_match_debug_fields(payload)
         logger.error(
-            "[stripe] invoice paid: no matching profile client_reference_id=%s customer=%s customer_details.email=%s",
+            "stripe.webhook.skipped event_id=%s event_type=%s reason_code=%s client_reference_id=%s customer=%s customer_details_email=%s",
+            event_id,
+            "invoice.paid",
+            "missing_profile_match",
             dbg["client_reference_id"],
             dbg["customer"],
             dbg["customer_details_email"],
         )
-        return False
+        return StripeSyncResult(
+            handled=False,
+            did_update=False,
+            matched_profile_id=None,
+            matched_by="none",
+            updated_fields=[],
+            reason_code="missing_profile_match",
+        )
     obj = _as_dict(_as_dict(payload).get("object"))
-    logger.info(
-        "[stripe] invoice paid matched via %s profile_id=%s client_reference_id=%s",
-        resolver,
-        profile.id,
-        str(obj.get("client_reference_id") or "").strip(),
-    )
     customer = str(obj.get("customer") or "").strip()
     subscription = str(obj.get("subscription") or "").strip()
     lines = _as_dict(obj.get("lines"))
@@ -285,17 +398,42 @@ def sync_from_invoice_paid(payload: dict) -> bool:
     first_d = _as_dict(first)
     price = _as_dict(first_d.get("price"))
     price_id = str(price.get("id") or "").strip()
-    apply_subscription_payload_to_profile(
+    if not (customer or subscription or price_id):
+        return StripeSyncResult(
+            handled=False,
+            did_update=False,
+            matched_profile_id=profile.id,
+            matched_by=resolver,
+            updated_fields=[],
+            reason_code="empty_update_payload",
+        )
+    did_update, updated_fields = apply_subscription_payload_to_profile(
         profile,
         customer_id=customer,
         subscription_id=subscription,
         price_id=price_id,
         status="active",
     )
-    return True
+    if not did_update:
+        return StripeSyncResult(
+            handled=False,
+            did_update=False,
+            matched_profile_id=profile.id,
+            matched_by=resolver,
+            updated_fields=[],
+            reason_code="empty_update_payload",
+        )
+    return StripeSyncResult(
+        handled=True,
+        did_update=True,
+        matched_profile_id=profile.id,
+        matched_by=resolver,
+        updated_fields=updated_fields,
+        reason_code=None,
+    )
 
 
-def sync_from_subscription(payload: dict) -> bool:
+def sync_from_subscription(payload: dict, *, event_id: str = "") -> StripeSyncResult:
     obj = _as_dict(_as_dict(payload).get("object"))
     customer = str(obj.get("customer") or "").strip()
     subscription = str(obj.get("id") or "").strip()
@@ -319,18 +457,22 @@ def sync_from_subscription(payload: dict) -> bool:
     if profile is None:
         dbg = extract_match_debug_fields(payload)
         logger.error(
-            "[stripe] subscription event: no matching profile client_reference_id=%s customer=%s customer_details.email=%s",
+            "stripe.webhook.skipped event_id=%s event_type=%s reason_code=%s client_reference_id=%s customer=%s customer_details_email=%s",
+            event_id,
+            "customer.subscription.updated",
+            "missing_profile_match",
             dbg["client_reference_id"],
             dbg["customer"],
             dbg["customer_details_email"],
         )
-        return False
-    logger.info(
-        "[stripe] subscription event matched via %s profile_id=%s client_reference_id=%s",
-        resolver,
-        profile.id,
-        str(obj.get("client_reference_id") or "").strip(),
-    )
+        return StripeSyncResult(
+            handled=False,
+            did_update=False,
+            matched_profile_id=None,
+            matched_by="none",
+            updated_fields=[],
+            reason_code="missing_profile_match",
+        )
 
     status = str(obj.get("status") or "").strip()
     cancel_at_period_end = bool(obj.get("cancel_at_period_end"))
@@ -341,7 +483,16 @@ def sync_from_subscription(payload: dict) -> bool:
         first = items.get("data")[0]
     price = _as_dict(_as_dict(first).get("price"))
     price_id = str(price.get("id") or "").strip()
-    apply_subscription_payload_to_profile(
+    if not (customer or subscription or price_id or status):
+        return StripeSyncResult(
+            handled=False,
+            did_update=False,
+            matched_profile_id=profile.id,
+            matched_by=resolver,
+            updated_fields=[],
+            reason_code="empty_update_payload",
+        )
+    did_update, updated_fields = apply_subscription_payload_to_profile(
         profile,
         customer_id=customer,
         subscription_id=subscription,
@@ -350,4 +501,20 @@ def sync_from_subscription(payload: dict) -> bool:
         current_period_end_unix=int(current_period_end) if isinstance(current_period_end, int) else None,
         cancel_at_period_end=cancel_at_period_end,
     )
-    return True
+    if not did_update:
+        return StripeSyncResult(
+            handled=False,
+            did_update=False,
+            matched_profile_id=profile.id,
+            matched_by=resolver,
+            updated_fields=[],
+            reason_code="empty_update_payload",
+        )
+    return StripeSyncResult(
+        handled=True,
+        did_update=True,
+        matched_profile_id=profile.id,
+        matched_by=resolver,
+        updated_fields=updated_fields,
+        reason_code=None,
+    )
