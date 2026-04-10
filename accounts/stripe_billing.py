@@ -77,6 +77,44 @@ def _as_dict(x) -> dict:
     return n if isinstance(n, dict) else {}
 
 
+def _get_scalar(obj, key: str, default=""):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return default
+
+
+def _get_nested(obj, *path, default=None):
+    cur = obj
+    for segment in path:
+        if isinstance(segment, int):
+            if not isinstance(cur, list) or segment < 0 or segment >= len(cur):
+                return default
+            cur = cur[segment]
+            continue
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(segment)
+        if cur is None:
+            return default
+    return cur
+
+
+def _object_payload(payload) -> dict:
+    d = _as_dict(payload)
+    nested_obj = d.get("object")
+    if isinstance(nested_obj, dict):
+        return nested_obj
+    return d
+
+
+def _first_price_id_from_lines(obj: dict) -> str:
+    return str(_get_nested(obj, "lines", "data", 0, "price", "id", default="") or "").strip()
+
+
+def _first_price_id_from_items(obj: dict) -> str:
+    return str(_get_nested(obj, "items", "data", 0, "price", "id", default="") or "").strip()
+
+
 def normalize_stripe_payload(value):
     """
     Recursively normalize Stripe payload objects to plain Python dict/list/scalars.
@@ -98,13 +136,12 @@ def normalize_stripe_payload(value):
 
 
 def extract_match_debug_fields(payload) -> dict[str, str]:
-    d = _as_dict(payload)
-    obj = _as_dict(d.get("object"))
-    details = _as_dict(obj.get("customer_details"))
+    obj = _object_payload(payload)
+    details = _as_dict(_get_scalar(obj, "customer_details"))
     return {
-        "client_reference_id": str(obj.get("client_reference_id") or "").strip(),
-        "customer": str(obj.get("customer") or "").strip(),
-        "customer_details_email": str(details.get("email") or "").strip().lower(),
+        "client_reference_id": str(_get_scalar(obj, "client_reference_id") or "").strip(),
+        "customer": str(_get_scalar(obj, "customer") or "").strip(),
+        "customer_details_email": str(_get_scalar(details, "email") or "").strip().lower(),
     }
 
 
@@ -125,15 +162,16 @@ def extract_sync_debug_fields(
     matched_profile_id: int | None = None,
     did_update: bool | None = None,
 ) -> dict[str, str]:
-    d = _as_dict(payload)
-    obj = _as_dict(d.get("object"))
-    details = _as_dict(obj.get("customer_details"))
-    email = str(details.get("email") or obj.get("customer_email") or obj.get("receipt_email") or "").strip().lower()
+    obj = _object_payload(payload)
+    details = _as_dict(_get_scalar(obj, "customer_details"))
+    email = str(
+        _get_scalar(details, "email") or _get_scalar(obj, "customer_email") or _get_scalar(obj, "receipt_email") or ""
+    ).strip().lower()
     out = {
         "event_type": event_type,
-        "client_reference_id": str(obj.get("client_reference_id") or "").strip(),
-        "customer": str(obj.get("customer") or "").strip(),
-        "subscription": str(obj.get("subscription") or obj.get("id") or "").strip(),
+        "client_reference_id": str(_get_scalar(obj, "client_reference_id") or "").strip(),
+        "customer": str(_get_scalar(obj, "customer") or "").strip(),
+        "subscription": str(_get_scalar(obj, "subscription") or _get_scalar(obj, "id") or "").strip(),
         "email": email,
         "matched_profile_id": str(matched_profile_id or ""),
         "did_update": "true" if did_update else "false",
@@ -142,21 +180,18 @@ def extract_sync_debug_fields(
 
 
 def infer_sync_failure_reason(event_type: str, payload) -> str:
-    d = _as_dict(payload)
-    obj = _as_dict(d.get("object"))
-    details = _as_dict(obj.get("customer_details"))
-    customer = str(obj.get("customer") or "").strip()
-    subscription = str(obj.get("subscription") or obj.get("id") or "").strip()
-    client_ref = str(obj.get("client_reference_id") or "").strip()
-    email = str(details.get("email") or obj.get("customer_email") or obj.get("receipt_email") or "").strip().lower()
-    payment_link = str(obj.get("payment_link") or "").strip()
-    lines = _as_dict(obj.get("lines"))
-    line0 = lines.get("data")[0] if isinstance(lines.get("data"), list) and lines.get("data") else {}
-    price_id = str(_as_dict(_as_dict(line0).get("price")).get("id") or "").strip()
-    items = _as_dict(obj.get("items"))
-    item0 = items.get("data")[0] if isinstance(items.get("data"), list) and items.get("data") else {}
-    sub_price_id = str(_as_dict(_as_dict(item0).get("price")).get("id") or "").strip()
-    status = str(obj.get("status") or "").strip()
+    obj = _object_payload(payload)
+    details = _as_dict(_get_scalar(obj, "customer_details"))
+    customer = str(_get_scalar(obj, "customer") or "").strip()
+    subscription = str(_get_scalar(obj, "subscription") or _get_scalar(obj, "id") or "").strip()
+    client_ref = str(_get_scalar(obj, "client_reference_id") or "").strip()
+    email = str(
+        _get_scalar(details, "email") or _get_scalar(obj, "customer_email") or _get_scalar(obj, "receipt_email") or ""
+    ).strip().lower()
+    payment_link = str(_get_scalar(obj, "payment_link") or "").strip()
+    price_id = _first_price_id_from_lines(obj)
+    sub_price_id = _first_price_id_from_items(obj)
+    status = str(_get_scalar(obj, "status") or "").strip()
 
     if not (client_ref or customer or subscription or email):
         return "no_profile_identifiers"
@@ -200,9 +235,14 @@ def _unique_profile_by_email(email: str) -> BusinessProfile | None:
 
 
 def _resolve_profile_for_event(data: dict) -> tuple[BusinessProfile | None, str]:
-    d = _as_dict(data)
-    obj = _as_dict(d.get("object"))
-    customer_id = str(obj.get("customer") or "").strip()
+    obj = _object_payload(data)
+    client_ref = str(_get_scalar(obj, "client_reference_id") or "").strip()
+    if client_ref.isdigit():
+        p = BusinessProfile.objects.filter(id=int(client_ref)).first()
+        if p is not None:
+            return p, "client_reference_id"
+
+    customer_id = str(_get_scalar(obj, "customer") or "").strip()
     if customer_id:
         profile = (
             BusinessProfile.objects.filter(stripe_customer_id=customer_id)
@@ -224,16 +264,10 @@ def _resolve_profile_for_event(data: dict) -> tuple[BusinessProfile | None, str]
         except Exception:
             logger.exception("[stripe] failed retrieving customer %s for profile resolution", customer_id)
 
-    client_ref = str(obj.get("client_reference_id") or "").strip()
-    if client_ref.isdigit():
-        p = BusinessProfile.objects.filter(id=int(client_ref)).first()
-        if p is not None:
-            return p, "client_reference_id"
-
-    details = _as_dict(obj.get("customer_details"))
-    email = str(details.get("email") or "").strip().lower()
+    details = _as_dict(_get_scalar(obj, "customer_details"))
+    email = str(_get_scalar(details, "email") or "").strip().lower()
     if not email:
-        email = str(obj.get("customer_email") or obj.get("receipt_email") or "").strip().lower()
+        email = str(_get_scalar(obj, "customer_email") or _get_scalar(obj, "receipt_email") or "").strip().lower()
     if email:
         p = _unique_profile_by_email(email)
         if p is not None:
@@ -284,7 +318,7 @@ def apply_subscription_payload_to_profile(
 
 
 def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSyncResult:
-    payload = _as_dict(payload)
+    payload = normalize_stripe_payload(payload)
     profile, resolver = _resolve_profile_for_event(payload)
     if profile is None:
         dbg = extract_match_debug_fields(payload)
@@ -305,10 +339,10 @@ def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSy
             updated_fields=[],
             reason_code="missing_profile_match",
         )
-    obj = _as_dict(payload.get("object"))
-    client_ref = str(obj.get("client_reference_id") or "").strip()
-    details = _as_dict(obj.get("customer_details"))
-    checkout_email = str(details.get("email") or obj.get("customer_email") or "").strip().lower()
+    obj = _object_payload(payload)
+    client_ref = str(_get_scalar(obj, "client_reference_id") or "").strip()
+    details = _as_dict(_get_scalar(obj, "customer_details"))
+    checkout_email = str(_get_scalar(details, "email") or _get_scalar(obj, "customer_email") or "").strip().lower()
     if client_ref.isdigit():
         ref_profile = BusinessProfile.objects.filter(id=int(client_ref)).first()
         if ref_profile is not None and checkout_email and ref_profile.user.email:
@@ -325,9 +359,9 @@ def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSy
         profile.id,
         client_ref,
     )
-    subscription = str(obj.get("subscription") or "").strip()
-    customer = str(obj.get("customer") or "").strip()
-    payment_link = str(obj.get("payment_link") or "").strip()
+    subscription = str(_get_scalar(obj, "subscription") or "").strip()
+    customer = str(_get_scalar(obj, "customer") or "").strip()
+    payment_link = str(_get_scalar(obj, "payment_link") or "").strip()
     if not (customer or subscription or payment_link):
         return StripeSyncResult(
             handled=False,
@@ -337,9 +371,9 @@ def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSy
             updated_fields=[],
             reason_code="empty_update_payload",
         )
-    email = str(details.get("email") or "").strip()
+    email = str(_get_scalar(details, "email") or "").strip()
     if not email:
-        email = str(obj.get("customer_email") or "").strip()
+        email = str(_get_scalar(obj, "customer_email") or "").strip()
     if email and not profile.user.email:
         profile.user.email = email
         profile.user.save(update_fields=["email"])
@@ -369,7 +403,7 @@ def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSy
 
 
 def sync_from_invoice_paid(payload: dict, *, event_id: str = "") -> StripeSyncResult:
-    payload = _as_dict(payload)
+    payload = normalize_stripe_payload(payload)
     profile, resolver = _resolve_profile_for_event(payload)
     if profile is None:
         dbg = extract_match_debug_fields(payload)
@@ -390,16 +424,10 @@ def sync_from_invoice_paid(payload: dict, *, event_id: str = "") -> StripeSyncRe
             updated_fields=[],
             reason_code="missing_profile_match",
         )
-    obj = _as_dict(payload.get("object"))
-    customer = str(obj.get("customer") or "").strip()
-    subscription = str(obj.get("subscription") or "").strip()
-    lines = _as_dict(obj.get("lines"))
-    first = None
-    if isinstance(lines.get("data"), list) and lines.get("data"):
-        first = lines.get("data")[0]
-    first_d = _as_dict(first)
-    price = _as_dict(first_d.get("price"))
-    price_id = str(price.get("id") or "").strip()
+    obj = _object_payload(payload)
+    customer = str(_get_scalar(obj, "customer") or "").strip()
+    subscription = str(_get_scalar(obj, "subscription") or "").strip()
+    price_id = _first_price_id_from_lines(obj)
     if not (customer or subscription or price_id):
         return StripeSyncResult(
             handled=False,
@@ -436,10 +464,10 @@ def sync_from_invoice_paid(payload: dict, *, event_id: str = "") -> StripeSyncRe
 
 
 def sync_from_subscription(payload: dict, *, event_id: str = "") -> StripeSyncResult:
-    payload = _as_dict(payload)
-    obj = _as_dict(payload.get("object"))
-    customer = str(obj.get("customer") or "").strip()
-    subscription = str(obj.get("id") or "").strip()
+    payload = normalize_stripe_payload(payload)
+    obj = _object_payload(payload)
+    customer = str(_get_scalar(obj, "customer") or "").strip()
+    subscription = str(_get_scalar(obj, "id") or "").strip()
     profile = None
     if customer:
         profile = (
@@ -477,15 +505,10 @@ def sync_from_subscription(payload: dict, *, event_id: str = "") -> StripeSyncRe
             reason_code="missing_profile_match",
         )
 
-    status = str(obj.get("status") or "").strip()
-    cancel_at_period_end = bool(obj.get("cancel_at_period_end"))
-    current_period_end = obj.get("current_period_end")
-    items = _as_dict(obj.get("items"))
-    first = None
-    if isinstance(items.get("data"), list) and items.get("data"):
-        first = items.get("data")[0]
-    price = _as_dict(_as_dict(first).get("price"))
-    price_id = str(price.get("id") or "").strip()
+    status = str(_get_scalar(obj, "status") or "").strip()
+    cancel_at_period_end = bool(_get_scalar(obj, "cancel_at_period_end"))
+    current_period_end = _get_scalar(obj, "current_period_end", None)
+    price_id = _first_price_id_from_items(obj)
     if not (customer or subscription or price_id or status):
         return StripeSyncResult(
             handled=False,

@@ -71,6 +71,32 @@ from .stripe_billing import mask_email
 logger = logging.getLogger(__name__)
 _STRIPE_EVENT_SHAPE_LOGGED = False
 
+
+def _stripe_get_scalar(obj, key: str, default=""):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    try:
+        return getattr(obj, key, default)
+    except Exception:
+        return default
+
+
+def _stripe_get_nested(obj, *path, default=None):
+    cur = obj
+    for segment in path:
+        if isinstance(segment, int):
+            if not isinstance(cur, list) or segment < 0 or segment >= len(cur):
+                return default
+            cur = cur[segment]
+            continue
+        cur = _stripe_get_scalar(cur, segment, None)
+        if cur is None:
+            return default
+    return cur
+
+
 # Prompt coverage + pending checks: stored AEOResponseSnapshot.platform values we surface in the UI.
 _AEO_COVERAGE_PLATFORM_SET = frozenset({"openai", "gemini", "perplexity"})
 _AEO_PENDING_PLATFORM_ORDER = ("openai", "perplexity", "gemini")
@@ -191,27 +217,40 @@ def stripe_webhook(request: HttpRequest) -> Response:
             repr(event)[:500],
         )
 
-    # Normalize recursively to plain dict/list before dispatch.
-    # Stripe SDK supports recursive conversion on event objects.
-    if hasattr(event, "to_dict_recursive"):
-        try:
-            raw_event_dict = event.to_dict_recursive()
-        except Exception:
-            logger.exception(
-                "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s",
-                "parse_failed",
-                "",
-                "",
-            )
-            return Response({"error": "Could not parse Stripe event."}, status=400)
-    elif isinstance(event, dict):
-        raw_event_dict = event
-    else:
-        raw_event_dict = {}
-
     try:
-        event_id_raw = getattr(event, "id", None) or (event.get("id") if isinstance(event, dict) else None)
-        event_type_raw = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else None)
+        event_id = str(_stripe_get_scalar(event, "id", "") or "")
+        event_type = str(_stripe_get_scalar(event, "type", "") or "")
+        livemode = bool(_stripe_get_scalar(event, "livemode", False))
+        api_version = str(_stripe_get_scalar(event, "api_version", "") or "")
+        event_data = _stripe_get_scalar(event, "data", {})
+        raw_data_obj = _stripe_get_scalar(event_data, "object", {})
+        obj = normalize_stripe_payload(raw_data_obj)
+        if not isinstance(obj, dict):
+            obj = {
+                "id": _stripe_get_scalar(raw_data_obj, "id", ""),
+                "object": _stripe_get_scalar(raw_data_obj, "object", ""),
+                "client_reference_id": _stripe_get_scalar(raw_data_obj, "client_reference_id", ""),
+                "customer": _stripe_get_scalar(raw_data_obj, "customer", ""),
+                "subscription": _stripe_get_scalar(raw_data_obj, "subscription", ""),
+                "customer_details": normalize_stripe_payload(_stripe_get_scalar(raw_data_obj, "customer_details", {})),
+                "customer_email": _stripe_get_scalar(raw_data_obj, "customer_email", ""),
+                "receipt_email": _stripe_get_scalar(raw_data_obj, "receipt_email", ""),
+                "payment_link": _stripe_get_scalar(raw_data_obj, "payment_link", ""),
+                "invoice": _stripe_get_scalar(raw_data_obj, "invoice", ""),
+                "lines": normalize_stripe_payload(_stripe_get_scalar(raw_data_obj, "lines", {})),
+                "items": normalize_stripe_payload(_stripe_get_scalar(raw_data_obj, "items", {})),
+                "price": _stripe_get_scalar(raw_data_obj, "price", ""),
+                "status": _stripe_get_scalar(raw_data_obj, "status", ""),
+                "current_period_end": _stripe_get_scalar(raw_data_obj, "current_period_end", None),
+                "cancel_at_period_end": _stripe_get_scalar(raw_data_obj, "cancel_at_period_end", None),
+            }
+        event_dict = {
+            "id": event_id,
+            "type": event_type,
+            "livemode": livemode,
+            "api_version": api_version,
+            "data": {"object": obj},
+        }
     except Exception:
         logger.exception(
             "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s",
@@ -220,11 +259,6 @@ def stripe_webhook(request: HttpRequest) -> Response:
             "",
         )
         return Response({"error": "Could not parse Stripe event."}, status=400)
-    event_dict = normalize_stripe_payload(raw_event_dict)
-    if not isinstance(event_dict, dict):
-        event_dict = {}
-    event_id = str(event_id_raw or event_dict.get("id") or "")
-    event_type = str(event_type_raw or event_dict.get("type") or "")
     if not event_id or not event_type:
         logger.error(
             "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s top_level_keys=%s",
@@ -234,8 +268,6 @@ def stripe_webhook(request: HttpRequest) -> Response:
             ",".join(sorted(event_dict.keys())),
         )
         return Response({"error": "Stripe event missing required fields."}, status=400)
-    livemode = bool(event_dict.get("livemode"))
-    api_version = str(event_dict.get("api_version") or "")
     logger.info(
         "stripe.webhook.received event_id=%s event_type=%s livemode=%s api_version=%s request_path=%s has_signature_header=%s",
         event_id,
@@ -245,35 +277,32 @@ def stripe_webhook(request: HttpRequest) -> Response:
         request.path,
         bool(sig),
     )
-    data = event_dict.get("data")
-    if not isinstance(data, dict):
-        data = {}
-    obj = data.get("object") if isinstance(data.get("object"), dict) else {}
-    details = obj.get("customer_details") if isinstance(obj.get("customer_details"), dict) else {}
+    data = {"object": obj}
+    details = _stripe_get_scalar(obj, "customer_details", {})
+    details = details if isinstance(details, dict) else {}
     logger.info(
         "stripe.webhook.parsed event_id=%s event_type=%s livemode=%s object_id=%s object_type=%s client_reference_id=%s customer=%s subscription=%s customer_details_email=%s payment_link=%s invoice=%s top_level_keys=%s",
         event_id,
         event_type,
         livemode,
-        str(obj.get("id") or ""),
-        str(obj.get("object") or ""),
-        str(obj.get("client_reference_id") or ""),
-        str(obj.get("customer") or ""),
-        str(obj.get("subscription") or ""),
-        mask_email(str(details.get("email") or "")),
-        str(obj.get("payment_link") or ""),
-        str(obj.get("invoice") or ""),
+        str(_stripe_get_scalar(obj, "id") or ""),
+        str(_stripe_get_scalar(obj, "object") or ""),
+        str(_stripe_get_scalar(obj, "client_reference_id") or ""),
+        str(_stripe_get_scalar(obj, "customer") or ""),
+        str(_stripe_get_scalar(obj, "subscription") or ""),
+        mask_email(str(_stripe_get_scalar(details, "email") or "")),
+        str(_stripe_get_scalar(obj, "payment_link") or ""),
+        str(_stripe_get_scalar(obj, "invoice") or ""),
         ",".join(sorted(event_dict.keys())),
     )
     dbg_identity = extract_sync_debug_fields(data, event_type=event_type, did_update=False)
-    lines = obj.get("lines") if isinstance(obj.get("lines"), dict) else {}
-    line0 = lines.get("data")[0] if isinstance(lines.get("data"), list) and lines.get("data") else {}
-    line0_price = line0.get("price") if isinstance(line0, dict) and isinstance(line0.get("price"), dict) else {}
-    items = obj.get("items") if isinstance(obj.get("items"), dict) else {}
-    item0 = items.get("data")[0] if isinstance(items.get("data"), list) and items.get("data") else {}
-    item0_price = item0.get("price") if isinstance(item0, dict) and isinstance(item0.get("price"), dict) else {}
-    extracted_price_id = str(obj.get("price") or line0_price.get("id") or item0_price.get("id") or "")
-    extracted_status = str(obj.get("status") or "")
+    extracted_price_id = str(
+        _stripe_get_scalar(obj, "price")
+        or _stripe_get_nested(obj, "lines", "data", 0, "price", "id", default="")
+        or _stripe_get_nested(obj, "items", "data", 0, "price", "id", default="")
+        or ""
+    )
+    extracted_status = str(_stripe_get_scalar(obj, "status") or "")
     logger.info(
         "stripe.webhook.identity event_id=%s event_type=%s client_reference_id=%s customer_id=%s subscription_id=%s customer_details_email=%s payment_link_id=%s invoice_id=%s",
         event_id,
@@ -282,8 +311,8 @@ def stripe_webhook(request: HttpRequest) -> Response:
         dbg_identity["customer"],
         dbg_identity["subscription"],
         dbg_identity["email"],
-        str(obj.get("payment_link") or ""),
-        str(obj.get("id") or ""),
+        str(_stripe_get_scalar(obj, "payment_link") or ""),
+        str(_stripe_get_scalar(obj, "id") or ""),
     )
     handled = False
     result = None
