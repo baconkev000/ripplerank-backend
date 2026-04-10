@@ -6,6 +6,7 @@ from datetime import datetime
 from datetime import timezone
 from urllib.parse import urlparse
 
+import stripe
 from django.conf import settings
 
 from .models import BusinessProfile
@@ -102,6 +103,22 @@ def _resolve_profile_for_event(data: dict) -> BusinessProfile | None:
         )
         if profile is not None:
             return profile
+        # First-time webhook for a customer not yet linked in DB:
+        # fetch customer email from Stripe and resolve profile by email.
+        try:
+            customer = stripe.Customer.retrieve(customer_id)
+            customer_dict = _as_dict(customer)
+            customer_email = str(customer_dict.get("email") or "").strip().lower()
+            if customer_email:
+                profile_by_email = (
+                    BusinessProfile.objects.filter(user__email__iexact=customer_email)
+                    .order_by("-is_main", "-updated_at")
+                    .first()
+                )
+                if profile_by_email is not None:
+                    return profile_by_email
+        except Exception:
+            logger.exception("[stripe] failed retrieving customer %s for profile resolution", customer_id)
 
     client_ref = str(obj.get("client_reference_id") or "").strip()
     if client_ref.isdigit():
