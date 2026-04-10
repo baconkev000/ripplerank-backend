@@ -179,11 +179,31 @@ def stripe_webhook(request: HttpRequest) -> Response:
         return Response({"error": "Invalid signature."}, status=400)
 
     # Normalize recursively to plain dict/list before dispatch.
-    event_dict = normalize_stripe_payload(event)
+    # Stripe SDK supports recursive conversion on event objects.
+    try:
+        raw_event_dict = event.to_dict_recursive() if hasattr(event, "to_dict_recursive") else event
+    except Exception:
+        logger.exception(
+            "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s",
+            "parse_failed",
+            "",
+            "",
+        )
+        return Response({"error": "Could not parse Stripe event."}, status=400)
+    event_dict = normalize_stripe_payload(raw_event_dict)
     if not isinstance(event_dict, dict):
         event_dict = {}
     event_id = str(event_dict.get("id") or "")
     event_type = str(event_dict.get("type") or "")
+    if not event_id or not event_type:
+        logger.error(
+            "stripe.webhook.skipped reason_code=%s event_id=%s event_type=%s top_level_keys=%s",
+            "parse_failed",
+            event_id,
+            event_type,
+            ",".join(sorted(event_dict.keys())),
+        )
+        return Response({"error": "Stripe event missing required fields."}, status=400)
     livemode = bool(event_dict.get("livemode"))
     api_version = str(event_dict.get("api_version") or "")
     logger.info(
@@ -198,8 +218,24 @@ def stripe_webhook(request: HttpRequest) -> Response:
     data = event_dict.get("data")
     if not isinstance(data, dict):
         data = {}
-    dbg_identity = extract_sync_debug_fields(data, event_type=event_type, did_update=False)
     obj = data.get("object") if isinstance(data.get("object"), dict) else {}
+    details = obj.get("customer_details") if isinstance(obj.get("customer_details"), dict) else {}
+    logger.info(
+        "stripe.webhook.parsed event_id=%s event_type=%s livemode=%s object_id=%s object_type=%s client_reference_id=%s customer=%s subscription=%s customer_details_email=%s payment_link=%s invoice=%s top_level_keys=%s",
+        event_id,
+        event_type,
+        livemode,
+        str(obj.get("id") or ""),
+        str(obj.get("object") or ""),
+        str(obj.get("client_reference_id") or ""),
+        str(obj.get("customer") or ""),
+        str(obj.get("subscription") or ""),
+        mask_email(str(details.get("email") or "")),
+        str(obj.get("payment_link") or ""),
+        str(obj.get("invoice") or ""),
+        ",".join(sorted(event_dict.keys())),
+    )
+    dbg_identity = extract_sync_debug_fields(data, event_type=event_type, did_update=False)
     lines = obj.get("lines") if isinstance(obj.get("lines"), dict) else {}
     line0 = lines.get("data")[0] if isinstance(lines.get("data"), list) and lines.get("data") else {}
     line0_price = line0.get("price") if isinstance(line0, dict) and isinstance(line0.get("price"), dict) else {}

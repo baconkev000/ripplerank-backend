@@ -284,6 +284,7 @@ def apply_subscription_payload_to_profile(
 
 
 def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSyncResult:
+    payload = _as_dict(payload)
     profile, resolver = _resolve_profile_for_event(payload)
     if profile is None:
         dbg = extract_match_debug_fields(payload)
@@ -304,7 +305,7 @@ def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSy
             updated_fields=[],
             reason_code="missing_profile_match",
         )
-    obj = _as_dict(_as_dict(payload).get("object"))
+    obj = _as_dict(payload.get("object"))
     client_ref = str(obj.get("client_reference_id") or "").strip()
     details = _as_dict(obj.get("customer_details"))
     checkout_email = str(details.get("email") or obj.get("customer_email") or "").strip().lower()
@@ -368,6 +369,7 @@ def sync_from_checkout_session(payload: dict, *, event_id: str = "") -> StripeSy
 
 
 def sync_from_invoice_paid(payload: dict, *, event_id: str = "") -> StripeSyncResult:
+    payload = _as_dict(payload)
     profile, resolver = _resolve_profile_for_event(payload)
     if profile is None:
         dbg = extract_match_debug_fields(payload)
@@ -388,7 +390,7 @@ def sync_from_invoice_paid(payload: dict, *, event_id: str = "") -> StripeSyncRe
             updated_fields=[],
             reason_code="missing_profile_match",
         )
-    obj = _as_dict(_as_dict(payload).get("object"))
+    obj = _as_dict(payload.get("object"))
     customer = str(obj.get("customer") or "").strip()
     subscription = str(obj.get("subscription") or "").strip()
     lines = _as_dict(obj.get("lines"))
@@ -434,7 +436,8 @@ def sync_from_invoice_paid(payload: dict, *, event_id: str = "") -> StripeSyncRe
 
 
 def sync_from_subscription(payload: dict, *, event_id: str = "") -> StripeSyncResult:
-    obj = _as_dict(_as_dict(payload).get("object"))
+    payload = _as_dict(payload)
+    obj = _as_dict(payload.get("object"))
     customer = str(obj.get("customer") or "").strip()
     subscription = str(obj.get("id") or "").strip()
     profile = None
