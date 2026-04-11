@@ -241,6 +241,40 @@ class AEOPromptExecutionAggregateAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         return (obj.prompt_hash or "")[:12]
 
 
+class ThirdPartyApiRequestLogInline(admin.TabularInline):
+    model = ThirdPartyApiRequestLog
+    fk_name = "business_profile"
+    extra = 0
+    max_num = 30
+    can_delete = False
+    show_change_link = True
+    fields = ("created_at", "provider", "operation", "tokens_sent", "tokens_received", "cost_usd")
+    readonly_fields = fields
+    ordering = ("-created_at",)
+    verbose_name_plural = "Recent third-party API requests (this profile)"
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        return qs.order_by("-created_at")[:30]
+
+
+class ThirdPartyApiErrorLogInline(admin.TabularInline):
+    model = ThirdPartyApiErrorLog
+    fk_name = "business_profile"
+    extra = 0
+    max_num = 30
+    can_delete = False
+    show_change_link = True
+    fields = ("created_at", "provider", "operation", "error_kind", "http_status", "message")
+    readonly_fields = fields
+    ordering = ("-created_at",)
+    verbose_name_plural = "Recent third-party API errors (this profile)"
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        return qs.order_by("-created_at")[:30]
+
+
 @admin.register(BusinessProfile)
 class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = (
@@ -249,12 +283,98 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "business_name",
         "industry",
         "plan",
+        "aeo_prompt_expansion_status",
+        "aeo_expansion_progress_display",
+        "aeo_prompt_expansion_updated_at",
         "created_at",
         "updated_at",
     )
     search_fields = ("user__email", "user__username", "business_name", "industry")
-    list_filter = ("industry", "plan", "created_at")
+    list_filter = ("industry", "plan", "aeo_prompt_expansion_status", "created_at")
     filter_horizontal = ("tracked_competitors",)
+    inlines = (ThirdPartyApiRequestLogInline, ThirdPartyApiErrorLogInline)
+    readonly_fields = ("created_at", "updated_at")
+    fieldsets = (
+        (
+            None,
+            {
+                "fields": (
+                    "user",
+                    "is_main",
+                    "full_name",
+                    "business_name",
+                    "business_address",
+                    "industry",
+                    "phone",
+                    "description",
+                    "website_url",
+                ),
+            },
+        ),
+        (
+            "Billing",
+            {
+                "fields": (
+                    "plan",
+                    "stripe_customer_id",
+                    "stripe_subscription_id",
+                    "stripe_price_id",
+                    "stripe_subscription_status",
+                    "stripe_current_period_end",
+                    "stripe_cancel_at_period_end",
+                ),
+            },
+        ),
+        (
+            "SEO & competitors",
+            {
+                "fields": (
+                    "seo_competitor_domains_override",
+                    "tracked_competitors",
+                    "seo_location_mode",
+                    "seo_location_depth",
+                    "seo_location_code",
+                    "seo_location_label",
+                ),
+            },
+        ),
+        (
+            "AEO monitored prompts",
+            {
+                "fields": ("selected_aeo_prompts",),
+            },
+        ),
+        (
+            "AEO prompt expansion (plan-based monitored prompt growth)",
+            {
+                "description": (
+                    "Updated by the post-payment Celery task when Pro/Advanced adds prompts. "
+                    "last_error is set on partial runs or failures."
+                ),
+                "fields": (
+                    "aeo_prompt_expansion_status",
+                    "aeo_prompt_expansion_target",
+                    "aeo_prompt_expansion_progress",
+                    "aeo_prompt_expansion_last_error",
+                    "aeo_prompt_expansion_updated_at",
+                ),
+            },
+        ),
+        (
+            "Timestamps",
+            {"fields": ("created_at", "updated_at")},
+        ),
+    )
+
+    @admin.display(description="AEO expansion (count)")
+    def aeo_expansion_progress_display(self, obj: BusinessProfile) -> str:
+        if obj is None:
+            return "—"
+        t = obj.aeo_prompt_expansion_target
+        p = obj.aeo_prompt_expansion_progress
+        if t is not None:
+            return f"{p} / {t}"
+        return str(p)
 
 
 @admin.register(TrackedCompetitor)
