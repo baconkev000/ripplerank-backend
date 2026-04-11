@@ -5,8 +5,14 @@ Stripe → BusinessProfile billing sync.
 
 Payment link → plan mapping uses Django settings STRIPE_PAYMENT_LINK_* (see config.settings.base).
 Each value must be the Payment Link ID (e.g. plink_…) or the full buy URL (last path segment is used).
-They must match the live Stripe Payment Links used in checkout, or checkout.session.completed may not
-resolve a tier when the session omits price IDs.
+They must match the live Stripe Payment Links used in production checkout; if Render (or other) env
+vars omit or typo the live plink id, mapping fails until settings are corrected.
+
+Webhooks often send ``subscription`` as a string id (sub_…) without expanded ``items``/``price``.
+checkout.session.completed and invoice.paid may then have no price id in the payload. In that case
+we call Stripe ``Subscription.retrieve`` (with expand) using ``STRIPE_SECRET_KEY`` and map the
+subscription's price via ``STRIPE_PRICE_ID_*``. Retrieve errors are logged and ignored so the
+webhook still succeeds; payment-link mapping remains a fallback when price-based resolution fails.
 
 Cancellation policy: when Stripe reports a terminal subscription status (canceled, unpaid,
 incomplete_expired), we set BusinessProfile.plan to PLAN_NONE (empty string). Onboarding and paid
@@ -131,6 +137,44 @@ def _first_price_id_from_items(obj: dict) -> str:
     return str(_get_nested(obj, "items", "data", 0, "price", "id", default="") or "").strip()
 
 
+def _fetch_price_id_from_stripe_subscription(subscription_id: str) -> str:
+    """
+    Load the subscription's primary price id from the Stripe API when webhooks omit expanded items.
+
+    Safe for webhook retries: read-only. Failures are logged; returns "" so callers can fall back
+    (e.g. payment link mapping).
+    """
+    sid = (subscription_id or "").strip()
+    if not sid.startswith("sub_"):
+        return ""
+    if not getattr(settings, "STRIPE_SECRET_KEY", "").strip():
+        logger.warning(
+            "[stripe] skipping Subscription.retrieve (STRIPE_SECRET_KEY unset) subscription_id=%s",
+            sid,
+        )
+        return ""
+    try:
+        sub = stripe.Subscription.retrieve(sid, expand=["items.data.price"])
+    except Exception:
+        logger.warning(
+            "[stripe] Subscription.retrieve failed for plan/price resolution subscription_id=%s",
+            sid,
+            exc_info=True,
+        )
+        return ""
+    sub_d = normalize_stripe_payload(sub)
+    if not isinstance(sub_d, dict):
+        return ""
+    pid = _first_price_id_from_items(sub_d)
+    if pid:
+        logger.info(
+            "[stripe] resolved price id from Subscription.retrieve subscription_id=%s price_id=%s",
+            sid,
+            pid,
+        )
+    return pid
+
+
 def _subscription_id_and_dict(sub_raw) -> tuple[str, dict | None]:
     if isinstance(sub_raw, dict):
         return str(sub_raw.get("id") or "").strip(), sub_raw
@@ -215,7 +259,10 @@ def extract_sync_debug_fields(
         _get_scalar(details, "email") or _get_scalar(obj, "customer_email") or _get_scalar(obj, "receipt_email") or ""
     ).strip().lower()
     sub_dbg, _ = _subscription_id_and_dict(_get_scalar(obj, "subscription"))
-    sub_dbg = sub_dbg or str(_get_scalar(obj, "id") or "").strip()
+    if not sub_dbg and event_type in {"customer.subscription.updated", "customer.subscription.deleted"}:
+        oid = str(_get_scalar(obj, "id") or "").strip()
+        if oid.startswith("sub_"):
+            sub_dbg = oid
     out = {
         "event_type": event_type,
         "client_reference_id": str(_get_scalar(obj, "client_reference_id") or "").strip(),
@@ -234,7 +281,11 @@ def infer_sync_failure_reason(event_type: str, payload) -> str:
     customer = str(_get_scalar(obj, "customer") or "").strip()
     sub_raw = _get_scalar(obj, "subscription")
     sub_id, sub_dict_inf = _subscription_id_and_dict(sub_raw)
-    subscription = sub_id or str(_get_scalar(obj, "id") or "").strip()
+    subscription = sub_id
+    if not subscription and event_type in {"customer.subscription.updated", "customer.subscription.deleted"}:
+        oid = str(_get_scalar(obj, "id") or "").strip()
+        if oid.startswith("sub_"):
+            subscription = oid
     client_ref = str(_get_scalar(obj, "client_reference_id") or "").strip()
     email = str(
         _get_scalar(details, "email") or _get_scalar(obj, "customer_email") or _get_scalar(obj, "receipt_email") or ""
@@ -343,6 +394,8 @@ def apply_subscription_payload_to_profile(
     effective_price = (price_id or "").strip()
     if not effective_price and subscription_dict:
         effective_price = _first_price_id_from_items(subscription_dict)
+    if not effective_price and (subscription_id or "").strip():
+        effective_price = _fetch_price_id_from_stripe_subscription(subscription_id)
 
     updates: dict[str, object] = {}
     if customer_id:
@@ -360,10 +413,25 @@ def apply_subscription_payload_to_profile(
 
     st_norm = (status or "").strip().lower()
     resolved_slug = _plan_from_price(effective_price)
-    if not resolved_slug and payment_link_id:
-        m = plan_mapping_by_payment_link_id().get(_normalize_link_id(payment_link_id))
+    plink_norm = _normalize_link_id(payment_link_id) if payment_link_id else ""
+    if not resolved_slug and plink_norm:
+        pmap = plan_mapping_by_payment_link_id()
+        m = pmap.get(plink_norm)
         if m:
             resolved_slug = m.plan_slug
+            logger.info(
+                "[stripe] resolved plan from payment_link profile_id=%s normalized=%s plan=%s",
+                profile.id,
+                plink_norm,
+                resolved_slug,
+            )
+        else:
+            logger.debug(
+                "[stripe] payment_link not in STRIPE_PAYMENT_LINK_* map profile_id=%s normalized=%s map_size=%s",
+                profile.id,
+                plink_norm,
+                len(pmap),
+            )
 
     if st_norm in TERMINAL_PLAN_CLEAR_STATUSES:
         updates["plan"] = BusinessProfile.PLAN_NONE
@@ -379,13 +447,19 @@ def apply_subscription_payload_to_profile(
         BusinessProfile.PLAN_PRO,
         BusinessProfile.PLAN_ADVANCED,
     }:
+        pmap = plan_mapping_by_payment_link_id()
         logger.warning(
             "[stripe] could not resolve plan slug from Stripe payload profile_id=%s status=%s "
-            "effective_price_id=%s payment_link_id=%s (check STRIPE_PRICE_ID_* and STRIPE_PAYMENT_LINK_* settings)",
+            "effective_price_id=%s payment_link_raw=%s payment_link_normalized=%s "
+            "payment_link_map_size=%s payment_link_key_hit=%s "
+            "(check STRIPE_PRICE_ID_* and STRIPE_PAYMENT_LINK_* settings; subscription retrieve may have failed)",
             profile.id,
             st_norm or "(empty)",
             effective_price or "(empty)",
             payment_link_id or "(empty)",
+            plink_norm or "(empty)",
+            len(pmap),
+            bool(plink_norm and plink_norm in pmap),
         )
 
     if not updates:

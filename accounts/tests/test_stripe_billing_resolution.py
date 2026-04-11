@@ -14,6 +14,16 @@ from accounts.stripe_billing import sync_from_subscription
 User = get_user_model()
 
 
+@pytest.fixture(autouse=True)
+def _stub_stripe_subscription_retrieve_empty(monkeypatch):
+    """Avoid real Stripe HTTP when webhooks pass subscription id without expanded items."""
+
+    def _retrieve(_sid, expand=None):
+        return {}
+
+    monkeypatch.setattr("accounts.stripe_billing.stripe.Subscription.retrieve", _retrieve)
+
+
 @pytest.mark.django_db
 def test_resolver_prefers_client_reference_id_when_present():
     user = User.objects.create_user(username="idmatch@example.com", email="idmatch@example.com", password="x")
@@ -327,4 +337,75 @@ def test_invoice_paid_empty_update_payload_returns_reason():
     assert result.did_update is False
     assert result.matched_profile_id == profile.id
     assert result.reason_code == "empty_update_payload"
+
+
+@pytest.mark.django_db
+def test_checkout_session_resolves_plan_via_subscription_retrieve_when_price_omitted(monkeypatch, settings):
+    settings.STRIPE_PRICE_ID_ADVANCED_MONTHLY = "price_from_api"
+
+    def _retrieve(sid, expand=None):
+        assert sid == "sub_checkout_scalar"
+        assert expand == ["items.data.price"]
+        return {"id": sid, "items": {"data": [{"price": {"id": "price_from_api"}}]}}
+
+    monkeypatch.setattr("accounts.stripe_billing.stripe.Subscription.retrieve", _retrieve)
+    user = User.objects.create_user(username="coapi@example.com", email="coapi@example.com", password="x")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="CoApi")
+    payload = {
+        "object": {
+            "client_reference_id": str(profile.id),
+            "customer": "cus_coapi",
+            "subscription": "sub_checkout_scalar",
+            "payment_link": "plink_unknown_not_in_env",
+        }
+    }
+    result = sync_from_checkout_session(payload, event_id="evt_coapi")
+    assert result.handled is True
+    profile.refresh_from_db()
+    assert profile.stripe_price_id == "price_from_api"
+    assert profile.plan == BusinessProfile.PLAN_ADVANCED
+
+
+@pytest.mark.django_db
+def test_invoice_paid_resolves_plan_via_subscription_retrieve_when_lines_empty(monkeypatch, settings):
+    settings.STRIPE_PRICE_ID_PRO_MONTHLY = "price_inv_api"
+
+    def _retrieve(sid, expand=None):
+        assert sid == "sub_inv_api"
+        return {"id": sid, "items": {"data": [{"price": {"id": "price_inv_api"}}]}}
+
+    monkeypatch.setattr("accounts.stripe_billing.stripe.Subscription.retrieve", _retrieve)
+    user = User.objects.create_user(username="invapi@example.com", email="invapi@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="InvApi",
+        stripe_customer_id="cus_inv_api",
+    )
+    payload = {
+        "object": {
+            "customer": "cus_inv_api",
+            "subscription": "sub_inv_api",
+            "customer_details": {"email": "invapi@example.com"},
+        }
+    }
+    result = sync_from_invoice_paid(payload, event_id="evt_inv_api")
+    assert result.handled is True
+    profile.refresh_from_db()
+    assert profile.stripe_price_id == "price_inv_api"
+    assert profile.plan == BusinessProfile.PLAN_PRO
+
+
+def test_infer_sync_failure_reason_invoice_does_not_use_invoice_id_as_subscription():
+    """Without subscription/customer/price, invoice id must not satisfy the subscription slot."""
+    from accounts.stripe_billing import infer_sync_failure_reason
+
+    payload = {
+        "object": {
+            "id": "in_123",
+            "customer": "",
+            "customer_details": {"email": "a@example.com"},
+        }
+    }
+    assert infer_sync_failure_reason("invoice.paid", payload) == "no_stripe_ids_or_price"
 

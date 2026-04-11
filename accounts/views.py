@@ -304,7 +304,7 @@ def stripe_webhook(request: HttpRequest) -> Response:
     )
     extracted_status = str(_stripe_get_scalar(obj, "status") or "")
     logger.info(
-        "stripe.webhook.identity event_id=%s event_type=%s client_reference_id=%s customer_id=%s subscription_id=%s customer_details_email=%s payment_link_id=%s invoice_id=%s",
+        "stripe.webhook.identity event_id=%s event_type=%s client_reference_id=%s customer_id=%s subscription_id=%s customer_details_email=%s payment_link_id=%s stripe_object_id=%s invoice_ref=%s",
         event_id,
         event_type,
         dbg_identity["client_reference_id"],
@@ -313,6 +313,7 @@ def stripe_webhook(request: HttpRequest) -> Response:
         dbg_identity["email"],
         str(_stripe_get_scalar(obj, "payment_link") or ""),
         str(_stripe_get_scalar(obj, "id") or ""),
+        str(_stripe_get_scalar(obj, "invoice") or ""),
     )
     handled = False
     result = None
