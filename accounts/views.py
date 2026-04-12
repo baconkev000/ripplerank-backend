@@ -1936,6 +1936,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
     )
     visibility_pending = _aeo_profile_visibility_pending(profile)
     prompt_fill_target = aeo_effective_monitored_target_for_profile(profile)
+    recommendations_pending = _aeo_recommendations_pipeline_pending(profile)
 
     return {
         "prompts": prompts,
@@ -1945,6 +1946,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         "prompt_scan_total": prompt_scan_total,
         "prompt_scan_completed": prompt_scan_completed,
         "visibility_pending": visibility_pending,
+        "recommendations_pending": recommendations_pending,
         "prompt_fill_completed": selected_prompt_count,
         "prompt_fill_target": prompt_fill_target,
         "aeo_prompt_expansion_status": getattr(profile, "aeo_prompt_expansion_status", "") or "",
@@ -2021,6 +2023,29 @@ def _aeo_profile_visibility_pending(profile: BusinessProfile) -> bool:
     return False
 
 
+def _aeo_recommendations_pipeline_pending(profile: BusinessProfile) -> bool:
+    """
+    True while the latest execution run has finished scoring but Phase 5 has not persisted yet.
+
+    Lets the dashboard keep polling prompt-coverage so Actions picks up ``recommendation_strategies``
+    after expansion/backfill (visibility can be false while recommendations are still running).
+    """
+    if not bool(getattr(settings, "AEO_ENABLE_RECOMMENDATION_STAGE", False)):
+        return False
+    from .models import AEOExecutionRun
+
+    latest_ex = (
+        AEOExecutionRun.objects.filter(profile=profile).order_by("-created_at", "-id").first()
+    )
+    if latest_ex is None:
+        return False
+    return (
+        latest_ex.scoring_status == AEOExecutionRun.STAGE_COMPLETED
+        and latest_ex.recommendation_status
+        in (AEOExecutionRun.STAGE_PENDING, AEOExecutionRun.STAGE_RUNNING)
+    )
+
+
 @csrf_exempt
 @api_view(["GET"])
 @authentication_classes([CsrfExemptSessionAuthentication])
@@ -2043,6 +2068,7 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
                 "prompt_scan_total": 0,
                 "prompt_scan_completed": 0,
                 "visibility_pending": False,
+                "recommendations_pending": False,
                 "prompt_fill_completed": 0,
                 "prompt_fill_target": aeo_fallback_global_target_count(),
                 "aeo_prompt_expansion_status": "",

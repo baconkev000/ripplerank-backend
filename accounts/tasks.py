@@ -77,6 +77,28 @@ def _enqueue_seo_after_aeo(run_id: int) -> None:
     trigger_seo_warmup_after_aeo_task.delay(run_id)
 
 
+def _chain_post_phase3_extraction(run) -> None:
+    """
+    After Phase 3 extractions for Phase 1 snapshots:
+
+    - Starter-scale profiles: go straight to Phase 4 (Phase 2 is already queued from Phase 1).
+    - Pro/Advanced: run Phase 2 multi-pass (OpenAI/Gemini confidence) first; Phase 2 ends with Phase 4.
+
+    Expansion/backfill runs use the same path: Phase 1 → Phase 3 → Phase 2 (with ``prompt_set`` from
+    this run's aggregates via ``phase2_prompt_plan_items_for_execution_run``) → Phase 4 → Phase 5.
+
+    Ordering avoids scoring/recommendations on aggregates that still need a second provider pass.
+    """
+    from .aeo.aeo_utils import phase2_prompt_plan_items_for_execution_run
+
+    refresh_competitor_snapshot_for_profile_task.delay(run.profile_id)
+    if _is_onboarding_sample_size_profile(run.profile):
+        run_aeo_phase4_scoring_task.delay(run.id)
+    else:
+        payload = phase2_prompt_plan_items_for_execution_run(run)
+        run_aeo_phase2_confidence_task.delay(run.id, payload if payload else None)
+
+
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
     """
@@ -981,22 +1003,31 @@ def run_aeo_phase2_confidence_task(self, run_id: int, prompt_set: list[dict] | N
             spec = saved_by_hash.get(agg.prompt_hash)
             if not spec:
                 continue
-            if int(agg.openai_pass_count or 0) < PASSES_PER_PROVIDER_TARGET:
-                _push("openai", spec, 0)
+            o_count = int(agg.openai_pass_count or 0)
+            g_count = int(agg.gemini_pass_count or 0)
+            # Single-provider refresh runs (e.g. Gemini-only) should not spawn the other provider here.
+            gemini_only_aggregate = o_count == 0 and g_count > 0
+            openai_only_aggregate = g_count == 0 and o_count > 0
+            if o_count < PASSES_PER_PROVIDER_TARGET:
+                if not gemini_only_aggregate:
+                    _push("openai", spec, 0)
             elif (
                 bool(agg.openai_third_pass_required)
                 and not bool(agg.openai_third_pass_ran)
-                and int(agg.openai_pass_count or 0) < 3
+                and o_count < 3
             ):
-                _push("openai", spec, 1)
-            if int(agg.gemini_pass_count or 0) < PASSES_PER_PROVIDER_TARGET:
-                _push("gemini", spec, 0)
+                if not gemini_only_aggregate:
+                    _push("openai", spec, 1)
+            if g_count < PASSES_PER_PROVIDER_TARGET:
+                if not openai_only_aggregate:
+                    _push("gemini", spec, 0)
             elif (
                 bool(agg.gemini_third_pass_required)
                 and not bool(agg.gemini_third_pass_ran)
-                and int(agg.gemini_pass_count or 0) < 3
+                and g_count < 3
             ):
-                _push("gemini", spec, 1)
+                if not openai_only_aggregate:
+                    _push("gemini", spec, 1)
 
         for provider in ("openai", "gemini"):
             provider_batches[provider].sort(
@@ -1184,7 +1215,7 @@ def run_aeo_phase3_extraction_task(
         logger.warning("[AEO phase3] run not found run_id=%s", run_id)
         return
     if run.extraction_status == AEOExecutionRun.STAGE_COMPLETED:
-        run_aeo_phase4_scoring_task.delay(run.id)
+        _chain_post_phase3_extraction(run)
         return
 
     run.extraction_status = AEOExecutionRun.STAGE_RUNNING
@@ -1240,8 +1271,7 @@ def run_aeo_phase3_extraction_task(
             created_count,
             failed_count,
         )
-        refresh_competitor_snapshot_for_profile_task.delay(run.profile_id)
-        run_aeo_phase4_scoring_task.delay(run.id)
+        _chain_post_phase3_extraction(run)
     except Exception as exc:
         run.extraction_status = AEOExecutionRun.STAGE_FAILED
         run.error_message = f"{run.error_message}\nphase3:{type(exc).__name__}: {exc}".strip()
@@ -1348,6 +1378,13 @@ def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
 
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def run_aeo_phase5_recommendation_task(self, run_id: int) -> None:
+    """
+    Each invocation creates a new ``AEORecommendationRun`` when it completes.
+
+    Follow-up runs after expansion/backfill must not short-circuit on a prior
+    ``recommendation_status=completed``; ``GET /api/aeo/prompt-coverage/`` uses the latest run by
+    ``created_at``/``id``.
+    """
     from .models import AEOExecutionRun
     from .aeo.aeo_recommendation_utils import generate_aeo_recommendations
 
@@ -1365,8 +1402,6 @@ def run_aeo_phase5_recommendation_task(self, run_id: int) -> None:
             run.status,
         )
         _enqueue_seo_after_aeo(run.id)
-        return
-    if run.recommendation_status == AEOExecutionRun.STAGE_COMPLETED and run.recommendation_run_id:
         return
 
     run.recommendation_status = AEOExecutionRun.STAGE_RUNNING

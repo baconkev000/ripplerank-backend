@@ -1,4 +1,5 @@
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
+
 import pytest
 from django.contrib.auth import get_user_model
 from django.utils import timezone
@@ -9,6 +10,7 @@ from accounts.models import (
     AEOExtractionSnapshot,
     AEOPromptExecutionAggregate,
     AEOResponseSnapshot,
+    AEORecommendationRun,
     AEOScoreSnapshot,
     BusinessProfile,
 )
@@ -17,6 +19,7 @@ from accounts.tasks import (
     run_aeo_phase1_execution_task,
     run_aeo_phase3_extraction_task,
     run_aeo_phase4_scoring_task,
+    run_aeo_phase5_recommendation_task,
     trigger_seo_warmup_after_aeo_task,
 )
 
@@ -24,10 +27,49 @@ from accounts.tasks import (
 User = get_user_model()
 
 
+class _ImmediateThreadPoolExecutor:
+    """Runs work inline so pytest monkeypatches on ``run_single_extraction`` apply (worker threads can miss them)."""
+
+    def __init__(self, max_workers: int = 1) -> None:
+        self._max_workers = max_workers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def submit(self, fn, *args, **kwargs):
+        fut: Future = Future()
+        try:
+            fut.set_result(fn(*args, **kwargs))
+        except Exception as exc:
+            fut.set_exception(exc)
+        return fut
+
+
+@pytest.fixture(autouse=True)
+def _stub_aeo_celery_delays(monkeypatch):
+    """Tests run without Redis/broker; individual tests override .delay when asserting enqueue order."""
+    noop = lambda *args, **kwargs: None
+    monkeypatch.setattr("accounts.tasks.refresh_competitor_snapshot_for_profile_task.delay", noop)
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase2_confidence_task.delay", noop)
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase3_extraction_task.delay", noop)
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", noop)
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase5_recommendation_task.delay", noop)
+    monkeypatch.setattr("accounts.tasks.trigger_seo_warmup_after_aeo_task.delay", noop)
+
+
 @pytest.mark.django_db
-def test_phase1_completion_enqueues_extraction_on_partial_failures(monkeypatch):
+def test_phase1_completion_enqueues_extraction_on_partial_failures(monkeypatch, settings):
+    settings.AEO_TESTING_MODE = False
     user = User.objects.create_user(username="p1", email="p1@example.com", password="pw")
-    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Biz",
+        plan=BusinessProfile.PLAN_ADVANCED,
+    )
     run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_PENDING)
 
     snap = AEOResponseSnapshot.objects.create(
@@ -166,6 +208,8 @@ def test_phase3_creates_extraction_rows_and_enqueues_scoring(monkeypatch):
         return {"extraction_snapshot_id": row.id, "save_error": None}
 
     monkeypatch.setattr("accounts.aeo.aeo_extraction_utils.run_single_extraction", fake_single_extraction)
+    monkeypatch.setattr("django.db.close_old_connections", lambda: None)
+    monkeypatch.setattr("accounts.tasks.ThreadPoolExecutor", _ImmediateThreadPoolExecutor)
     queued = []
     monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", lambda run_id: queued.append(run_id))
 
@@ -189,13 +233,15 @@ def test_phase3_thread_pool_uses_aeo_execution_max_workers(monkeypatch, settings
     )
     r1 = AEOResponseSnapshot.objects.create(profile=profile, prompt_text="a", prompt_hash="ha", raw_response="ra")
 
-    original_init = ThreadPoolExecutor.__init__
+    seen_workers: list[int] = []
 
-    def tracked_init(self, *args, **kwargs):
-        assert kwargs.get("max_workers") == aeo_execution_max_workers()
-        return original_init(self, *args, **kwargs)
+    class _RecordingImmediatePool(_ImmediateThreadPoolExecutor):
+        def __init__(self, max_workers: int = 1) -> None:
+            seen_workers.append(int(max_workers))
+            super().__init__(max_workers=max_workers)
 
-    monkeypatch.setattr(ThreadPoolExecutor, "__init__", tracked_init)
+    monkeypatch.setattr("django.db.close_old_connections", lambda: None)
+    monkeypatch.setattr("accounts.tasks.ThreadPoolExecutor", _RecordingImmediatePool)
 
     def fake_single_extraction(snapshot, save=True, competitor_hints=None):
         row = AEOExtractionSnapshot.objects.create(
@@ -216,6 +262,7 @@ def test_phase3_thread_pool_uses_aeo_execution_max_workers(monkeypatch, settings
     monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", lambda _rid: None)
 
     run_aeo_phase3_extraction_task(run.id, [r1.id])
+    assert seen_workers == [aeo_execution_max_workers()]
 
 
 @pytest.mark.django_db
@@ -262,6 +309,8 @@ def test_phase3_skips_idempotent_snapshots_but_extracts_others(monkeypatch):
         return {"extraction_snapshot_id": row.id, "save_error": None}
 
     monkeypatch.setattr("accounts.aeo.aeo_extraction_utils.run_single_extraction", fake_single_extraction)
+    monkeypatch.setattr("django.db.close_old_connections", lambda: None)
+    monkeypatch.setattr("accounts.tasks.ThreadPoolExecutor", _ImmediateThreadPoolExecutor)
     monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", lambda _rid: None)
 
     run_aeo_phase3_extraction_task(run.id, [r1.id, r2.id])
@@ -273,8 +322,14 @@ def test_phase3_skips_idempotent_snapshots_but_extracts_others(monkeypatch):
 @pytest.mark.django_db
 def test_phase4_creates_score_snapshot_with_expected_fields(monkeypatch, settings):
     settings.AEO_ENABLE_RECOMMENDATION_STAGE = False
+    settings.AEO_TESTING_MODE = False
     user = User.objects.create_user(username="p4", email="p4@example.com", password="pw")
-    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Biz",
+        plan=BusinessProfile.PLAN_ADVANCED,
+    )
     run = AEOExecutionRun.objects.create(
         profile=profile,
         status=AEOExecutionRun.STATUS_COMPLETED,
@@ -433,3 +488,130 @@ def test_seo_trigger_task_is_idempotent_on_replay(monkeypatch):
     run.refresh_from_db()
     assert calls["count"] == 1
     assert run.seo_trigger_status == "success"
+
+
+@pytest.mark.django_db
+def test_phase3_advanced_enqueues_phase2_not_direct_phase4(settings, monkeypatch):
+    settings.AEO_TESTING_MODE = False
+    user = User.objects.create_user(username="p3adv", email="p3adv@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Biz",
+        plan=BusinessProfile.PLAN_ADVANCED,
+    )
+    run = AEOExecutionRun.objects.create(
+        profile=profile,
+        status=AEOExecutionRun.STATUS_COMPLETED,
+        started_at=timezone.now(),
+    )
+    AEOPromptExecutionAggregate.objects.create(
+        profile=profile,
+        execution_run=run,
+        prompt_hash="ha",
+        prompt_text="topic a",
+        openai_pass_count=1,
+        gemini_pass_count=1,
+    )
+    r1 = AEOResponseSnapshot.objects.create(profile=profile, prompt_text="a", prompt_hash="ha", raw_response="ra")
+
+    def fake_single_extraction(snapshot, save=True, competitor_hints=None):
+        row = AEOExtractionSnapshot.objects.create(
+            response_snapshot=snapshot,
+            brand_mentioned=True,
+            mention_position="top",
+            mention_count=1,
+            competitors_json=[],
+            citations_json=["example.com"],
+            sentiment="positive",
+            confidence_score=0.9,
+            extraction_model="fake",
+            extraction_parse_failed=False,
+        )
+        return {"extraction_snapshot_id": row.id, "save_error": None}
+
+    monkeypatch.setattr("accounts.aeo.aeo_extraction_utils.run_single_extraction", fake_single_extraction)
+    monkeypatch.setattr("django.db.close_old_connections", lambda: None)
+    monkeypatch.setattr("accounts.tasks.ThreadPoolExecutor", _ImmediateThreadPoolExecutor)
+    phase2_calls: list[tuple] = []
+    phase4_calls: list[int] = []
+    monkeypatch.setattr("accounts.tasks.refresh_competitor_snapshot_for_profile_task.delay", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "accounts.tasks.run_aeo_phase2_confidence_task.delay",
+        lambda *args, **kwargs: phase2_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", lambda rid: phase4_calls.append(rid))
+
+    run_aeo_phase3_extraction_task(run.id, [r1.id])
+    assert len(phase2_calls) == 1
+    assert phase2_calls[0][0][0] == run.id
+    assert phase4_calls == []
+
+
+@pytest.mark.django_db
+def test_phase3_starter_enqueues_phase4_not_phase2(settings, monkeypatch):
+    settings.AEO_TESTING_MODE = False
+    user = User.objects.create_user(username="p3st", email="p3st@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    run = AEOExecutionRun.objects.create(
+        profile=profile,
+        status=AEOExecutionRun.STATUS_COMPLETED,
+        started_at=timezone.now(),
+    )
+    r1 = AEOResponseSnapshot.objects.create(profile=profile, prompt_text="a", prompt_hash="ha", raw_response="ra")
+
+    def fake_single_extraction(snapshot, save=True, competitor_hints=None):
+        row = AEOExtractionSnapshot.objects.create(
+            response_snapshot=snapshot,
+            brand_mentioned=True,
+            mention_position="top",
+            mention_count=1,
+            competitors_json=[],
+            citations_json=["example.com"],
+            sentiment="positive",
+            confidence_score=0.9,
+            extraction_model="fake",
+            extraction_parse_failed=False,
+        )
+        return {"extraction_snapshot_id": row.id, "save_error": None}
+
+    monkeypatch.setattr("accounts.aeo.aeo_extraction_utils.run_single_extraction", fake_single_extraction)
+    monkeypatch.setattr("django.db.close_old_connections", lambda: None)
+    monkeypatch.setattr("accounts.tasks.ThreadPoolExecutor", _ImmediateThreadPoolExecutor)
+    phase2_calls: list[tuple] = []
+    phase4_calls: list[int] = []
+    monkeypatch.setattr("accounts.tasks.refresh_competitor_snapshot_for_profile_task.delay", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "accounts.tasks.run_aeo_phase2_confidence_task.delay",
+        lambda *args, **kwargs: phase2_calls.append(1),
+    )
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", lambda rid: phase4_calls.append(rid))
+
+    run_aeo_phase3_extraction_task(run.id, [r1.id])
+    assert phase2_calls == []
+    assert phase4_calls == [run.id]
+
+
+@pytest.mark.django_db
+def test_phase5_reinvocation_calls_generate_twice(settings, monkeypatch):
+    settings.AEO_ENABLE_RECOMMENDATION_STAGE = True
+    user = User.objects.create_user(username="p5r", email="p5r@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_COMPLETED)
+    calls: list[int] = []
+
+    def fake_gen(profile, save=True, **_kwargs):
+        calls.append(1)
+        row = AEORecommendationRun.objects.create(
+            profile=profile,
+            recommendations_json=[{"rec_id": "x"}],
+            strategies_json=[],
+        )
+        return {"recommendation_run_id": row.id, "recommendations": [{"rec_id": "x"}]}
+
+    monkeypatch.setattr("accounts.aeo.aeo_recommendation_utils.generate_aeo_recommendations", fake_gen)
+    monkeypatch.setattr("accounts.tasks._enqueue_seo_after_aeo", lambda _rid: None)
+
+    run_aeo_phase5_recommendation_task(run.id)
+    run_aeo_phase5_recommendation_task(run.id)
+    assert len(calls) == 2

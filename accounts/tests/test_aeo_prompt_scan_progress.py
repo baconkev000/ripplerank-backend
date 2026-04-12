@@ -90,7 +90,38 @@ def test_prompt_coverage_api_includes_scan_fields():
     assert data["prompt_scan_completed"] == 0
     # Only OpenAI has a snapshot and it already has an extraction — no in-flight work.
     assert data["visibility_pending"] is False
+    assert data.get("recommendations_pending") is False
     assert data["prompt_fill_completed"] == 1
     assert data["prompt_fill_target"] == 10
     assert "aeo_prompt_expansion_status" in data
     assert "aeo_prompt_expansion_last_error" in data
+
+
+@pytest.mark.django_db
+def test_prompt_coverage_recommendations_pending_when_phase5_in_flight(settings):
+    pytest.importorskip("stripe")
+    from django.contrib.auth import get_user_model
+    from rest_framework.test import APIClient
+
+    from accounts.models import AEOExecutionRun, BusinessProfile
+
+    settings.AEO_ENABLE_RECOMMENDATION_STAGE = True
+    User = get_user_model()
+    user = User.objects.create_user(username="reco_pend", email="reco_pend@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Biz",
+        selected_aeo_prompts=["One"],
+    )
+    AEOExecutionRun.objects.create(
+        profile=profile,
+        status=AEOExecutionRun.STATUS_COMPLETED,
+        scoring_status=AEOExecutionRun.STAGE_COMPLETED,
+        recommendation_status=AEOExecutionRun.STAGE_RUNNING,
+    )
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.get("/api/aeo/prompt-coverage/")
+    assert res.status_code == 200
+    assert res.json().get("recommendations_pending") is True

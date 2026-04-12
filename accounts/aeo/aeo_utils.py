@@ -482,6 +482,37 @@ def _format_template(
     return spec.template.format(**safe_values)
 
 
+def phase2_prompt_plan_items_for_execution_run(run: Any) -> list[dict[str, Any]]:
+    """
+    Build Phase 2 ``prompt_set`` from aggregates tied to ``run`` (same hashes as Phase 1).
+
+    Falls back to an empty list when there are no rows — callers may pass ``None`` to
+    ``run_aeo_phase2_confidence_task`` to use profile-wide prompts, but expansion/backfill
+    runs should always have aggregates here.
+    """
+    from ..models import AEOPromptExecutionAggregate
+    from .aeo_plan_targets import aeo_effective_monitored_target_for_profile
+
+    profile = run.profile
+    aggs = AEOPromptExecutionAggregate.objects.filter(execution_run=run).order_by("id")
+    texts: list[str] = []
+    seen_hash: set[str] = set()
+    for a in aggs:
+        t = (a.prompt_text or "").strip()
+        if not t:
+            continue
+        h = str(a.prompt_hash or "").strip()
+        if h and h in seen_hash:
+            continue
+        if h:
+            seen_hash.add(h)
+        texts.append(t)
+    if not texts:
+        return []
+    cap = max(len(texts), aeo_effective_monitored_target_for_profile(profile))
+    return plan_items_from_saved_prompt_strings(texts, max_items=cap)
+
+
 def plan_items_from_saved_prompt_strings(
     texts: Sequence[str],
     *,
