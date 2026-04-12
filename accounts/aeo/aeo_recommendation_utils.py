@@ -2110,7 +2110,8 @@ def _aggregate_applies_to_for_strategy(
 
     out: dict[str, Any] = {
         "prompt_count": unique_prompt_n,
-        "prompt_examples": prompts[:3],
+        # Full deduped list for Actions UI (client shows first 3 + expand).
+        "prompt_examples": prompts,
         "response_snapshot_ids": resp_ids[:40],
     }
     if monitored_prompt_count and monitored_prompt_count > 0 and unique_prompt_n > 0:

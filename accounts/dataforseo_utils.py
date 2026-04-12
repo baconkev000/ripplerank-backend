@@ -2964,6 +2964,44 @@ def fetch_ranked_keyword_items(
         return []
 
 
+def display_rank_for_keyword_sort(row: Dict[str, Any]) -> Optional[int]:
+    """Best positive display rank: organic ``rank``, else ``local_verified_rank`` (matches Keywords UI)."""
+    r = row.get("rank")
+    lv = row.get("local_verified_rank")
+    if isinstance(r, int) and r > 0:
+        return int(r)
+    if isinstance(lv, int) and lv > 0:
+        return int(lv)
+    return None
+
+
+def sort_top_keywords_for_display(
+    rows: List[Dict[str, Any]],
+    *,
+    max_rows: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Snapshot/API/UI order: ranked rows first (lowest position number first), then unranked
+    by search_volume descending. ``max_rows`` optionally caps persistence (safety bound).
+    """
+    def sort_key(row: Dict[str, Any]) -> tuple[Any, ...]:
+        pos = display_rank_for_keyword_sort(row)
+        sv = row.get("search_volume") or 0
+        try:
+            sv_f = float(sv)
+        except (TypeError, ValueError):
+            sv_f = 0.0
+        kw = str(row.get("keyword") or "").lower()
+        if pos is not None:
+            return (0, pos, -sv_f, kw)
+        return (1, -sv_f, kw)
+
+    out = sorted(list(rows or []), key=sort_key)
+    if max_rows is not None and max_rows > 0 and len(out) > max_rows:
+        return out[:max_rows]
+    return out
+
+
 def compute_ranked_metrics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     From ranked_keywords API items, compute estimated_traffic, keywords_ranking,
@@ -3024,6 +3062,7 @@ def compute_ranked_metrics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                         "rank": int(rank_int),
                         "local_verified_rank": None,
                         "rank_source": "baseline",
+                        "keyword_origin": "ranked",
                         "missed_searches_monthly": _estimate_missed_searches_monthly(sv, rank_int),
                         "top_competitor": None,
                         "top_competitor_domain": None,
@@ -3039,6 +3078,7 @@ def compute_ranked_metrics(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                         "rank": None,
                         "local_verified_rank": None,
                         "rank_source": "baseline",
+                        "keyword_origin": "ranked",
                         "missed_searches_monthly": _estimate_missed_searches_monthly(sv, None),
                         "top_competitor": None,
                         "top_competitor_domain": None,
@@ -3210,6 +3250,7 @@ def enrich_with_gap_keywords(
                         gap_competitors = item.get("competitors")
                         if isinstance(gap_competitors, list):
                             existing_entry["competitors"] = gap_competitors[:3]
+                        existing_entry["keyword_origin"] = "gap"
                         gap_items_existing_key_rank_updated += 1
                 continue
 
@@ -3220,6 +3261,7 @@ def enrich_with_gap_keywords(
                     "rank": your_rank_int,
                     "local_verified_rank": None,
                     "rank_source": "baseline",
+                    "keyword_origin": "gap",
                     "missed_searches_monthly": missed,
                     "top_competitor": item.get("top_competitor"),
                     "top_competitor_domain": item.get("top_competitor_domain"),
@@ -3785,6 +3827,7 @@ def enrich_with_llm_keywords(
                             "rank": rank_int,
                             "local_verified_rank": None,
                             "rank_source": "baseline",
+                            "keyword_origin": "profile_seed",
                             "missed_searches_monthly": missed,
                             "top_competitor": best_match.get("top_competitor"),
                             "top_competitor_domain": best_match.get("top_competitor_domain"),
@@ -3809,6 +3852,7 @@ def enrich_with_llm_keywords(
                         "rank": None,
                         "local_verified_rank": None,
                         "rank_source": "baseline",
+                        "keyword_origin": "profile_seed",
                         "missed_searches_monthly": missed,
                         "top_competitor": None,
                         "top_competitor_domain": None,
@@ -4401,11 +4445,13 @@ def get_or_refresh_seo_score_for_user(
     from accounts.third_party_usage import usage_profile_context
 
     def _live_seo_refresh_branch() -> Dict[str, Any] | None:
+        ranked_kw_limit = int(getattr(settings, "DATAFORSEO_RANKED_KEYWORDS_LIMIT", 100))
         items = fetch_ranked_keyword_items(
             domain,
             ranking_location_code,
             language_code,
             user,
+            limit=ranked_kw_limit,
             business_profile=profile,
         )
         if not items:
@@ -4426,11 +4472,8 @@ def get_or_refresh_seo_score_for_user(
 
         metrics = compute_ranked_metrics(items)
         # Ranked-only keywords for sync path: no gap/LLM enrichment here (done in background).
-        top_keywords_ranked = sorted(
-            metrics["top_keywords"],
-            key=lambda x: x.get("search_volume", 0),
-            reverse=True,
-        )[:20]
+        max_kw = int(getattr(settings, "SEO_TOP_KEYWORDS_MAX_PERSISTED", 200))
+        top_keywords_ranked = sort_top_keywords_for_display(metrics["top_keywords"], max_rows=max_kw)
 
         agg = normalize_seo_snapshot_metrics(
             recompute_snapshot_metrics_from_keywords(

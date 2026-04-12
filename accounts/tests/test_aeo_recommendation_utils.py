@@ -306,7 +306,7 @@ def test_build_recommendation_strategies_groups_and_dedupes_actions():
     assert "title" in s0 and len(s0["title"].split()) <= 10
     assert "summary" in s0 and len(s0["summary"]) > 20
     assert s0["applies_to"]["prompt_count"] >= 1
-    assert len(s0["applies_to"]["prompt_examples"]) <= 3
+    assert set(s0["applies_to"]["prompt_examples"]) == {"best cookies nationwide", "cookie delivery options"}
     assert len(s0["angles"]) == 1
     assert s0["angles"][0]["angle"] == "todo"
     all_titles = [a["title"] for b in s0["angles"] for a in b["actions"]]

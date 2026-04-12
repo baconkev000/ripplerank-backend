@@ -367,6 +367,10 @@ DATAFORSEO_DISABLE_COMPETITOR_LOOKUPS = env.bool(
     "DATAFORSEO_DISABLE_COMPETITOR_LOOKUPS",
     default=False,
 )
+# Labs ranked_keywords/live: max items per request (API ceiling varies; default 100).
+DATAFORSEO_RANKED_KEYWORDS_LIMIT = env.int("DATAFORSEO_RANKED_KEYWORDS_LIMIT", default=100)
+# Cap rows stored on SEOOverviewSnapshot.top_keywords (ranked + gap + profile seeds). Pagination is client-side.
+SEO_TOP_KEYWORDS_MAX_PERSISTED = env.int("SEO_TOP_KEYWORDS_MAX_PERSISTED", default=200)
 AEO_TESTING_MODE = env.bool("AEO_TESTING_MODE", default=False)
 AEO_TEST_PROMPT_COUNT = env.int("AEO_TEST_PROMPT_COUNT", default=10)
 AEO_PROD_PROMPT_COUNT = env.int("AEO_PROD_PROMPT_COUNT", default=50)

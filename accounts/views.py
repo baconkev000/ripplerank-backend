@@ -45,11 +45,13 @@ from .dataforseo_utils import (
     get_profile_location_code,
     normalize_domain,
     seo_snapshot_context_for_profile,
+    sort_top_keywords_for_display,
 )
 from .constants import SEO_SNAPSHOT_TTL
 from .onboarding_completion import user_has_completed_full_onboarding
 from . import openai_utils
 from . import debug_log as _debug
+from .aeo.prompt_scan_progress import monitored_prompt_keys_in_order, prompt_scan_completed_count
 from .aeo.aeo_plan_targets import aeo_effective_monitored_target_for_profile
 from .aeo.aeo_utils import (
     aeo_business_input_from_onboarding_payload,
@@ -1747,6 +1749,14 @@ def _improvement_recommendations_for_prompt(
 def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
     """
     One row per monitored / seen prompt; per-platform (OpenAI / Gemini / Perplexity) cells from latest snapshot each.
+
+    Extra keys for clients:
+    - ``prompt_scan_total``: len(monitored prompts), same basis as ``monitored_count``.
+    - ``prompt_scan_completed``: monitored prompts with latest response per platform each
+      having ≥1 extraction (see ``_aeo_prompt_scan_completed_count``).
+    - ``visibility_pending``: same semantics as the AEO visibility bundle — true while
+      execution or extractions are still in flight; UI should keep a "working" affordance
+      even when ``prompt_scan_completed`` reaches ``prompt_scan_total``.
     """
     from .aeo.aeo_extraction_utils import (
         brand_effectively_cited,
@@ -1764,7 +1774,9 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
     profile_business_name = (getattr(profile, "business_name", None) or "").strip()
 
     responses = list(
-        AEOResponseSnapshot.objects.filter(profile=profile).order_by("-created_at", "-id")
+        AEOResponseSnapshot.objects.filter(profile=profile)
+        .order_by("-created_at", "-id")
+        .prefetch_related("extraction_snapshots")
     )
 
     by_prompt: dict[str, list] = {}
@@ -1912,11 +1924,21 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         )
 
     tracked_name = profile_business_name
+    monitored_keys = monitored_prompt_keys_in_order(profile.selected_aeo_prompts)
+    prompt_scan_total = len(monitored_keys)
+    prompt_scan_completed = prompt_scan_completed_count(
+        monitored_keys, by_prompt, latest_snapshot_per_platform
+    )
+    visibility_pending = _aeo_profile_visibility_pending(profile)
+
     return {
         "prompts": prompts,
         "monitored_count": selected_prompt_count,
         "tracked_business_name": tracked_name,
         "recommendation_strategies": recommendation_strategies,
+        "prompt_scan_total": prompt_scan_total,
+        "prompt_scan_completed": prompt_scan_completed,
+        "visibility_pending": visibility_pending,
     }
 
 
@@ -2003,7 +2025,16 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
         or BusinessProfile.objects.filter(user=request.user).first()
     )
     if not profile:
-        return Response({"prompts": [], "monitored_count": 0, "tracked_business_name": ""})
+        return Response(
+            {
+                "prompts": [],
+                "monitored_count": 0,
+                "tracked_business_name": "",
+                "prompt_scan_total": 0,
+                "prompt_scan_completed": 0,
+                "visibility_pending": False,
+            }
+        )
     return Response(_build_aeo_prompt_coverage_payload(profile))
 
 
@@ -3357,11 +3388,11 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
                     status=409,
                 )
 
-            top_keywords_sorted = sorted(
-                top_keywords,
-                key=lambda x: x.get("search_volume", 0),
-                reverse=True,
-            )[:20]
+            max_kw = int(getattr(settings, "SEO_TOP_KEYWORDS_MAX_PERSISTED", 200))
+            for _row in top_keywords:
+                if not (_row or {}).get("keyword_origin"):
+                    _row["keyword_origin"] = "ranked"
+            top_keywords_sorted = sort_top_keywords_for_display(top_keywords, max_rows=max_kw)
             total_keywords = len(top_keywords_sorted)
             keywords_with_rank = sum(
                 1 for k in top_keywords_sorted if isinstance(k.get("rank"), int) and (k.get("rank") or 0) > 0

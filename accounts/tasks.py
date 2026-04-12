@@ -115,6 +115,9 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
 
     # Copy so we don't mutate in-place until we're ready to save
     top_keywords: List[Dict[str, Any]] = [dict(k) for k in (getattr(snapshot, "top_keywords", None) or [])]
+    for _row in top_keywords:
+        if not (_row or {}).get("keyword_origin"):
+            _row["keyword_origin"] = "ranked"
 
     # Debug evidence: do we already have rank values before gap/LLM enrichment?
     try:
@@ -148,6 +151,7 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
             enrich_keyword_ranks_from_labs,
             recompute_snapshot_metrics_from_keywords,
             normalize_seo_snapshot_metrics,
+            sort_top_keywords_for_display,
         )
 
         with usage_profile_context(profile_for_usage):
@@ -190,11 +194,8 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
         )
         return
 
-    top_keywords_sorted = sorted(
-        top_keywords,
-        key=lambda x: x.get("search_volume", 0),
-        reverse=True,
-    )[:20]
+    max_kw = int(getattr(settings, "SEO_TOP_KEYWORDS_MAX_PERSISTED", 200))
+    top_keywords_sorted = sort_top_keywords_for_display(top_keywords, max_rows=max_kw)
 
     # Debug guardrails: quickly detect blank competitor/rank regressions in UI tables.
     total_keywords = len(top_keywords_sorted)
