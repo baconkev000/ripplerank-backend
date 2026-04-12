@@ -1751,7 +1751,7 @@ def _improvement_recommendations_for_prompt(
     return out
 
 
-def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
+def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: bool = False) -> dict:
     """
     One row per monitored / seen prompt; per-platform (OpenAI / Gemini / Perplexity) cells from latest snapshot each.
 
@@ -1762,6 +1762,9 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
     - ``visibility_pending``: same semantics as the AEO visibility bundle — true while
       execution or extractions are still in flight; UI should keep a "working" affordance
       even when ``prompt_scan_completed`` reaches ``prompt_scan_total``.
+    - ``fully_ready`` / ``monitored`` per row; ``full_phase_*`` for a single progress + ETA bar
+      (see ``accounts.aeo.prompt_full_ready``). Optional ``ready_only`` filters to monitored
+      rows that are ``fully_ready``.
     """
     from .aeo.aeo_extraction_utils import (
         brand_effectively_cited,
@@ -1879,6 +1882,12 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         if k not in seen:
             ordered_keys.append(k)
 
+    from .aeo import prompt_full_ready as aeo_full_ready
+
+    monitored_keys = monitored_prompt_keys_in_order(profile.selected_aeo_prompts)
+    monitored_set = set(monitored_keys)
+    recs_settled = aeo_full_ready.recommendations_pipeline_settled_for_visibility(profile)
+
     prompts: list[dict] = []
     for key in ordered_keys:
         rows = by_prompt.get(key, [])
@@ -1916,6 +1925,11 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         )
         comp_other_businesses = unique_business_count_excluding_target(merged_ranking)
 
+        monitored = key in monitored_set
+        fully_ready = monitored and aeo_full_ready.monitored_prompt_fully_ready(
+            key, profile, by_prompt, latest_snapshot_per_platform, recs_settled
+        )
+
         prompts.append(
             {
                 "prompt": key,
@@ -1925,11 +1939,12 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
                 "target_url_position": combined_target,
                 "citations_ranking": combined_ranking,
                 "improvement_recommendations": improvement_recommendations,
+                "monitored": monitored,
+                "fully_ready": fully_ready,
             }
         )
 
     tracked_name = profile_business_name
-    monitored_keys = monitored_prompt_keys_in_order(profile.selected_aeo_prompts)
     prompt_scan_total = len(monitored_keys)
     prompt_scan_completed = prompt_scan_completed_count(
         monitored_keys, by_prompt, latest_snapshot_per_platform
@@ -1937,6 +1952,31 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
     visibility_pending = _aeo_profile_visibility_pending(profile)
     prompt_fill_target = aeo_effective_monitored_target_for_profile(profile)
     recommendations_pending = _aeo_recommendations_pipeline_pending(profile)
+
+    per_key_ready = {
+        k: aeo_full_ready.monitored_prompt_fully_ready(
+            k, profile, by_prompt, latest_snapshot_per_platform, recs_settled
+        )
+        for k in monitored_keys
+    }
+    full_phase_completed = sum(1 for k in monitored_keys if per_key_ready.get(k))
+
+    n_mon = len(monitored_keys)
+    effective_target = min(n_mon, prompt_fill_target) if n_mon > 0 else prompt_fill_target
+    remaining = max(0, int(effective_target) - int(full_phase_completed))
+
+    with transaction.atomic():
+        locked = BusinessProfile.objects.select_for_update().get(pk=profile.pk)
+        durations = aeo_full_ready.merge_eta_state_after_completions(
+            locked, monitored_keys, per_key_ready
+        )
+
+    full_phase_eta_seconds, full_phase_eta_cold_start = aeo_full_ready.compute_full_phase_eta_seconds(
+        durations, remaining, full_phase_completed
+    )
+
+    if ready_only:
+        prompts = [p for p in prompts if p.get("monitored") and p.get("fully_ready")]
 
     return {
         "prompts": prompts,
@@ -1949,6 +1989,10 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile) -> dict:
         "recommendations_pending": recommendations_pending,
         "prompt_fill_completed": selected_prompt_count,
         "prompt_fill_target": prompt_fill_target,
+        "full_phase_completed": full_phase_completed,
+        "full_phase_target": prompt_fill_target,
+        "full_phase_eta_seconds": full_phase_eta_seconds,
+        "full_phase_eta_cold_start": full_phase_eta_cold_start,
         "aeo_prompt_expansion_status": getattr(profile, "aeo_prompt_expansion_status", "") or "",
         "aeo_prompt_expansion_last_error": getattr(profile, "aeo_prompt_expansion_last_error", "") or "",
     }
@@ -2071,11 +2115,16 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
                 "recommendations_pending": False,
                 "prompt_fill_completed": 0,
                 "prompt_fill_target": aeo_fallback_global_target_count(),
+                "full_phase_completed": 0,
+                "full_phase_target": aeo_fallback_global_target_count(),
+                "full_phase_eta_seconds": None,
+                "full_phase_eta_cold_start": True,
                 "aeo_prompt_expansion_status": "",
                 "aeo_prompt_expansion_last_error": "",
             }
         )
-    return Response(_build_aeo_prompt_coverage_payload(profile))
+    ready_only = str(request.GET.get("ready_only", "")).lower() in ("1", "true", "yes")
+    return Response(_build_aeo_prompt_coverage_payload(profile, ready_only=ready_only))
 
 
 @csrf_exempt

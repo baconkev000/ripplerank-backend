@@ -383,6 +383,9 @@ AEO_OPENAI_MAX_TOKENS_ADVANCED = env.int("AEO_OPENAI_MAX_TOKENS_ADVANCED", defau
 AEO_PROMPT_TOPUP_MAX_ROUNDS = env.int("AEO_PROMPT_TOPUP_MAX_ROUNDS", default=3)
 AEO_PROMPT_TOPUP_BUFFER = env.int("AEO_PROMPT_TOPUP_BUFFER", default=8)
 AEO_ENABLE_RECOMMENDATION_STAGE = env.bool("AEO_ENABLE_RECOMMENDATION_STAGE", default=False)
+AEO_FULL_PHASE_ETA_K = env.int("AEO_FULL_PHASE_ETA_K", default=5)
+AEO_FULL_PHASE_ETA_DEFAULT_SEC = env.int("AEO_FULL_PHASE_ETA_DEFAULT_SEC", default=120)
+AEO_FULL_PHASE_ETA_CAP_SEC = env.int("AEO_FULL_PHASE_ETA_CAP_SEC", default=3600)
 # Phase 5 recommendation nl_explanation: False = template-only (no OpenAI); True = LLM (extra API calls).
 AEO_RECOMMENDATION_USE_OPENAI = env.bool("AEO_RECOMMENDATION_USE_OPENAI", default=False)
 # Max actionable recommendations per run (3–5 typical). Env override for ops rollback.

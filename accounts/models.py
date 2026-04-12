@@ -163,6 +163,11 @@ class BusinessProfile(models.Model):
     )
     aeo_prompt_expansion_last_error = models.TextField(blank=True, default="")
     aeo_prompt_expansion_updated_at = models.DateTimeField(null=True, blank=True)
+    aeo_full_phase_eta_state = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Rolling completion durations + recorded prompt hashes for AI Visibility ETA.",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
