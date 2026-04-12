@@ -379,6 +379,9 @@ AEO_PROD_PROMPT_COUNT = env.int("AEO_PROD_PROMPT_COUNT", default=50)
 AEO_OPENAI_MAX_TOKENS_STARTER = env.int("AEO_OPENAI_MAX_TOKENS_STARTER", default=1024)
 AEO_OPENAI_MAX_TOKENS_PRO = env.int("AEO_OPENAI_MAX_TOKENS_PRO", default=4096)
 AEO_OPENAI_MAX_TOKENS_ADVANCED = env.int("AEO_OPENAI_MAX_TOKENS_ADVANCED", default=8192)
+# Shortfall top-up after the four-type pass (build_full_aeo_prompt_plan): extra buffer on requested batch size for dedupe loss.
+AEO_PROMPT_TOPUP_MAX_ROUNDS = env.int("AEO_PROMPT_TOPUP_MAX_ROUNDS", default=3)
+AEO_PROMPT_TOPUP_BUFFER = env.int("AEO_PROMPT_TOPUP_BUFFER", default=8)
 AEO_ENABLE_RECOMMENDATION_STAGE = env.bool("AEO_ENABLE_RECOMMENDATION_STAGE", default=False)
 # Phase 5 recommendation nl_explanation: False = template-only (no OpenAI); True = LLM (extra API calls).
 AEO_RECOMMENDATION_USE_OPENAI = env.bool("AEO_RECOMMENDATION_USE_OPENAI", default=False)

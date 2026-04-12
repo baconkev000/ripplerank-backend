@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass, field
 from string import Formatter
@@ -19,6 +20,8 @@ from django.conf import settings
 
 from ..models import BusinessProfile
 from .aeo_plan_targets import AEO_PLAN_CAP_PRO, AEO_PLAN_CAP_STARTER
+
+logger = logging.getLogger(__name__)
 
 # Onboarding / tracking: exactly this many prompts in combined output and saved profile lists.
 AEO_ONBOARDING_PROMPT_COUNT: Final[int] = 50
@@ -828,6 +831,10 @@ def build_full_aeo_prompt_plan(
     those topics + Labs/AEO metadata; ``prompts_by_topic`` maps the same flat list onto
     each selected topic for the review UI (see ``assign_onboarding_prompts_to_selected_topics``).
 
+    After the four-type pass, optional top-up rounds (``AEO_PROMPT_TOPUP_MAX_ROUNDS``) request
+    more prompts until ``target`` is reached or progress stops. Top-up uses the same
+    ``type_order`` system prompts in rotation (transactional → trust → comparison → authority).
+
     Output schema remains backward compatible:
     - fixed: []
     - dynamic: []
@@ -899,7 +906,7 @@ def build_full_aeo_prompt_plan(
     )
     quotas = _allocate_type_quotas(target)
 
-    # Fast single-pass generation per type (no retry/top-up loops).
+    # Initial single pass: one batch per prompt type (quotas sum to target).
     for prompt_type in type_order:
         if max_openai_prompts is not None and len(combined) >= max_openai_prompts:
             break
@@ -922,6 +929,59 @@ def build_full_aeo_prompt_plan(
 
     if len(combined) > target:
         combined = combined[:target]
+
+    topup_max_rounds = max(0, int(getattr(settings, "AEO_PROMPT_TOPUP_MAX_ROUNDS", 3)))
+    topup_buffer = max(0, int(getattr(settings, "AEO_PROMPT_TOPUP_BUFFER", 8)))
+    for topup_round in range(1, topup_max_rounds + 1):
+        if len(combined) >= target:
+            break
+        if max_openai_prompts is not None and len(combined) >= max_openai_prompts:
+            break
+        need = target - len(combined)
+        max_additional = min(max_batch_size, need + topup_buffer)
+        if max_additional <= 0:
+            break
+        # Rotate system prompt across types so top-up variety matches the main pass.
+        type_idx = (topup_round - 1) % len(type_order)
+        topup_type = type_order[type_idx]
+        len_before = len(combined)
+        batch = run_prompt_batch_via_openai(
+            ctx,
+            seed_prompts=combined,
+            max_additional=max_additional,
+            system_prompt=type_prompts[topup_type],
+            onboarding_topic_details=onboarding_topic_details,
+            business_profile=profile,
+            max_output_tokens=batch_max_output_tokens,
+        )
+        typed = _typed_batch(batch, topup_type)
+        if not typed:
+            logger.info(
+                "[AEO prompt top-up] empty_batch target=%s have=%s need=%s round=%s/%s type=%s",
+                target,
+                len_before,
+                need,
+                topup_round,
+                topup_max_rounds,
+                topup_type,
+            )
+            break
+        combined = combine_prompt_set(combined, typed)
+        if len(combined) > target:
+            combined = combined[:target]
+        added = len(combined) - len_before
+        logger.info(
+            "[AEO prompt top-up] target=%s have=%s need=%s round=%s/%s added=%s type=%s",
+            target,
+            len(combined),
+            need,
+            topup_round,
+            topup_max_rounds,
+            added,
+            topup_type,
+        )
+        if added == 0:
+            break
 
     prompts_by_topic: dict[str, list[str]] = {}
     if onboarding_topic_details:

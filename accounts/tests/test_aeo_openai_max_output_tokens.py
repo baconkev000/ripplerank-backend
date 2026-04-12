@@ -25,6 +25,7 @@ def test_aeo_openai_max_output_tokens_starter_pro_advanced(settings):
 @pytest.mark.django_db
 def test_build_full_aeo_prompt_plan_passes_scaled_max_tokens(monkeypatch, settings, django_user_model):
     settings.AEO_OPENAI_MAX_TOKENS_ADVANCED = 7777
+    settings.AEO_PROMPT_TOPUP_MAX_ROUNDS = 0
     seen: list[int] = []
 
     class _Msg:
