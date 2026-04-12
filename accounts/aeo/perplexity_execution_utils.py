@@ -28,7 +28,7 @@ from .perplexity_prompts import AEO_PERPLEXITY_EXECUTION_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-PERPLEXITY_CHAT_COMPLETIONS_URL = "https://api.perplexity.ai/v1/chat/completions"
+PERPLEXITY_CHAT_COMPLETIONS_URL = "https://api.perplexity.ai/v1/sonar"
 
 
 def perplexity_execution_enabled() -> bool:
