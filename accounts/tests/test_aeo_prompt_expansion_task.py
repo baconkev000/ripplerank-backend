@@ -53,3 +53,57 @@ def test_expansion_skipped_in_testing_mode(settings):
     schedule_aeo_prompt_plan_expansion.run(profile.id)
     profile.refresh_from_db()
     assert len(profile.selected_aeo_prompts) == 1
+
+
+@pytest.mark.django_db
+def test_expansion_no_op_when_expected_plan_slug_mismatches_db(settings):
+    settings.AEO_TESTING_MODE = False
+    user = User.objects.create_user(username="exmis@example.com", email="exmis@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Mis",
+        plan=BusinessProfile.PLAN_STARTER,
+        selected_aeo_prompts=["only"],
+    )
+    schedule_aeo_prompt_plan_expansion.run(
+        profile.id,
+        expected_plan_slug=BusinessProfile.PLAN_ADVANCED,
+        expansion_cap=100,
+    )
+    profile.refresh_from_db()
+    assert profile.selected_aeo_prompts == ["only"]
+
+
+@pytest.mark.django_db
+def test_expansion_uses_webhook_expansion_cap_kwarg(monkeypatch, settings):
+    settings.AEO_TESTING_MODE = False
+    captured: list[int | None] = []
+
+    def fake_build(profile, **kwargs):
+        captured.append(kwargs.get("target_combined_count"))
+        n = int(kwargs.get("target_combined_count") or 0)
+        return {
+            "combined": [{"prompt": f"p{i}"} for i in range(n)],
+            "meta": {"openai_status": "ok", "combined_shortfall": 0},
+        }
+
+    monkeypatch.setattr("accounts.aeo.aeo_utils.build_full_aeo_prompt_plan", fake_build)
+
+    user = User.objects.create_user(username="excap@example.com", email="excap@example.com", password="x")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Cap",
+        plan=BusinessProfile.PLAN_ADVANCED,
+        website_url="https://example.com",
+        selected_aeo_prompts=[f"keep{i}" for i in range(10)],
+    )
+    schedule_aeo_prompt_plan_expansion.run(
+        profile.id,
+        expected_plan_slug=BusinessProfile.PLAN_ADVANCED,
+        expansion_cap=100,
+    )
+    assert captured and captured[0] == 100
+    profile.refresh_from_db()
+    assert len(profile.selected_aeo_prompts) == 100

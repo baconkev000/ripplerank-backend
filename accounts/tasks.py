@@ -1495,9 +1495,22 @@ def _clean_profile_prompts_for_expansion(profile) -> list[str]:
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=2, retry_backoff=30, ignore_result=True)
-def schedule_aeo_prompt_plan_expansion(self, profile_id: int) -> None:
+def schedule_aeo_prompt_plan_expansion(
+    self,
+    profile_id: int,
+    expected_plan_slug: str | None = None,
+    expansion_cap: int | None = None,
+) -> None:
     """
     After Pro/Advanced billing, grow selected_aeo_prompts toward the plan cap (idempotent).
+
+    **Enqueue only from** ``apply_subscription_payload_to_profile`` (Stripe webhooks), on commit, with
+    ``expected_plan_slug`` and ``expansion_cap`` from the same price/link resolution used to set
+    ``profile.plan`` for that event. At task start, if ``expected_plan_slug`` is set and the DB
+    profile's plan differs (race with another update), the task logs and exits without mutating
+    prompts. When ``expansion_cap`` is set, it is used as the target count (production caps from
+    the webhook); otherwise the cap is derived from the current profile plan. Starter / testing
+    mode still short-circuits via ``aeo_should_run_post_payment_expansion``.
     """
     from .aeo.aeo_utils import aeo_business_input_from_onboarding_payload, build_full_aeo_prompt_plan
     from .dataforseo_utils import normalize_domain
@@ -1508,7 +1521,25 @@ def schedule_aeo_prompt_plan_expansion(self, profile_id: int) -> None:
     if profile is None:
         return
 
-    cap = aeo_effective_monitored_target_for_profile(profile)
+    db_plan = str(getattr(profile, "plan", "") or "")
+    logger.info(
+        "[AEO expansion] start profile_id=%s expected_plan_slug=%s expansion_cap=%s profile.plan=%s",
+        pid,
+        expected_plan_slug,
+        expansion_cap,
+        db_plan,
+    )
+    if expected_plan_slug is not None:
+        exp_norm = str(expected_plan_slug).strip().lower()
+        if db_plan.strip().lower() != exp_norm:
+            logger.warning(
+                "[AEO expansion] plan_mismatch skip profile_id=%s expected_plan_slug=%s db_plan=%s",
+                pid,
+                expected_plan_slug,
+                db_plan,
+            )
+            return
+
     now = django_tz.now()
 
     def touch(**kwargs: Any) -> None:
@@ -1516,14 +1547,23 @@ def schedule_aeo_prompt_plan_expansion(self, profile_id: int) -> None:
         BusinessProfile.objects.filter(pk=pid).update(**kwargs)
 
     if not aeo_should_run_post_payment_expansion(profile):
+        cap_meta = aeo_effective_monitored_target_for_profile(profile)
         touch(
             aeo_prompt_expansion_status=BusinessProfile.AEO_PROMPT_EXPANSION_COMPLETE,
-            aeo_prompt_expansion_target=cap,
+            aeo_prompt_expansion_target=cap_meta,
             aeo_prompt_expansion_progress=len(_clean_profile_prompts_for_expansion(profile)),
             aeo_prompt_expansion_last_error="",
             aeo_prompt_expansion_updated_at=now,
         )
         return
+
+    cap = (
+        int(expansion_cap)
+        if expansion_cap is not None
+        else aeo_effective_monitored_target_for_profile(profile)
+    )
+    if cap < 1:
+        cap = aeo_effective_monitored_target_for_profile(profile)
 
     existing = _clean_profile_prompts_for_expansion(profile)
     if len(existing) >= cap:

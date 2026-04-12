@@ -17,6 +17,11 @@ webhook still succeeds; payment-link mapping remains a fallback when price-based
 Cancellation policy: when Stripe reports a terminal subscription status (canceled, unpaid,
 incomplete_expired), we set BusinessProfile.plan to PLAN_NONE (empty string). Onboarding and paid
 access remain gated on stripe_subscription_status (see accounts.onboarding_completion).
+
+AEO monitored-prompt expansion toward the Pro/Advanced cap is scheduled only from
+``apply_subscription_payload_to_profile`` when a webhook applies ``plan`` = pro or advanced
+(``transaction.on_commit``), with ``expected_plan_slug`` / ``expansion_cap`` tied to that
+resolution—not from onboarding, checkout-return-only flows, or generic profile saves.
 """
 
 import logging
@@ -29,6 +34,7 @@ import stripe
 from django.conf import settings
 from django.db import transaction
 
+from .aeo.aeo_plan_targets import aeo_monitored_prompt_cap_for_plan_slug
 from .models import BusinessProfile
 
 logger = logging.getLogger(__name__)
@@ -391,6 +397,13 @@ def apply_subscription_payload_to_profile(
     payment_link_id: str = "",
     subscription_dict: dict | None = None,
 ) -> tuple[bool, list[str]]:
+    """
+    Persist Stripe-derived subscription fields on ``profile``.
+
+    AEO post-payment prompt expansion is **only** scheduled from here (via ``transaction.on_commit``)
+    when this call applies a **plan** change to Pro or Advanced—never for Stripe-only field updates
+    (e.g. customer id alone) and never when ``updates`` is empty (no DB write).
+    """
     effective_price = (price_id or "").strip()
     if not effective_price and subscription_dict:
         effective_price = _first_price_id_from_items(subscription_dict)
@@ -468,18 +481,26 @@ def apply_subscription_payload_to_profile(
     for k, v in updates.items():
         setattr(profile, k, v)
     profile.save(update_fields=list(updates.keys()))
-    plan_after = str(getattr(profile, "plan", "") or "")
-    if plan_after in {BusinessProfile.PLAN_PRO, BusinessProfile.PLAN_ADVANCED}:
+    plan_written = updates.get("plan")
+    if plan_written in {BusinessProfile.PLAN_PRO, BusinessProfile.PLAN_ADVANCED}:
+        slug = str(plan_written)
+        cap = int(aeo_monitored_prompt_cap_for_plan_slug(slug))
 
         def _enqueue_aeo_expansion() -> None:
             try:
                 from .tasks import schedule_aeo_prompt_plan_expansion
 
-                schedule_aeo_prompt_plan_expansion.delay(profile.id)
+                schedule_aeo_prompt_plan_expansion.delay(
+                    profile.id,
+                    expected_plan_slug=slug,
+                    expansion_cap=cap,
+                )
             except Exception:
                 logger.exception(
-                    "[stripe] enqueue AEO prompt expansion failed profile_id=%s",
+                    "[stripe] enqueue AEO prompt expansion failed profile_id=%s plan=%s cap=%s",
                     profile.id,
+                    slug,
+                    cap,
                 )
 
         transaction.on_commit(_enqueue_aeo_expansion)
