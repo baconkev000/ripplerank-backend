@@ -9,6 +9,7 @@ from django.utils.html import format_html
 from .models import (
     AEOPromptExecutionAggregate,
     AEOCompetitorSnapshot,
+    AEODashboardBundleCache,
     AEOExtractionSnapshot,
     AEOResponseSnapshot,
     AEORecommendationRun,
@@ -103,6 +104,34 @@ class AEOCompetitorSnapshotAdmin(CsvExportAdminMixin, admin.ModelAdmin):
             text = text[:max_len] + "\n… (truncated)"
         return format_html(
             '<pre style="max-height:28rem;overflow:auto;font-size:11px;margin:0;">{}</pre>',
+            text,
+        )
+
+
+@admin.register(AEODashboardBundleCache)
+class AEODashboardBundleCacheAdmin(admin.ModelAdmin):
+    list_display = ("id", "profile", "updated_at")
+    search_fields = ("profile__business_name", "profile__user__email")
+    autocomplete_fields = ("profile",)
+    readonly_fields = ("updated_at", "payload_preview")
+    exclude = ("payload_json",)
+
+    @admin.display(description="payload_json (preview)")
+    def payload_preview(self, obj: AEODashboardBundleCache) -> str:
+        if obj is None or not getattr(obj, "pk", None):
+            return "—"
+        data = obj.payload_json
+        if data in (None, [], {}):
+            return "—"
+        try:
+            text = json.dumps(data, indent=2, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(data)
+        max_len = 8000
+        if len(text) > max_len:
+            text = text[:max_len] + "\n… (truncated)"
+        return format_html(
+            '<pre style="max-height:24rem;overflow:auto;font-size:11px;margin:0;">{}</pre>',
             text,
         )
 

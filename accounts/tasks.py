@@ -92,6 +92,7 @@ def _chain_post_phase3_extraction(run) -> None:
     from .aeo.aeo_utils import phase2_prompt_plan_items_for_execution_run
 
     refresh_competitor_snapshot_for_profile_task.delay(run.profile_id)
+    refresh_aeo_dashboard_bundle_cache_task.delay(run.profile_id)
     if _is_onboarding_sample_size_profile(run.profile):
         run_aeo_phase4_scoring_task.delay(run.id)
     else:
@@ -1325,6 +1326,27 @@ def refresh_competitor_snapshot_for_profile_task(self, profile_id: int) -> None:
     except Exception:
         logger.exception(
             "[AEO competitors] snapshot refresh failed profile_id=%s",
+            profile_id,
+        )
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def refresh_aeo_dashboard_bundle_cache_task(self, profile_id: int) -> None:
+    from .models import AEODashboardBundleCache, BusinessProfile
+    from .views import _build_aeo_prompt_coverage_payload
+
+    profile = BusinessProfile.objects.filter(id=profile_id).first()
+    if not profile:
+        return
+    try:
+        payload = _build_aeo_prompt_coverage_payload(profile, ready_only=False)
+        AEODashboardBundleCache.objects.update_or_create(
+            profile=profile,
+            defaults={"payload_json": payload},
+        )
+    except Exception:
+        logger.exception(
+            "[AEO dashboard cache] refresh failed profile_id=%s",
             profile_id,
         )
 

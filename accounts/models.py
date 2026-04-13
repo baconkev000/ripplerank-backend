@@ -353,6 +353,29 @@ class AEOCompetitorSnapshot(models.Model):
         )
 
 
+class AEODashboardBundleCache(models.Model):
+    """
+    Cached JSON from ``_build_aeo_prompt_coverage_payload`` for fast dashboard + platform visibility.
+
+    Refreshed synchronously on cache miss and asynchronously when stale (see tasks / views).
+    """
+
+    profile = models.OneToOneField(
+        BusinessProfile,
+        on_delete=models.CASCADE,
+        related_name="aeo_dashboard_bundle_cache",
+    )
+    payload_json = models.JSONField(default=dict, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "AEO dashboard bundle cache"
+        verbose_name_plural = "AEO dashboard bundle caches"
+
+    def __str__(self) -> str:
+        return f"AEODashboardBundleCache(profile_id={self.profile_id})"
+
+
 class AEOResponseSnapshot(models.Model):
     """
     Raw OpenAI (or other platform) answer for a single AEO visibility prompt.

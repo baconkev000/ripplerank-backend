@@ -1,5 +1,6 @@
 import logging
 import secrets
+from typing import Optional
 from urllib.parse import urlencode, unquote, quote, urlparse
 from datetime import datetime, date, timedelta, timezone
 
@@ -20,6 +21,7 @@ from rest_framework.response import Response
 
 from .models import (
     AEOCompetitorSnapshot,
+    AEODashboardBundleCache,
     AgentActivityLog,
     BusinessProfile,
     SEOOverviewSnapshot,
@@ -1998,6 +2000,128 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
     }
 
 
+# Dashboard: reuse cached prompt-coverage payload for platform visibility + fast prompt-coverage reads.
+_AEO_DASH_BUNDLE_CACHE_STALE_AFTER = timedelta(seconds=90)
+
+
+def _aeo_platform_rows_from_prompts(prompts: list) -> list:
+    """Build ``platforms`` list for ``/api/aeo/platform-visibility/`` from prompt rows."""
+
+    def aggregate(api_key: str) -> tuple[int, int]:
+        with_data = 0
+        cited = 0
+        for row in prompts:
+            if not isinstance(row, dict):
+                continue
+            cell = (row.get("platforms") or {}).get(api_key) or {}
+            if not cell.get("has_data"):
+                continue
+            with_data += 1
+            if cell.get("cited"):
+                cited += 1
+        return with_data, cited
+
+    def pct(with_data: int, cited_count: int) -> float:
+        if with_data <= 0:
+            return 0.0
+        return round(100.0 * float(cited_count) / float(with_data), 1)
+
+    o_w, o_c = aggregate("openai")
+    p_w, p_c = aggregate("perplexity")
+    g_w, g_c = aggregate("gemini")
+
+    return [
+        {
+            "key": "openai",
+            "label": "ChatGPT",
+            "visibility_pct": pct(o_w, o_c),
+            "has_data": o_w > 0,
+            "prompts_with_data": o_w,
+            "prompts_cited": o_c,
+            "has_backend": True,
+        },
+        {
+            "key": "perplexity",
+            "label": "Perplexity",
+            "visibility_pct": pct(p_w, p_c),
+            "has_data": p_w > 0,
+            "prompts_with_data": p_w,
+            "prompts_cited": p_c,
+            "has_backend": True,
+        },
+        {
+            "key": "gemini",
+            "label": "Gemini",
+            "visibility_pct": pct(g_w, g_c),
+            "has_data": g_w > 0,
+            "prompts_with_data": g_w,
+            "prompts_cited": g_c,
+            "has_backend": True,
+        },
+        {
+            "key": "grok",
+            "label": "Grok",
+            "visibility_pct": 0.0,
+            "has_data": False,
+            "prompts_with_data": 0,
+            "prompts_cited": 0,
+            "has_backend": False,
+        },
+    ]
+
+
+def _maybe_enqueue_aeo_dashboard_bundle_refresh(
+    profile: BusinessProfile, cache_row: Optional[AEODashboardBundleCache]
+) -> None:
+    if cache_row is None:
+        return
+    updated = getattr(cache_row, "updated_at", None)
+    if updated is None:
+        return
+    if django_timezone.now() - updated <= _AEO_DASH_BUNDLE_CACHE_STALE_AFTER:
+        return
+    try:
+        from .tasks import refresh_aeo_dashboard_bundle_cache_task
+
+        refresh_aeo_dashboard_bundle_cache_task.delay(profile.id)
+    except Exception:
+        logger.exception(
+            "[aeo_dashboard_cache] enqueue refresh failed profile_id=%s",
+            profile.id,
+        )
+
+
+def _aeo_prompt_coverage_payload_for_api(
+    profile: BusinessProfile, *, ready_only: bool, force_refresh: bool
+) -> dict:
+    cache_row = AEODashboardBundleCache.objects.filter(profile=profile).first()
+    if (
+        cache_row
+        and not force_refresh
+        and isinstance(cache_row.payload_json, dict)
+        and cache_row.payload_json
+    ):
+        payload = dict(cache_row.payload_json)
+        _maybe_enqueue_aeo_dashboard_bundle_refresh(profile, cache_row)
+    else:
+        payload = _build_aeo_prompt_coverage_payload(profile, ready_only=False)
+        AEODashboardBundleCache.objects.update_or_create(
+            profile=profile,
+            defaults={"payload_json": payload},
+        )
+    if ready_only:
+        pl = payload.get("prompts") or []
+        payload = {
+            **payload,
+            "prompts": [
+                p
+                for p in pl
+                if isinstance(p, dict) and p.get("monitored") and p.get("fully_ready")
+            ],
+        }
+    return payload
+
+
 def _aeo_profile_visibility_pending(profile: BusinessProfile) -> bool:
     """
     True while prompt LLM responses or extraction snapshots are still in flight for monitored
@@ -2124,7 +2248,11 @@ def aeo_prompt_coverage_data(request: HttpRequest) -> Response:
             }
         )
     ready_only = str(request.GET.get("ready_only", "")).lower() in ("1", "true", "yes")
-    return Response(_build_aeo_prompt_coverage_payload(profile, ready_only=ready_only))
+    force_refresh = str(request.GET.get("refresh", "")).lower() in ("1", "true", "yes")
+    payload = _aeo_prompt_coverage_payload_for_api(
+        profile, ready_only=ready_only, force_refresh=force_refresh
+    )
+    return Response(payload)
 
 
 @csrf_exempt
@@ -2145,68 +2273,27 @@ def aeo_platform_visibility_data(request: HttpRequest) -> Response:
     if not profile:
         return Response({"platforms": []})
 
-    payload = _build_aeo_prompt_coverage_payload(profile)
+    force_refresh = str(request.GET.get("refresh", "")).lower() in ("1", "true", "yes")
+    cache_row = AEODashboardBundleCache.objects.filter(profile=profile).first()
+    if (
+        cache_row
+        and not force_refresh
+        and isinstance(cache_row.payload_json, dict)
+        and cache_row.payload_json.get("prompts") is not None
+    ):
+        prompts = cache_row.payload_json.get("prompts") or []
+        platforms_out = _aeo_platform_rows_from_prompts(prompts)
+        visibility_pending = _aeo_profile_visibility_pending(profile)
+        _maybe_enqueue_aeo_dashboard_bundle_refresh(profile, cache_row)
+        return Response({"platforms": platforms_out, "visibility_pending": visibility_pending})
+
+    payload = _build_aeo_prompt_coverage_payload(profile, ready_only=False)
+    AEODashboardBundleCache.objects.update_or_create(
+        profile=profile,
+        defaults={"payload_json": payload},
+    )
     prompts = payload.get("prompts") or []
-
-    def aggregate(api_key: str) -> tuple[int, int]:
-        with_data = 0
-        cited = 0
-        for row in prompts:
-            cell = (row.get("platforms") or {}).get(api_key) or {}
-            if not cell.get("has_data"):
-                continue
-            with_data += 1
-            if cell.get("cited"):
-                cited += 1
-        return with_data, cited
-
-    def pct(with_data: int, cited_count: int) -> float:
-        if with_data <= 0:
-            return 0.0
-        return round(100.0 * float(cited_count) / float(with_data), 1)
-
-    o_w, o_c = aggregate("openai")
-    p_w, p_c = aggregate("perplexity")
-    g_w, g_c = aggregate("gemini")
-
-    platforms_out = [
-        {
-            "key": "openai",
-            "label": "ChatGPT",
-            "visibility_pct": pct(o_w, o_c),
-            "has_data": o_w > 0,
-            "prompts_with_data": o_w,
-            "prompts_cited": o_c,
-            "has_backend": True,
-        },
-        {
-            "key": "perplexity",
-            "label": "Perplexity",
-            "visibility_pct": pct(p_w, p_c),
-            "has_data": p_w > 0,
-            "prompts_with_data": p_w,
-            "prompts_cited": p_c,
-            "has_backend": True,
-        },
-        {
-            "key": "gemini",
-            "label": "Gemini",
-            "visibility_pct": pct(g_w, g_c),
-            "has_data": g_w > 0,
-            "prompts_with_data": g_w,
-            "prompts_cited": g_c,
-            "has_backend": True,
-        },
-        {
-            "key": "grok",
-            "label": "Grok",
-            "visibility_pct": 0.0,
-            "has_data": False,
-            "prompts_with_data": 0,
-            "prompts_cited": 0,
-            "has_backend": False,
-        },
-    ]
+    platforms_out = _aeo_platform_rows_from_prompts(prompts)
     visibility_pending = _aeo_profile_visibility_pending(profile)
     return Response({"platforms": platforms_out, "visibility_pending": visibility_pending})
 

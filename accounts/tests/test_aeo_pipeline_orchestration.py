@@ -53,6 +53,7 @@ def _stub_aeo_celery_delays(monkeypatch):
     """Tests run without Redis/broker; individual tests override .delay when asserting enqueue order."""
     noop = lambda *args, **kwargs: None
     monkeypatch.setattr("accounts.tasks.refresh_competitor_snapshot_for_profile_task.delay", noop)
+    monkeypatch.setattr("accounts.tasks.refresh_aeo_dashboard_bundle_cache_task.delay", noop)
     monkeypatch.setattr("accounts.tasks.run_aeo_phase2_confidence_task.delay", noop)
     monkeypatch.setattr("accounts.tasks.run_aeo_phase3_extraction_task.delay", noop)
     monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", noop)
