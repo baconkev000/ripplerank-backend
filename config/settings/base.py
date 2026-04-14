@@ -87,7 +87,7 @@ THIRD_PARTY_APPS = [
 
 LOCAL_APPS = [
     "swivl.users",
-    "accounts",
+    "accounts.apps.AccountsConfig",
     # Your stuff: custom apps go here
 ]
 # https://docs.djangoproject.com/en/dev/ref/settings/#installed-apps
@@ -289,7 +289,10 @@ ACCOUNT_LOGIN_METHODS = {"username"}
 # https://docs.allauth.org/en/latest/account/configuration.html
 ACCOUNT_SIGNUP_FIELDS = ["email*", "username*", "password1*", "password2*"]
 # https://docs.allauth.org/en/latest/account/configuration.html
-ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+# ``mandatory`` sends users to /accounts/confirm-email/ until verified; we have no outbound
+# email yet. Use ``optional`` so login succeeds; set ``DJANGO_ACCOUNT_EMAIL_VERIFICATION=mandatory``
+# when SMTP + verification emails are configured.
+ACCOUNT_EMAIL_VERIFICATION = env("DJANGO_ACCOUNT_EMAIL_VERIFICATION", default="optional")
 # Google (and similar) already verify email; do not block OAuth users on Django email confirmation.
 # Without this, social login often redirects to /accounts/confirm-email/ instead of the SPA.
 SOCIALACCOUNT_EMAIL_VERIFICATION = "none"
