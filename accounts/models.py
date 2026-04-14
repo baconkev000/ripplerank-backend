@@ -716,11 +716,12 @@ class AEOPromptExecutionAggregate(models.Model):
         indexes = [
             models.Index(
                 fields=["profile", "execution_run", "stability_status"],
-                name="accounts_aeo_prompt_agg_profile_run_status_idx",
+                # <= 30 chars for SQLite / Django system checks (E034)
+                name="acct_aeoagg_runstat_idx",
             ),
             models.Index(
                 fields=["profile", "prompt_hash"],
-                name="accounts_aeo_prompt_agg_profile_hash_idx",
+                name="acct_aeoagg_prhash_idx",
             ),
         ]
 

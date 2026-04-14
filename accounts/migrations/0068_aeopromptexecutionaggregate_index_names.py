@@ -12,8 +12,11 @@ operation (or replace it with ``RunPython(noop)``) after this file is merged, th
 from django.db import migrations
 
 
-STATUS_CANONICAL = "accounts_aeo_prompt_agg_profile_run_status_idx"
-HASH_CANONICAL = "accounts_aeo_prompt_agg_profile_hash_idx"
+# <= 30 chars (Django E034); 0069 renames legacy long names from 0048 if needed.
+STATUS_CANONICAL = "acct_aeoagg_runstat_idx"
+HASH_CANONICAL = "acct_aeoagg_prhash_idx"
+LEGACY_STATUS = "accounts_aeo_prompt_agg_profile_run_status_idx"
+LEGACY_HASH = "accounts_aeo_prompt_agg_profile_hash_idx"
 TABLE = "accounts_aeopromptexecutionaggregate"
 
 
@@ -53,7 +56,7 @@ def _find_rename_candidate(cursor, required: list[str], forbidden: list[str]) ->
             continue
         if any(x.lower() in d for x in forbidden):
             continue
-        if relname in (STATUS_CANONICAL, HASH_CANONICAL):
+        if relname in (STATUS_CANONICAL, HASH_CANONICAL, LEGACY_STATUS, LEGACY_HASH):
             continue
         return relname
     return None
