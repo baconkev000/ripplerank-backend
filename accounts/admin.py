@@ -340,7 +340,13 @@ class BusinessProfileMembershipInlineFormSet(BaseInlineFormSet):
             if not hasattr(form, "cleaned_data"):
                 continue
             cd = form.cleaned_data
-            if not cd or cd.get("DELETE"):
+            if not cd:
+                continue
+            if cd.get("DELETE") and getattr(form.instance, "pk", None) and form.instance.is_owner:
+                raise ValidationError(
+                    "Cannot delete the primary owner (is_owner=True) membership row.",
+                )
+            if cd.get("DELETE"):
                 continue
             if cd.get("is_owner"):
                 owner_rows += 1
@@ -365,11 +371,6 @@ class BusinessProfileMembershipInline(admin.TabularInline):
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related("user")
-
-    def has_delete_permission(self, request, obj=None):
-        if obj is not None and obj.is_owner:
-            return False
-        return super().has_delete_permission(request, obj)
 
 
 class ThirdPartyApiRequestLogInline(admin.TabularInline):
