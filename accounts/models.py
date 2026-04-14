@@ -714,8 +714,14 @@ class AEOPromptExecutionAggregate(models.Model):
             ),
         ]
         indexes = [
-            models.Index(fields=["profile", "execution_run", "stability_status"]),
-            models.Index(fields=["profile", "prompt_hash"]),
+            models.Index(
+                fields=["profile", "execution_run", "stability_status"],
+                name="accounts_aeo_prompt_agg_profile_run_status_idx",
+            ),
+            models.Index(
+                fields=["profile", "prompt_hash"],
+                name="accounts_aeo_prompt_agg_profile_hash_idx",
+            ),
         ]
 
     def __str__(self) -> str:

@@ -2,7 +2,10 @@ import csv
 import json
 from datetime import datetime
 
+from django import forms
 from django.contrib import admin
+from django.core.exceptions import ValidationError
+from django.forms.models import BaseInlineFormSet
 from django.http import HttpResponse
 from django.utils.html import format_html
 
@@ -16,6 +19,7 @@ from .models import (
     AEOExecutionRun,
     AEOScoreSnapshot,
     BusinessProfile,
+    BusinessProfileMembership,
     TrackedCompetitor,
     ThirdPartyApiErrorLog,
     ThirdPartyApiRequestLog,
@@ -276,6 +280,98 @@ class AEOPromptExecutionAggregateAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         return (obj.prompt_hash or "")[:12]
 
 
+class BusinessProfileMembershipInlineForm(forms.ModelForm):
+    """Same rules as ``business_profile_team`` POST where applicable."""
+
+    class Meta:
+        model = BusinessProfileMembership
+        fields = ("user", "role", "is_owner")
+
+    def clean(self):
+        cleaned = super().clean()
+        if self.errors:
+            return cleaned
+        profile = cleaned.get("business_profile") or getattr(self.instance, "business_profile", None)
+        user = cleaned.get("user")
+        role = cleaned.get("role")
+        is_owner = cleaned.get("is_owner")
+        if profile is None or user is None:
+            return cleaned
+
+        if user.pk == profile.user_id:
+            if not is_owner:
+                raise ValidationError(
+                    {
+                        "is_owner": (
+                            "The account holder (BusinessProfile.user) must have is_owner=True; "
+                            "do not add them as a non-owner team row."
+                        ),
+                    },
+                )
+            if role != BusinessProfileMembership.ROLE_ADMIN:
+                raise ValidationError(
+                    {"role": "The owner row must use role “admin”."},
+                )
+        else:
+            if is_owner:
+                raise ValidationError(
+                    {
+                        "is_owner": (
+                            "Only BusinessProfile.user may be marked as owner; "
+                            "team admins and members must have is_owner=False."
+                        ),
+                    },
+                )
+
+        dup = BusinessProfileMembership.objects.filter(business_profile=profile, user=user)
+        if self.instance.pk:
+            dup = dup.exclude(pk=self.instance.pk)
+        if dup.exists():
+            raise ValidationError({"user": "This user already has a membership on this profile."})
+
+        return cleaned
+
+
+class BusinessProfileMembershipInlineFormSet(BaseInlineFormSet):
+    def clean(self):
+        super().clean()
+        owner_rows = 0
+        for form in self.forms:
+            if not hasattr(form, "cleaned_data"):
+                continue
+            cd = form.cleaned_data
+            if not cd or cd.get("DELETE"):
+                continue
+            if cd.get("is_owner"):
+                owner_rows += 1
+        if owner_rows > 1:
+            raise ValidationError(
+                "Only one team membership may have is_owner=True (primary billing owner) per profile.",
+            )
+
+
+class BusinessProfileMembershipInline(admin.TabularInline):
+    model = BusinessProfileMembership
+    fk_name = "business_profile"
+    form = BusinessProfileMembershipInlineForm
+    formset = BusinessProfileMembershipInlineFormSet
+    extra = 0
+    raw_id_fields = ("user",)
+    fields = ("user", "role", "is_owner", "created_at", "updated_at")
+    readonly_fields = ("created_at", "updated_at")
+    ordering = ("-is_owner", "role", "id")
+    show_change_link = True
+    verbose_name_plural = "Team memberships"
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related("user")
+
+    def has_delete_permission(self, request, obj=None):
+        if obj is not None and obj.is_owner:
+            return False
+        return super().has_delete_permission(request, obj)
+
+
 class ThirdPartyApiRequestLogInline(admin.TabularInline):
     model = ThirdPartyApiRequestLog
     fk_name = "business_profile"
@@ -324,7 +420,11 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     search_fields = ("user__email", "user__username", "business_name", "industry")
     list_filter = ("industry", "plan", "aeo_prompt_expansion_status", "created_at")
     filter_horizontal = ("tracked_competitors",)
-    inlines = (ThirdPartyApiRequestLogInline, ThirdPartyApiErrorLogInline)
+    inlines = (
+        BusinessProfileMembershipInline,
+        ThirdPartyApiRequestLogInline,
+        ThirdPartyApiErrorLogInline,
+    )
     readonly_fields = ("created_at", "updated_at")
     fieldsets = (
         (
