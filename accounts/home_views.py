@@ -137,10 +137,20 @@ def aeo_pass_count_staff_page(request):
         "selected_run_id": "all" if run_id is None else str(run_id),
         "selected_profile_id": "all" if profile_id is None else str(profile_id),
         "business_profiles_for_usage": list(
-            BusinessProfile.objects.order_by("business_name", "pk").values("id", "business_name")[:500]
+            BusinessProfile.objects.select_related("user")
+            .order_by("business_name", "pk")
+            .values("id", "business_name", "user__email", "user__username")[:500]
         ),
         "aeo_runs_for_filter": list(
-            AEOExecutionRun.objects.order_by("-created_at").values("id")[:500]
+            AEOExecutionRun.objects.select_related("profile", "profile__user")
+            .order_by("-created_at", "-id")
+            .values(
+                "id",
+                "profile_id",
+                "profile__business_name",
+                "profile__user__email",
+                "profile__user__username",
+            )[:500]
         ),
     }
     return render(request, "pages/aeo_pass_count_staff.html", ctx)
