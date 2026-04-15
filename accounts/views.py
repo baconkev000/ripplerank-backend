@@ -2104,10 +2104,11 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
     Optional ``ready_only`` filters to monitored rows that are ``fully_ready`` (global).
     """
     from .aeo.aeo_extraction_utils import (
-        brand_effectively_cited,
         citations_ranking_for_prompt_coverage,
         merge_citations_rankings_across_platform_cells,
         merged_target_url_position,
+        root_domain_from_fragment,
+        tracked_domain_listed_in_competitors,
         unique_business_count_excluding_target,
     )
     from .models import AEOExecutionRun, AEOResponseSnapshot, AEORecommendationRun
@@ -2173,11 +2174,6 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
         ranking: list = []
         target_url_position = None
         if latest_ex is not None:
-            cited = brand_effectively_cited(
-                bool(latest_ex.brand_mentioned),
-                latest_ex.competitors_json,
-                tracked_website_url_or_domain=profile_site,
-            )
             comps = latest_ex.competitors_json or []
             competitors_count = len(comps) if isinstance(comps, list) else 0
             ranking, target_url_position = citations_ranking_for_prompt_coverage(
@@ -2187,6 +2183,14 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
                 brand_mentioned=bool(latest_ex.brand_mentioned),
                 tracked_business_name=profile_business_name,
             )
+            tracked_root = root_domain_from_fragment(profile_site) or profile_site.strip().lower().rstrip(".")
+            cited_by_citation_domain = target_url_position is not None
+            cited_by_competitor_domain = (
+                bool(tracked_root)
+                and tracked_domain_listed_in_competitors(tracked_root, latest_ex.competitors_json)
+            )
+            # Prompt-table citation attribution should rely on profile URL/domain evidence only.
+            cited = bool(cited_by_citation_domain or cited_by_competitor_domain)
         return {
             "has_data": True,
             "cited": cited,
@@ -2513,17 +2517,25 @@ def _patch_prompt_coverage_response_live(profile: BusinessProfile, payload: dict
     from django.core.cache import cache
 
     from .aeo.aeo_plan_targets import aeo_should_run_post_payment_expansion, aeo_testing_mode
-    from .aeo.visibility_pending import aeo_visibility_pending_breakdown
+    from .aeo.visibility_pending import (
+        aeo_banner_visibility_pending_breakdown,
+        aeo_visibility_pending_breakdown,
+    )
     from .tasks import aeo_repair_stalled_visibility_pipeline_task
 
-    b = aeo_visibility_pending_breakdown(profile)
+    # Banner flags should reflect latest-run-only semantics (not profile-wide historic artifacts).
+    b = aeo_banner_visibility_pending_breakdown(profile)
     payload["visibility_pending"] = bool(b["visibility_pending"])
     payload["visibility_pending_reasons"] = {
         "execution_inflight": bool(b["execution_inflight"]),
         "latest_run_extractions_inflight": bool(b["latest_run_extractions_inflight"]),
         "snapshots_awaiting_extraction": bool(b["snapshots_awaiting_extraction"]),
     }
+    # Keep recommendation pending live even when base payload came from cache.
+    payload["recommendations_pending"] = bool(_aeo_recommendations_pipeline_pending(profile))
 
+    # Repair gating remains profile-wide by design (fills historical coverage gaps too).
+    b_repair = aeo_visibility_pending_breakdown(profile)
     repair_meta = {"eligible": False, "enqueued": False, "skipped_reason": None}
     if aeo_testing_mode():
         repair_meta["skipped_reason"] = "testing_mode"
@@ -2537,8 +2549,11 @@ def _patch_prompt_coverage_response_live(profile: BusinessProfile, payload: dict
         else:
             cache.set(ckey, 1, timeout=300)
             try:
-                aeo_repair_stalled_visibility_pipeline_task.delay(profile.id)
-                repair_meta["enqueued"] = True
+                if bool(b_repair["visibility_pending"]):
+                    repair_meta["skipped_reason"] = "already_pending"
+                else:
+                    aeo_repair_stalled_visibility_pipeline_task.delay(profile.id)
+                    repair_meta["enqueued"] = True
             except Exception:
                 logger.exception(
                     "[aeo_prompt_coverage] repair enqueue failed profile_id=%s",

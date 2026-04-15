@@ -236,7 +236,7 @@ def test_citations_ranking_order_and_target_position():
     assert rows[1]["url"] == "https://www.example.com/x"
 
 
-def test_citations_ranking_uses_competitor_name_when_not_brand_mentioned():
+def test_citations_ranking_marks_target_by_domain_even_when_brand_flag_false():
     rows, pos = citations_ranking_for_prompt_coverage(
         ["https://example.com"],
         [{"name": "Listed As", "url": "https://example.com"}],
@@ -245,8 +245,8 @@ def test_citations_ranking_uses_competitor_name_when_not_brand_mentioned():
         tracked_business_name="Real Brand Name",
     )
     assert pos == 1
-    assert rows[0]["name"] == "Listed As"
-    assert rows[0]["is_target"] is False
+    assert rows[0]["name"] == "Real Brand Name"
+    assert rows[0]["is_target"] is True
     assert rows[0]["url"] == "https://example.com"
 
 

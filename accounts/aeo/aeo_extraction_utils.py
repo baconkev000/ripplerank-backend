@@ -477,7 +477,7 @@ def citations_ranking_for_prompt_coverage(
     Build UI rows from stored ``citations_json`` (ordered root domains).
 
     Display names come from ``competitors_json`` when a row's URL matches that domain; otherwise a
-    short label derived from the domain. When ``brand_mentioned`` is true and a citation domain
+    short label derived from the domain. Target attribution is domain-based: when a citation domain
     matches the profile site, the row uses ``tracked_business_name`` and ``is_target`` is true.
 
     Returns ``(rows, target_url_position)`` where ``target_url_position`` is the 1-based index of
@@ -498,8 +498,9 @@ def citations_ranking_for_prompt_coverage(
         if is_domain_target and target_pos is None:
             target_pos = pos_counter
 
-        is_target = bool(is_domain_target and brand_mentioned)
-        if brand_mentioned and is_domain_target:
+        # Prompt coverage attribution is always URL/domain-based (not brand_mentioned alone).
+        is_target = bool(is_domain_target)
+        if is_domain_target:
             tb = (tracked_business_name or "").strip()
             display_name = tb if tb else _domain_fallback_display(cite_dom)
         else:
