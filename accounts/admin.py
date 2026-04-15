@@ -285,7 +285,7 @@ class BusinessProfileMembershipInlineForm(forms.ModelForm):
 
     class Meta:
         model = BusinessProfileMembership
-        fields = ("user", "role", "is_owner")
+        fields = ("user", "role", "is_owner", "hidden_from_team_ui")
 
     def clean(self):
         cleaned = super().clean()
@@ -311,6 +311,10 @@ class BusinessProfileMembershipInlineForm(forms.ModelForm):
             if role != BusinessProfileMembership.ROLE_ADMIN:
                 raise ValidationError(
                     {"role": "The owner row must use role “admin”."},
+                )
+            if cleaned.get("hidden_from_team_ui"):
+                raise ValidationError(
+                    {"hidden_from_team_ui": "The owner row cannot be hidden from team UI."},
                 )
         else:
             if is_owner:
@@ -363,7 +367,7 @@ class BusinessProfileMembershipInline(admin.TabularInline):
     formset = BusinessProfileMembershipInlineFormSet
     extra = 0
     raw_id_fields = ("user",)
-    fields = ("user", "role", "is_owner", "created_at", "updated_at")
+    fields = ("user", "role", "is_owner", "hidden_from_team_ui", "created_at", "updated_at")
     readonly_fields = ("created_at", "updated_at")
     ordering = ("-is_owner", "role", "id")
     show_change_link = True

@@ -1597,7 +1597,10 @@ def business_profile_team(request: HttpRequest) -> Response:
         if m_self is None and profile.user_id != request.user.id:
             return Response({"detail": "Forbidden."}, status=403)
         rows = (
-            BusinessProfileMembership.objects.filter(business_profile=profile)
+            BusinessProfileMembership.objects.filter(
+                business_profile=profile,
+                hidden_from_team_ui=False,
+            )
             .select_related("user")
             .order_by("-is_owner", "role", "id")
         )

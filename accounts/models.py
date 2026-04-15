@@ -210,6 +210,13 @@ class BusinessProfileMembership(models.Model):
         default=False,
         help_text="True for the primary account holder (billing owner) of this business profile.",
     )
+    hidden_from_team_ui = models.BooleanField(
+        default=False,
+        help_text=(
+            "When true, keep this membership for access control but hide it from "
+            "customer-facing team member lists."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
