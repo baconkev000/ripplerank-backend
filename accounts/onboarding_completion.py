@@ -35,6 +35,37 @@ def profile_has_active_subscription(profile: BusinessProfile) -> bool:
     return status in ACTIVE_SUBSCRIPTION_STATUSES
 
 
+def effective_dashboard_plan_slug_for_owned_business_profiles(user) -> str:
+    """
+    Effective paid tier for the account holder's owned profiles.
+
+    Mirrors the frontend ``dashboardPlanSlug(profile, subscription)`` rule: prefer
+    ``is_main``, then oldest by id; treat active Stripe with empty plan as starter.
+    """
+    if user is None or not getattr(user, "is_authenticated", False):
+        return "none"
+    qs = BusinessProfile.objects.filter(user=user)
+    bp = qs.filter(is_main=True).first() or qs.order_by("id").first()
+    if bp is None:
+        return "none"
+    raw = str(bp.plan or "").strip().lower()
+    sub_active = profile_has_active_subscription(bp)
+    if raw in ("pro", "professional"):
+        return "pro"
+    if raw in ("advanced", "enterprise", "scale"):
+        return "advanced"
+    if raw == "starter":
+        return "starter"
+    if sub_active:
+        return "starter"
+    return "none"
+
+
+def user_may_create_additional_business_profile(user) -> bool:
+    """Second and subsequent *owned* company profiles require an Advanced plan."""
+    return effective_dashboard_plan_slug_for_owned_business_profiles(user) == "advanced"
+
+
 def profile_has_ranked_keywords(profile: BusinessProfile) -> bool:
     """
     True if we have a non-empty keyword list from onboarding Labs crawl or SEO snapshot cache.

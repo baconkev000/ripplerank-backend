@@ -11,10 +11,28 @@ from accounts.models import (
     BusinessProfile,
     OnboardingOnPageCrawl,
 )
-from accounts.onboarding_completion import business_profile_fully_onboarded, user_has_completed_full_onboarding
+from accounts.onboarding_completion import (
+    business_profile_fully_onboarded,
+    effective_dashboard_plan_slug_for_owned_business_profiles,
+    user_has_completed_full_onboarding,
+)
 from accounts.serializers import _aeo_prompt_target_count
 
 User = get_user_model()
+
+
+@pytest.mark.django_db
+def test_effective_plan_slug_advanced_includes_enterprise_alias():
+    user = User.objects.create_user(username="plan1", email="plan1@example.com", password="x")
+    BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Co",
+        website_url="https://co.example",
+        plan="enterprise",
+        stripe_subscription_status="active",
+    )
+    assert effective_dashboard_plan_slug_for_owned_business_profiles(user) == "advanced"
 
 
 @pytest.mark.django_db

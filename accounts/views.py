@@ -60,7 +60,10 @@ from .dataforseo_utils import (
     sort_top_keywords_for_display,
 )
 from .constants import SEO_SNAPSHOT_TTL
-from .onboarding_completion import user_has_completed_full_onboarding
+from .onboarding_completion import (
+    user_has_completed_full_onboarding,
+    user_may_create_additional_business_profile,
+)
 from .user_identity_reconciliation import (
     authenticate_by_email_candidates,
     reconcile_user_identity_for_email,
@@ -4512,6 +4515,15 @@ def business_profile_list(request: HttpRequest) -> Response:
                     context={"request": request, "viewer_access": access},
                 )
                 return Response(serializer.data, status=200)
+
+    if not is_first and not user_may_create_additional_business_profile(request.user):
+        return Response(
+            {
+                "detail": "Additional company profiles are available on the Advanced plan.",
+                "error": "advanced_plan_required",
+            },
+            status=403,
+        )
 
     serializer = BusinessProfileSerializer(data=data)
     serializer.is_valid(raise_exception=True)
