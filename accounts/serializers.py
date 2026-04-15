@@ -99,6 +99,15 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         required=False,
         allow_blank=True,
     )
+    customer_reach = serializers.ChoiceField(
+        choices=[
+            BusinessProfile.CUSTOMER_REACH_ONLINE,
+            BusinessProfile.CUSTOMER_REACH_LOCAL,
+        ],
+        required=False,
+    )
+    customer_reach_state = serializers.CharField(required=False, allow_blank=True)
+    customer_reach_city = serializers.CharField(required=False, allow_blank=True)
     email = serializers.EmailField(source="user.email", required=False)
     plan = serializers.ChoiceField(
         choices=[
@@ -163,6 +172,9 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "full_name",
             "business_name",
             "business_address",
+            "customer_reach",
+            "customer_reach_state",
+            "customer_reach_city",
             "industry",
             "phone",
             "description",
@@ -353,6 +365,28 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        instance = getattr(self, "instance", None)
+        effective_reach = str(
+            attrs.get(
+                "customer_reach",
+                getattr(instance, "customer_reach", BusinessProfile.CUSTOMER_REACH_ONLINE),
+            )
+            or BusinessProfile.CUSTOMER_REACH_ONLINE
+        ).strip().lower()
+        effective_state = str(
+            attrs.get(
+                "customer_reach_state",
+                getattr(instance, "customer_reach_state", ""),
+            )
+            or ""
+        ).strip()
+        if effective_reach == BusinessProfile.CUSTOMER_REACH_LOCAL and not effective_state:
+            raise serializers.ValidationError(
+                {"customer_reach_state": "State is required when customer_reach is local."}
+            )
+        if effective_reach != BusinessProfile.CUSTOMER_REACH_LOCAL:
+            attrs["customer_reach_state"] = ""
+            attrs["customer_reach_city"] = ""
         if "tracked_competitors" in self.initial_data:
             raw = self.initial_data.get("tracked_competitors")
             if raw is None:

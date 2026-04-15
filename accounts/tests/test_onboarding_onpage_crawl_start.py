@@ -129,6 +129,9 @@ def test_onpage_crawl_enqueues_when_no_reusable_rows(monkeypatch):
             "website_url": "https://newdomain.test",
             "business_name": "Co",
             "location": "US",
+            "customer_reach": "local",
+            "customer_reach_state": "CA",
+            "customer_reach_city": "Los Angeles",
         },
         format="json",
     )
@@ -136,6 +139,35 @@ def test_onpage_crawl_enqueues_when_no_reusable_rows(monkeypatch):
     assert resp.data.get("reused") is not True
     assert len(calls) == 1
     assert OnboardingOnPageCrawl.objects.filter(user=user).count() == 1
+    crawl = OnboardingOnPageCrawl.objects.get(user=user)
+    assert crawl.context.get("customer_reach") == "local"
+    assert crawl.context.get("customer_reach_state") == "CA"
+    assert crawl.context.get("customer_reach_city") == "Los Angeles"
+
+
+@pytest.mark.django_db
+def test_onpage_crawl_requires_state_for_local_customer_reach():
+    user = User.objects.create_user(
+        username="reach-required",
+        email="reach-required@example.com",
+        password="pw",
+    )
+    BusinessProfile.objects.create(user=user, is_main=True)
+    client = APIClient()
+    client.force_authenticate(user=user)
+    resp = client.post(
+        "/api/onboarding/onpage-crawl/",
+        {
+            "website_url": "https://newdomain.test",
+            "business_name": "Co",
+            "location": "US",
+            "customer_reach": "local",
+            "customer_reach_state": "",
+        },
+        format="json",
+    )
+    assert resp.status_code == 400
+    assert "customer_reach_state" in str(resp.data.get("error") or "")
 
 
 @pytest.mark.django_db

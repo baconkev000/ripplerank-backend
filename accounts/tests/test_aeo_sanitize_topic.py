@@ -79,6 +79,34 @@ def test_build_openai_batch_user_content_sanitizes_llm_paths_only():
     assert "Gamma Lock LLC" not in (payload.get("industry") or "")
 
 
+def test_onboarding_business_input_uses_local_city_state_when_reach_is_local():
+    out = aeo_business_input_from_onboarding_payload(
+        business_name="Local Co",
+        website_url="https://local.example.com",
+        location="United States",
+        language="English",
+        selected_topics=["plumbing"],
+        customer_reach="local",
+        customer_reach_state="TX",
+        customer_reach_city="Austin",
+    )
+    assert out.city == "Austin, TX"
+
+
+def test_onboarding_business_input_keeps_existing_online_location_behavior():
+    out = aeo_business_input_from_onboarding_payload(
+        business_name="Online Co",
+        website_url="https://online.example.com",
+        location="Austin, TX",
+        language="English",
+        selected_topics=["software"],
+        customer_reach="online",
+        customer_reach_state="CA",
+        customer_reach_city="San Diego",
+    )
+    assert out.city == "Austin, TX"
+
+
 @pytest.mark.django_db
 def test_build_full_aeo_prompt_plan_prompts_by_topic_keys_match_original_keywords(
     monkeypatch,

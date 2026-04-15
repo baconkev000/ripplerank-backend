@@ -2121,6 +2121,21 @@ def schedule_aeo_prompt_plan_expansion(
             location=str(ctx.get("location") or profile.business_address or ""),
             language=str(ctx.get("language") or ""),
             selected_topics=selected_topics,
+            customer_reach=str(
+                ctx.get("customer_reach")
+                or getattr(profile, "customer_reach", "")
+                or "online"
+            ),
+            customer_reach_state=str(
+                ctx.get("customer_reach_state")
+                or getattr(profile, "customer_reach_state", "")
+                or ""
+            ),
+            customer_reach_city=str(
+                ctx.get("customer_reach_city")
+                or getattr(profile, "customer_reach_city", "")
+                or ""
+            ),
         )
 
         logger.info(
@@ -2300,6 +2315,21 @@ def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
             location=str(ctx.get("location") or profile.business_address or ""),
             language=str(ctx.get("language") or ""),
             selected_topics=selected_topics,
+            customer_reach=str(
+                ctx.get("customer_reach")
+                or getattr(profile, "customer_reach", "")
+                or "online"
+            ),
+            customer_reach_state=str(
+                ctx.get("customer_reach_state")
+                or getattr(profile, "customer_reach_state", "")
+                or ""
+            ),
+            customer_reach_city=str(
+                ctx.get("customer_reach_city")
+                or getattr(profile, "customer_reach_city", "")
+                or ""
+            ),
         )
         target_prompt_count = aeo_effective_monitored_target_for_profile(profile)
         plan = build_full_aeo_prompt_plan(

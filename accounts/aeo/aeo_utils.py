@@ -85,6 +85,9 @@ class AEOPromptBusinessInput:
     niche_modifiers: list[str] = field(default_factory=list)
     differentiators: list[str] = field(default_factory=list)
     language: str = ""
+    customer_reach: str = ""
+    customer_reach_state: str = ""
+    customer_reach_city: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -97,6 +100,9 @@ def aeo_business_input_from_onboarding_payload(
     location: str,
     language: str = "",
     selected_topics: Sequence[str],
+    customer_reach: str = "online",
+    customer_reach_state: str = "",
+    customer_reach_city: str = "",
 ) -> AEOPromptBusinessInput:
     """
     Build prompt-plan context from onboarding step 1+2 POST body (not from profile fields).
@@ -106,7 +112,17 @@ def aeo_business_input_from_onboarding_payload(
     """
     topics = [str(t).strip() for t in selected_topics if str(t).strip()]
     loc = (location or "").strip()
+    reach = str(customer_reach or "online").strip().lower()
+    state = _normalize_city(str(customer_reach_state or ""))
+    city = _normalize_city(str(customer_reach_city or ""))
     city_guess = infer_city_from_address(loc) or _normalize_city(loc[:200])
+    if reach == "local":
+        if city and state:
+            city_guess = f"{city}, {state}" if state.lower() not in city.lower() else city
+        elif city:
+            city_guess = city
+        elif state:
+            city_guess = state
     industry_hint = ", ".join(topics[:6]) if topics else ""
     return AEOPromptBusinessInput(
         industry=industry_hint[:500],
@@ -117,6 +133,9 @@ def aeo_business_input_from_onboarding_payload(
         niche_modifiers=[],
         differentiators=[],
         language=(language or "").strip(),
+        customer_reach=reach,
+        customer_reach_state=state,
+        customer_reach_city=city,
     )
 
 

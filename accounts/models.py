@@ -45,6 +45,13 @@ class TrackedCompetitor(models.Model):
 
 
 class BusinessProfile(models.Model):
+    CUSTOMER_REACH_ONLINE = "online"
+    CUSTOMER_REACH_LOCAL = "local"
+    CUSTOMER_REACH_CHOICES = [
+        (CUSTOMER_REACH_ONLINE, "Online"),
+        (CUSTOMER_REACH_LOCAL, "Local"),
+    ]
+
     SEO_LOCATION_MODE_ORGANIC = "organic"
     SEO_LOCATION_MODE_LOCAL = "local"
     SEO_LOCATION_MODE_CHOICES = [
@@ -68,6 +75,13 @@ class BusinessProfile(models.Model):
     full_name = models.CharField(max_length=255, blank=True)
     business_name = models.CharField(max_length=255, blank=True)
     business_address = models.CharField(max_length=255, blank=True)
+    customer_reach = models.CharField(
+        max_length=16,
+        choices=CUSTOMER_REACH_CHOICES,
+        default=CUSTOMER_REACH_ONLINE,
+    )
+    customer_reach_state = models.CharField(max_length=64, blank=True, default="")
+    customer_reach_city = models.CharField(max_length=128, blank=True, default="")
 
     # Industry is intentionally a free-text field (no choices).
     industry = models.CharField(max_length=255, blank=True)

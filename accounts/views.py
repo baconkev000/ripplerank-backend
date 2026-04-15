@@ -742,6 +742,25 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
     website_url = (request.data.get("website_url") or "").strip()
     business_name = (request.data.get("business_name") or "").strip()
     location = (request.data.get("location") or "").strip()
+    customer_reach = str(request.data.get("customer_reach") or BusinessProfile.CUSTOMER_REACH_ONLINE).strip().lower()
+    customer_reach_state = str(request.data.get("customer_reach_state") or "").strip()
+    customer_reach_city = str(request.data.get("customer_reach_city") or "").strip()
+    if customer_reach not in {
+        BusinessProfile.CUSTOMER_REACH_ONLINE,
+        BusinessProfile.CUSTOMER_REACH_LOCAL,
+    }:
+        customer_reach = BusinessProfile.CUSTOMER_REACH_ONLINE
+    if (
+        customer_reach == BusinessProfile.CUSTOMER_REACH_LOCAL
+        and not customer_reach_state
+    ):
+        return Response(
+            {"error": "customer_reach_state is required when customer_reach is local."},
+            status=400,
+        )
+    if customer_reach != BusinessProfile.CUSTOMER_REACH_LOCAL:
+        customer_reach_state = ""
+        customer_reach_city = ""
     domain = normalize_domain(website_url)
     if not domain:
         return Response({"error": "A valid website_url is required"}, status=400)
@@ -803,7 +822,13 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
             business_profile=profile,
             domain=domain,
             max_pages=10,
-            context={"business_name": business_name, "location": location},
+            context={
+                "business_name": business_name,
+                "location": location,
+                "customer_reach": customer_reach,
+                "customer_reach_state": customer_reach_state,
+                "customer_reach_city": customer_reach_city,
+            },
             status=OnboardingOnPageCrawl.STATUS_PENDING,
         )
         cid = crawl.id
@@ -3929,7 +3954,10 @@ def _onboarding_skip_execution(request: HttpRequest, body: dict) -> bool:
         return v
     if v is not None:
         return _truthy_openai_param(str(v))
-    return _truthy_openai_param(request.GET.get("skip_execution"))
+    q = request.GET.get("skip_execution")
+    if q is None:
+        return False
+    return _truthy_openai_param(q)
 
 
 def _first_nonempty_str(*vals) -> str | None:
@@ -4092,6 +4120,9 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
                             location=str(oc_early.get("location") or ""),
                             language=str(oc_early.get("language") or ""),
                             selected_topics=selected_topics,
+                            customer_reach=str(oc_early.get("customer_reach") or ""),
+                            customer_reach_state=str(oc_early.get("customer_reach_state") or ""),
+                            customer_reach_city=str(oc_early.get("customer_reach_city") or ""),
                         )
                         return Response(
                             {
@@ -4180,6 +4211,9 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
             location=str(oc.get("location") or ""),
             language=str(oc.get("language") or ""),
             selected_topics=selected_topics,
+            customer_reach=str(oc.get("customer_reach") or ""),
+            customer_reach_state=str(oc.get("customer_reach_state") or ""),
+            customer_reach_city=str(oc.get("customer_reach_city") or ""),
         )
         plan = build_full_aeo_prompt_plan(
             profile,
