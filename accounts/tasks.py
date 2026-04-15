@@ -834,8 +834,9 @@ def run_aeo_phase1_execution_task(
             _enqueue_seo_after_aeo(run.id)
             return
         if _is_onboarding_sample_size_profile(profile) and providers is None:
+            # Phase 2 enqueues Phase 4 once when multi-pass work finishes; do not schedule Phase 4 here
+            # (duplicate Phase 4 races on score_snapshot_id / scoring_status and can double-fire Phase 5).
             run_aeo_phase2_confidence_task.delay(run.id, selected)
-            run_aeo_phase4_scoring_task.delay(run.id)
         else:
             run_aeo_phase3_extraction_task.delay(run.id, response_snapshot_ids, extraction_platform)
     except Exception as e:
@@ -982,6 +983,7 @@ def run_aeo_phase2_confidence_task(self, run_id: int, prompt_set: list[dict] | N
             if _round == 0:
                 run.background_status = AEOExecutionRun.STAGE_SKIPPED
                 run.save(update_fields=["background_status", "updated_at"])
+                run_aeo_phase4_scoring_task.delay(run.id)
                 return
             break
         aggs.sort(key=lambda a: (_aggregate_priority_bucket(a), str(a.prompt_hash)))
@@ -1359,44 +1361,71 @@ def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
     from .aeo.aeo_scoring_utils import calculate_aeo_scores_for_business, calculate_layered_scores_from_aggregates
     from .models import AEOScoreSnapshot
 
-    run = AEOExecutionRun.objects.select_related("profile").filter(pk=run_id).first()
-    if not run:
-        logger.warning("[AEO phase4] run not found run_id=%s", run_id)
-        return
-    if run.scoring_status == AEOExecutionRun.STAGE_COMPLETED and run.score_snapshot_id:
-        if _aeo_recommendation_stage_enabled():
-            run_aeo_phase5_recommendation_task.delay(run.id)
+    run: AEOExecutionRun | None = None
+    profile = None
+    idempotent_phase5_rid: int | None = None
+    idempotent_seo_rid: int | None = None
+
+    with transaction.atomic():
+        locked = (
+            AEOExecutionRun.objects.select_for_update()
+            .select_related("profile")
+            .filter(pk=run_id)
+            .first()
+        )
+        if not locked:
+            logger.warning("[AEO phase4] run not found run_id=%s", run_id)
+            return
+        if locked.scoring_status == AEOExecutionRun.STAGE_COMPLETED and locked.score_snapshot_id:
+            if _aeo_recommendation_stage_enabled():
+                idempotent_phase5_rid = locked.id
+            else:
+                locked.recommendation_status = AEOExecutionRun.STAGE_SKIPPED
+                locked.save(update_fields=["recommendation_status", "updated_at"])
+                logger.info(
+                    "[AEO orchestrator] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true reason=phase4_completed_no_phase5",
+                    locked.id,
+                    locked.profile_id,
+                    locked.status,
+                )
+                idempotent_seo_rid = locked.id
+        elif locked.scoring_status == AEOExecutionRun.STAGE_RUNNING:
+            logger.info("[AEO phase4] skip concurrent duplicate run_id=%s profile_id=%s", run_id, locked.profile_id)
+            return
         else:
-            run.recommendation_status = AEOExecutionRun.STAGE_SKIPPED
-            run.save(update_fields=["recommendation_status", "updated_at"])
-            logger.info(
-                "[AEO orchestrator] aeo_run_id=%s profile_id=%s aeo_status=%s seo_trigger_attempted=true reason=phase4_completed_no_phase5",
-                run.id,
-                run.profile_id,
-                run.status,
-            )
-            _enqueue_seo_after_aeo(run.id)
+            locked.scoring_status = AEOExecutionRun.STAGE_RUNNING
+            locked.save(update_fields=["scoring_status", "updated_at"])
+            profile = locked.profile
+            run = locked
+
+    if idempotent_phase5_rid is not None:
+        run_aeo_phase5_recommendation_task.delay(idempotent_phase5_rid)
+        return
+    if idempotent_seo_rid is not None:
+        _enqueue_seo_after_aeo(idempotent_seo_rid)
         return
 
-    run.scoring_status = AEOExecutionRun.STAGE_RUNNING
-    run.save(update_fields=["scoring_status", "updated_at"])
+    assert run is not None and profile is not None
+
     logger.info("[AEO phase4] scoring start run_id=%s profile_id=%s", run.id, run.profile_id)
     try:
-        if _is_onboarding_sample_size_profile(run.profile):
+        if _is_onboarding_sample_size_profile(profile):
             calculate_layered_scores_from_aggregates(
-                run.profile,
+                profile,
                 execution_run_id=run.id,
                 score_layer=AEOScoreSnapshot.LAYER_SAMPLE,
                 save=True,
             )
             score_data = calculate_layered_scores_from_aggregates(
-                run.profile,
+                profile,
                 execution_run_id=run.id,
                 score_layer=AEOScoreSnapshot.LAYER_CONFIDENCE,
                 save=True,
             )
         else:
-            score_data = calculate_aeo_scores_for_business(run.profile, save=True)
+            score_data = calculate_aeo_scores_for_business(
+                profile, save=True, execution_run_id=run.id
+            )
         run.score_snapshot_id = score_data.get("snapshot_id")
         run.scoring_status = AEOExecutionRun.STAGE_COMPLETED
         run.save(update_fields=["score_snapshot_id", "scoring_status", "updated_at"])
@@ -1465,7 +1494,11 @@ def run_aeo_phase5_recommendation_task(self, run_id: int) -> None:
     run.save(update_fields=["recommendation_status", "updated_at"])
     logger.info("[AEO phase5] recommendation start run_id=%s profile_id=%s", run.id, run.profile_id)
     try:
-        data = generate_aeo_recommendations(run.profile, save=True)
+        data = generate_aeo_recommendations(
+            run.profile,
+            save=True,
+            execution_run_id=run.id,
+        )
         run.recommendation_run_id = data.get("recommendation_run_id")
         run.recommendation_status = AEOExecutionRun.STAGE_COMPLETED
         run.save(update_fields=["recommendation_run_id", "recommendation_status", "updated_at"])

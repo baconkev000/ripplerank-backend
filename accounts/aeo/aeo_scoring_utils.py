@@ -716,9 +716,12 @@ def calculate_aeo_scores_for_business(
     business_profile: BusinessProfile,
     *,
     save: bool = True,
+    execution_run_id: int | None = None,
 ) -> dict[str, Any]:
     """
     Load latest extractions for the profile, compute metrics, optionally persist AEOScoreSnapshot.
+
+    When ``execution_run_id`` is set (Phase 4 orchestration), the new row is FK-linked to that run.
 
     Returns computed values plus snapshot_id when saved.
     """
@@ -748,6 +751,7 @@ def calculate_aeo_scores_for_business(
             competitor_dominance=comp_dom,
             total_prompts=len(extractions),
             total_mentions=total_mentions,
+            execution_run_id=execution_run_id,
         )
         snapshot_id = snap.id
 

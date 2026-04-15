@@ -1,4 +1,5 @@
 from concurrent.futures import Future
+from typing import Any
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -17,11 +18,14 @@ from accounts.models import (
 from accounts.aeo.worker_limits import aeo_execution_max_workers
 from accounts.tasks import (
     run_aeo_phase1_execution_task,
+    run_aeo_phase2_confidence_task,
     run_aeo_phase3_extraction_task,
     run_aeo_phase4_scoring_task,
     run_aeo_phase5_recommendation_task,
     trigger_seo_warmup_after_aeo_task,
 )
+from accounts.aeo.aeo_recommendation_utils import generate_aeo_recommendations
+from accounts.aeo.aeo_scoring_utils import calculate_aeo_scores_for_business
 
 
 User = get_user_model()
@@ -358,6 +362,164 @@ def test_phase4_creates_score_snapshot_with_expected_fields(monkeypatch, setting
     score = AEOScoreSnapshot.objects.get(id=run.score_snapshot_id)
     assert score.total_prompts >= 1
     assert score.total_mentions >= 1
+    assert score.execution_run_id == run.id
+
+
+@pytest.mark.django_db
+def test_phase1_sample_profile_enqueues_phase2_only_not_phase4_from_phase1(monkeypatch, settings):
+    """Onboarding-sized profiles: Phase 1 must not schedule Phase 4 (Phase 2 owns that enqueue)."""
+    settings.AEO_TESTING_MODE = False
+    user = User.objects.create_user(username="p1smp", email="p1smp@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Biz",
+        plan=BusinessProfile.PLAN_STARTER,
+    )
+    run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_PENDING)
+    prompt_item = {"prompt": "q1", "type": "transactional", "dynamic": True, "weight": 1.0}
+
+    def fake_batch(selected, profile, save=True, execution_run=None, providers=None, on_result=None, **kwargs):
+        results = []
+        for item in selected:
+            prov = (providers or ["openai"])[0]
+            snap = AEOResponseSnapshot.objects.create(
+                profile=profile,
+                execution_run=execution_run,
+                prompt_text=str(item.get("prompt") or ""),
+                prompt_hash=f"h-{prov}",
+                raw_response="r",
+                platform=prov,
+            )
+            one = {"success": True, "snapshot_id": snap.id}
+            results.append(one)
+            if on_result is not None:
+                cat_item = dict(item)
+                from accounts.aeo.progressive_onboarding import classify_prompt_category
+
+                cat_item["_aeo_category"] = classify_prompt_category(item)
+                on_result(one, {"prompt_obj": cat_item})
+        return {"executed": len(results), "failed": 0, "results": results}
+
+    monkeypatch.setattr("accounts.aeo.aeo_execution_utils.run_aeo_prompt_batch", fake_batch)
+
+    def fake_single_extraction(snapshot, save=True, competitor_hints=None):
+        row = AEOExtractionSnapshot.objects.create(
+            response_snapshot=snapshot,
+            brand_mentioned=True,
+            mention_position="top",
+            mention_count=1,
+            competitors_json=[],
+            citations_json=[],
+            sentiment="neutral",
+            confidence_score=0.9,
+            extraction_model="fake",
+            extraction_parse_failed=False,
+        )
+        return {"extraction_snapshot_id": row.id}
+
+    monkeypatch.setattr("accounts.aeo.aeo_extraction_utils.run_single_extraction", fake_single_extraction)
+
+    phase2_calls: list[tuple] = []
+    phase4_calls: list[int] = []
+    monkeypatch.setattr(
+        "accounts.tasks.run_aeo_phase2_confidence_task.delay",
+        lambda rid, ps=None: phase2_calls.append((rid, ps)),
+    )
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", lambda rid: phase4_calls.append(rid))
+
+    run_aeo_phase1_execution_task(run.id, [prompt_item])
+    run.refresh_from_db()
+    assert run.status == AEOExecutionRun.STATUS_COMPLETED
+    assert len(phase2_calls) == 1
+    assert phase2_calls[0][0] == run.id
+    assert phase4_calls == []
+
+
+@pytest.mark.django_db
+def test_phase2_no_aggregates_enqueues_phase4_once(monkeypatch, settings):
+    settings.AEO_TESTING_MODE = False
+    user = User.objects.create_user(username="p2na", email="p2na@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz")
+    run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_COMPLETED)
+    phase4_calls: list[int] = []
+    monkeypatch.setattr("accounts.tasks.run_aeo_phase4_scoring_task.delay", lambda rid: phase4_calls.append(rid))
+    monkeypatch.setattr("accounts.aeo.perplexity_execution_utils.perplexity_execution_enabled", lambda: False)
+
+    run_aeo_phase2_confidence_task(
+        run.id,
+        [{"prompt": "orphan", "type": "transactional", "dynamic": True, "weight": 1.0}],
+    )
+    run.refresh_from_db()
+    assert run.background_status == AEOExecutionRun.STAGE_SKIPPED
+    assert phase4_calls == [run.id]
+
+
+@pytest.mark.django_db
+def test_calculate_aeo_scores_for_business_links_execution_run_when_saving(settings):
+    settings.AEO_TESTING_MODE = False
+    user = User.objects.create_user(username="p4fk", email="p4fk@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Biz",
+        website_url="https://example.com",
+    )
+    run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_COMPLETED)
+    rsp = AEOResponseSnapshot.objects.create(profile=profile, prompt_text="a", prompt_hash="ha", raw_response="ra")
+    AEOExtractionSnapshot.objects.create(
+        response_snapshot=rsp,
+        brand_mentioned=True,
+        mention_position="top",
+        mention_count=1,
+        competitors_json=[],
+        citations_json=["example.com"],
+        sentiment="positive",
+        confidence_score=0.8,
+        extraction_model="fake",
+        extraction_parse_failed=False,
+    )
+    calculate_aeo_scores_for_business(profile, save=True, execution_run_id=run.id)
+    snap = AEOScoreSnapshot.objects.filter(profile=profile).order_by("-id").first()
+    assert snap is not None
+    assert snap.execution_run_id == run.id
+
+
+@pytest.mark.django_db
+def test_generate_aeo_recommendations_uses_execution_run_score_not_latest(monkeypatch, settings):
+    settings.AEO_RECOMMENDATION_GROUP_GAPS = False
+    user = User.objects.create_user(username="p5sc", email="p5sc@example.com", password="pw")
+    profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Biz", website_url="https://x.com")
+    run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_COMPLETED)
+    older = AEOScoreSnapshot.objects.create(
+        profile=profile,
+        visibility_score=11.0,
+        weighted_position_score=11.0,
+        citation_share=11.0,
+        competitor_dominance_json={},
+        total_prompts=1,
+        total_mentions=1,
+    )
+    AEOScoreSnapshot.objects.create(
+        profile=profile,
+        visibility_score=99.0,
+        weighted_position_score=99.0,
+        citation_share=99.0,
+        competitor_dominance_json={},
+        total_prompts=1,
+        total_mentions=1,
+    )
+    run.score_snapshot_id = older.id
+    run.save(update_fields=["score_snapshot_id", "updated_at"])
+
+    monkeypatch.setattr(
+        "accounts.aeo.aeo_recommendation_utils.latest_extraction_per_response",
+        lambda _bp, **kwargs: [],
+    )
+
+    out = generate_aeo_recommendations(profile, save=False, execution_run_id=run.id)
+    assert out["score_snapshot_id"] == older.id
+    assert out["visibility_score"] == 11.0
 
 
 @pytest.mark.django_db
@@ -595,6 +757,71 @@ def test_phase3_starter_enqueues_phase4_not_phase2(settings, monkeypatch):
 
 
 @pytest.mark.django_db
+def test_phase5_save_recommendation_uses_score_from_execution_run(settings, monkeypatch):
+    settings.AEO_ENABLE_RECOMMENDATION_STAGE = True
+    settings.AEO_RECOMMENDATION_GROUP_GAPS = False
+    settings.AEO_RECOMMENDATION_USE_OPENAI = False
+    user = User.objects.create_user(username="p5lnk", email="p5lnk@example.com", password="pw")
+    profile = BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Biz",
+        website_url="https://example.com",
+    )
+    run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_COMPLETED)
+    snap_run = AEOScoreSnapshot.objects.create(
+        profile=profile,
+        visibility_score=22.0,
+        weighted_position_score=22.0,
+        citation_share=22.0,
+        competitor_dominance_json={},
+        total_prompts=2,
+        total_mentions=2,
+    )
+    AEOScoreSnapshot.objects.create(
+        profile=profile,
+        visibility_score=77.0,
+        weighted_position_score=77.0,
+        citation_share=77.0,
+        competitor_dominance_json={},
+        total_prompts=2,
+        total_mentions=2,
+    )
+    run.score_snapshot_id = snap_run.id
+    run.save(update_fields=["score_snapshot_id", "updated_at"])
+
+    monkeypatch.setattr(
+        "accounts.aeo.aeo_recommendation_utils.latest_extraction_per_response",
+        lambda _bp, **kwargs: [],
+    )
+
+    captured: dict[str, Any] = {}
+
+    def capture_save(bp, **kw):
+        captured["score_snapshot"] = kw.get("score_snapshot")
+        return AEORecommendationRun.objects.create(
+            profile=bp,
+            score_snapshot=kw.get("score_snapshot"),
+            recommendations_json=[],
+            strategies_json=[],
+            visibility_score_at_run=float(kw.get("visibility_score") or 0),
+            weighted_position_score_at_run=float(kw.get("weighted_position_score") or 0),
+            citation_share_at_run=float(kw.get("citation_share") or 0),
+        )
+
+    monkeypatch.setattr("accounts.aeo.aeo_recommendation_utils.save_recommendation_run", capture_save)
+
+    run_aeo_phase5_recommendation_task(run.id)
+    run.refresh_from_db()
+    assert run.recommendation_status == AEOExecutionRun.STAGE_COMPLETED
+    assert captured.get("score_snapshot") is not None
+    assert captured["score_snapshot"].id == snap_run.id
+    assert run.recommendation_run_id is not None
+    rec = AEORecommendationRun.objects.get(id=run.recommendation_run_id)
+    assert rec.score_snapshot_id == snap_run.id
+
+
+@pytest.mark.django_db
 def test_phase5_reinvocation_calls_generate_twice(settings, monkeypatch):
     settings.AEO_ENABLE_RECOMMENDATION_STAGE = True
     user = User.objects.create_user(username="p5r", email="p5r@example.com", password="pw")
@@ -602,7 +829,8 @@ def test_phase5_reinvocation_calls_generate_twice(settings, monkeypatch):
     run = AEOExecutionRun.objects.create(profile=profile, status=AEOExecutionRun.STATUS_COMPLETED)
     calls: list[int] = []
 
-    def fake_gen(profile, save=True, **_kwargs):
+    def fake_gen(profile, save=True, **kwargs):
+        assert kwargs.get("execution_run_id") == run.id
         calls.append(1)
         row = AEORecommendationRun.objects.create(
             profile=profile,

@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from django.conf import settings
 
 from ..models import (
+    AEOExecutionRun,
     AEOExtractionSnapshot,
     AEORecommendationRun,
     AEOScoreSnapshot,
@@ -2235,10 +2236,16 @@ def generate_aeo_recommendations(
     group_gaps: bool | None = None,
     verbosity: str = AEO_RECOMMENDATION_VERBOSITY_COMPACT,
     multi_angle: bool = False,
+    score_snapshot_id: int | None = None,
+    execution_run_id: int | None = None,
 ) -> dict[str, Any]:
     """
     Build a short prioritized to-do list (max leaves from ``AEO_RECOMMENDATION_MAX_LEAVES`` setting) from the
-    latest score snapshot and latest extraction per response.
+    score snapshot (see below) and latest extraction per response.
+
+    Score selection (first match wins): explicit ``score_snapshot_id`` for this profile; else
+    ``AEOExecutionRun.score_snapshot_id`` when ``execution_run_id`` is set; else latest snapshot by
+    ``created_at`` (legacy behavior).
 
     Gap clustering defaults from ``AEO_RECOMMENDATION_GROUP_GAPS`` (override with ``group_gaps=True/False``).
     Strategies flatten actions into a single flat to-do list for the Actions UI.
@@ -2246,9 +2253,30 @@ def generate_aeo_recommendations(
     When ``enrich_with_nl`` is True, ``generate_natural_language_recommendation`` may call OpenAI if
     ``AEO_RECOMMENDATION_USE_OPENAI`` is enabled; otherwise template copy is used.
     """
-    score = (
-        business_profile.aeo_score_snapshots.order_by("-created_at").select_related("profile").first()
-    )
+    score: AEOScoreSnapshot | None = None
+    if score_snapshot_id is not None:
+        score = (
+            business_profile.aeo_score_snapshots.filter(pk=int(score_snapshot_id))
+            .select_related("profile")
+            .first()
+        )
+    elif execution_run_id is not None:
+        erun = (
+            AEOExecutionRun.objects.filter(pk=int(execution_run_id), profile=business_profile)
+            .only("score_snapshot_id")
+            .first()
+        )
+        sid = int(erun.score_snapshot_id) if erun and erun.score_snapshot_id else None
+        if sid is not None:
+            score = (
+                business_profile.aeo_score_snapshots.filter(pk=sid)
+                .select_related("profile")
+                .first()
+            )
+    if score is None:
+        score = (
+            business_profile.aeo_score_snapshots.order_by("-created_at").select_related("profile").first()
+        )
     extractions = latest_extraction_per_response(business_profile)
     site = (getattr(business_profile, "website_url", None) or "").strip()
 

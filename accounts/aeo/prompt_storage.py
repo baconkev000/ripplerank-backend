@@ -115,8 +115,7 @@ def plan_items_from_profile_selected(
     """
     Build Phase-1 / Phase-2 ``prompt_set`` dicts from stored profile JSON (mixed str/dict).
     """
-    from .aeo_plan_targets import AEO_ONBOARDING_PROMPT_COUNT
-    from .aeo_utils import prompt_record
+    from .aeo_utils import AEO_ONBOARDING_PROMPT_COUNT, prompt_record
 
     cap = AEO_ONBOARDING_PROMPT_COUNT if max_items is None else max(1, int(max_items))
     out: list[dict[str, Any]] = []
