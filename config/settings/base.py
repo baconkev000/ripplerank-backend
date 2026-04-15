@@ -4,6 +4,7 @@
 from pathlib import Path
 import os
 import environ
+from celery.schedules import crontab
 
 BASE_DIR = Path(__file__).resolve(strict=True).parent.parent.parent
 # swivl/
@@ -274,6 +275,22 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_BACKEND = None  # we don't need to store task results for SEO tasks
 CELERY_TASK_IGNORE_RESULT = True
 CELERY_TIMEZONE = TIME_ZONE
+# Periodic full AEO monitoring re-run (optional). Task body no-ops unless enabled + profile IDs set.
+# Env: AEO_SCHEDULED_FULL_MONITORING_ENABLED (default false), AEO_SCHEDULED_FULL_MONITORING_PROFILE_IDS
+# (comma-separated ints; empty = no-op), AEO_SCHEDULED_FULL_MONITORING_CRON_HOUR / _CRON_MINUTE (UTC).
+AEO_SCHEDULED_FULL_MONITORING_ENABLED = env.bool("AEO_SCHEDULED_FULL_MONITORING_ENABLED", default=False)
+AEO_SCHEDULED_FULL_MONITORING_PROFILE_IDS = env.list("AEO_SCHEDULED_FULL_MONITORING_PROFILE_IDS", default=[])
+AEO_SCHEDULED_FULL_MONITORING_CRON_HOUR = env.int("AEO_SCHEDULED_FULL_MONITORING_CRON_HOUR", default=4)
+AEO_SCHEDULED_FULL_MONITORING_CRON_MINUTE = env.int("AEO_SCHEDULED_FULL_MONITORING_CRON_MINUTE", default=0)
+CELERY_BEAT_SCHEDULE = {
+    "aeo-scheduled-full-monitoring": {
+        "task": "accounts.tasks.aeo_scheduled_full_monitoring_tick_task",
+        "schedule": crontab(
+            hour=AEO_SCHEDULED_FULL_MONITORING_CRON_HOUR,
+            minute=AEO_SCHEDULED_FULL_MONITORING_CRON_MINUTE,
+        ),
+    },
+}
 # Optional split workers: celery -A config worker -Q celery,aeo_openai,aeo_gemini
 # Phase-2 still runs in-process today; dedicated provider tasks can use these via apply_async(queue=...).
 AEO_OPENAI_CELERY_QUEUE = env("AEO_OPENAI_CELERY_QUEUE", default="celery")

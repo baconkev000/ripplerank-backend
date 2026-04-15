@@ -29,6 +29,18 @@
     </div>
   </form>
 
+  <form method="post" class="mb-3">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="full_rerun" />
+    <input type="hidden" name="aeo_full_rerun_profile_id" value="{{ selected_profile_id }}" />
+    <input type="hidden" name="redirect_run_id" value="{{ selected_run_id }}" />
+    <input type="hidden" name="redirect_profile_id" value="{{ selected_profile_id }}" />
+    <button type="submit" class="btn btn-outline-danger btn-sm" {% if selected_profile_id == "all" %}disabled title="Choose a profile in the filter above (not All)"{% endif %}>
+      Full monitored-pipeline re-run
+    </button>
+    <span class="text-muted small ms-2">All prompts on profile · Phase 1→5 · <code>force_refresh</code> · skips if a run is already pending/running</span>
+  </form>
+
   <div class="row">
     <div class="col-md-6">
       <ul class="list-group mb-3">

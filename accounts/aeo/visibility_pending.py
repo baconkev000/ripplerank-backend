@@ -114,6 +114,106 @@ def aeo_visibility_pending_breakdown(profile: BusinessProfile) -> dict[str, Any]
     }
 
 
+def aeo_banner_visibility_pending_breakdown(profile: BusinessProfile) -> dict[str, Any]:
+    """
+    Progress-banner semantics: tie visibility flags to the **latest** ``AEOExecutionRun`` only.
+
+    - ``execution_inflight``: latest run exists and is ``pending`` or ``running``.
+    - ``latest_run_extractions_inflight``: unchanged (already defined on latest run).
+    - ``snapshots_awaiting_extraction``: monitored prompts whose **latest per-platform** snapshot
+      for rows with ``execution_run_id == latest_run.id`` lacks an extraction (ignores older runs).
+
+    Prompt-coverage **grid cells** may still use profile-wide latest snapshots; this breakdown is for
+    ``visibility_pending`` on the dashboard banner only.
+    """
+    from accounts.models import AEOResponseSnapshot, AEOExecutionRun
+
+    monitored = monitored_prompt_keys_in_order(profile.selected_aeo_prompts)
+    if not monitored:
+        return {
+            "execution_inflight": False,
+            "latest_run_extractions_inflight": False,
+            "snapshots_awaiting_extraction": False,
+            "visibility_pending": False,
+        }
+
+    latest_run = (
+        AEOExecutionRun.objects.filter(profile=profile).order_by("-created_at", "-id").first()
+    )
+
+    execution_inflight = bool(
+        latest_run is not None
+        and latest_run.status
+        in (AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING)
+    )
+
+    latest_run_extractions_inflight = False
+    if latest_run is not None and latest_run.status == AEOExecutionRun.STATUS_COMPLETED:
+        if latest_run.extraction_status in (
+            AEOExecutionRun.STAGE_PENDING,
+            AEOExecutionRun.STAGE_RUNNING,
+        ):
+            latest_run_extractions_inflight = True
+
+    responses = []
+    if latest_run is not None:
+        responses = list(
+            AEOResponseSnapshot.objects.filter(profile=profile, execution_run_id=latest_run.id)
+            .order_by("-created_at", "-id")
+            .prefetch_related("extraction_snapshots")
+        )
+
+    by_prompt: dict[str, list] = {}
+    for resp in responses:
+        key = (resp.prompt_text or "").strip()
+        if not key:
+            continue
+        by_prompt.setdefault(key, []).append(resp)
+
+    def _response_sort_key(x: Any) -> tuple:
+        c = x.created_at
+        if c is None:
+            return (datetime.min.replace(tzinfo=timezone.utc), x.id)
+        if django_timezone.is_naive(c):
+            c = django_timezone.make_aware(c, timezone.utc)
+        return (c, x.id)
+
+    def latest_snapshot_per_platform(rows: list) -> dict[str, Any]:
+        best: dict[str, Any] = {}
+        for r in sorted(rows, key=_response_sort_key, reverse=True):
+            plat = str(r.platform or "").strip().lower()
+            if plat not in _AEO_COVERAGE_PLATFORM_SET:
+                continue
+            if plat not in best:
+                best[plat] = r
+        return best
+
+    snapshots_awaiting_extraction = False
+    for key in monitored:
+        rows = by_prompt.get(key, [])
+        plat_latest = latest_snapshot_per_platform(rows)
+        for plat in _AEO_PENDING_PLATFORM_ORDER:
+            if plat not in plat_latest:
+                continue
+            resp = plat_latest[plat]
+            if not resp.extraction_snapshots.exists():
+                snapshots_awaiting_extraction = True
+                break
+        if snapshots_awaiting_extraction:
+            break
+
+    visibility_pending = (
+        execution_inflight or latest_run_extractions_inflight or snapshots_awaiting_extraction
+    )
+
+    return {
+        "execution_inflight": execution_inflight,
+        "latest_run_extractions_inflight": latest_run_extractions_inflight,
+        "snapshots_awaiting_extraction": snapshots_awaiting_extraction,
+        "visibility_pending": visibility_pending,
+    }
+
+
 def aeo_visibility_pipeline_quiescent(profile: BusinessProfile) -> bool:
     """True when no visibility-related pipeline leg is actively processing."""
     b = aeo_visibility_pending_breakdown(profile)

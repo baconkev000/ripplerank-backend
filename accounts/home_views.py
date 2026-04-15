@@ -4,8 +4,12 @@ Site home page: optional staff-only third-party API usage charts.
 
 from __future__ import annotations
 
-from django.shortcuts import render
+from urllib.parse import urlencode
+
+from django.contrib import messages
 from django.http import HttpResponseForbidden
+from django.shortcuts import redirect, render
+from django.urls import reverse
 from django.utils.translation import gettext as _
 
 from accounts.models import BusinessProfile
@@ -71,6 +75,45 @@ def site_home(request):
 def aeo_pass_count_staff_page(request):
     if not request.user.is_authenticated or not request.user.is_staff:
         return HttpResponseForbidden("Staff only")
+
+    if request.method == "POST":
+        from accounts.tasks import try_enqueue_aeo_full_monitored_pipeline
+
+        if request.POST.get("action") == "full_rerun":
+            pid_str = (request.POST.get("aeo_full_rerun_profile_id") or "").strip()
+            if pid_str in ("", "all"):
+                messages.warning(
+                    request,
+                    "Select a specific business profile (not All) to enqueue a full monitored-prompt pipeline re-run.",
+                )
+            else:
+                try:
+                    pid = int(pid_str)
+                except (TypeError, ValueError):
+                    messages.error(request, "Invalid profile id.")
+                else:
+                    out = try_enqueue_aeo_full_monitored_pipeline(pid, source="staff_aeo_pass_counts")
+                    if out.get("queued"):
+                        messages.success(
+                            request,
+                            f"{out.get('message', 'Enqueued.')} Run id {out.get('run_id')}.",
+                        )
+                    elif out.get("reason") == "duplicate_inflight":
+                        messages.warning(request, out.get("message") or "A run is already in progress.")
+                    elif out.get("reason") == "no_prompts":
+                        messages.warning(request, out.get("message") or "No monitored prompts on profile.")
+                    elif not out.get("ok"):
+                        messages.error(request, out.get("message") or "Could not enqueue pipeline.")
+                    else:
+                        messages.info(request, out.get("message") or "Done.")
+        else:
+            messages.error(request, "Unknown action.")
+
+        base = reverse("staff-aeo-pass-counts")
+        rp = (request.POST.get("redirect_run_id") or "all").strip() or "all"
+        pp = (request.POST.get("redirect_profile_id") or "all").strip() or "all"
+        return redirect(f"{base}?{urlencode({'run_id': rp, 'profile_id': pp})}")
+
     run_raw = request.GET.get("run_id")
     profile_raw = request.GET.get("profile_id")
     run_id: int | None = None

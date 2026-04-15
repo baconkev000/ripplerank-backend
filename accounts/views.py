@@ -2087,18 +2087,21 @@ def _improvement_recommendations_for_prompt(
 
 def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: bool = False) -> dict:
     """
-    One row per monitored / seen prompt; per-platform (OpenAI / Gemini / Perplexity) cells from latest snapshot each.
+    One row per monitored / seen prompt; per-platform cells use **profile-wide** latest snapshots
+    (what models show now in the grid).
 
     Extra keys for clients:
     - ``prompt_scan_total``: len(monitored prompts), same basis as ``monitored_count``.
-    - ``prompt_scan_completed``: monitored prompts with latest response per platform each
-      having ≥1 extraction (see ``_aeo_prompt_scan_completed_count``).
-    - ``visibility_pending``: same semantics as the AEO visibility bundle — true while
-      execution or extractions are still in flight; UI should keep a "working" affordance
-      even when ``prompt_scan_completed`` reaches ``prompt_scan_total``.
-    - ``fully_ready`` / ``monitored`` per row; ``full_phase_*`` for a single progress + ETA bar
-      (see ``accounts.aeo.prompt_full_ready``). Optional ``ready_only`` filters to monitored
-      rows that are ``fully_ready``.
+    - ``prompt_scan_completed``: for the **progress banner**, counts monitored prompts whose
+      latest per-platform row is limited to ``AEOResponseSnapshot`` rows for the **newest**
+      ``AEOExecutionRun`` only (triple extraction complete on that run).
+    - ``visibility_pending`` / ``visibility_pending_reasons``: banner semantics scoped to the
+      latest execution run (see ``aeo_banner_visibility_pending_breakdown``); repair / other
+      helpers may still use the global breakdown elsewhere.
+    - Per-row ``fully_ready`` still uses **global** snapshots + latest aggregate (grid semantics).
+    - ``full_phase_*`` (completed count, target, ETA) use the **latest run** only for completion
+      detection and ETA start times (``merge_eta_state_after_completions`` with run id).
+    Optional ``ready_only`` filters to monitored rows that are ``fully_ready`` (global).
     """
     from .aeo.aeo_extraction_utils import (
         brand_effectively_cited,
@@ -2107,7 +2110,7 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
         merged_target_url_position,
         unique_business_count_excluding_target,
     )
-    from .models import AEOResponseSnapshot, AEORecommendationRun
+    from .models import AEOExecutionRun, AEOResponseSnapshot, AEORecommendationRun
 
     from .aeo.prompt_storage import (
         custom_prompt_flags_by_text,
@@ -2133,6 +2136,17 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
         if not key:
             continue
         by_prompt.setdefault(key, []).append(resp)
+
+    latest_run = AEOExecutionRun.objects.filter(profile=profile).order_by("-created_at", "-id").first()
+    by_prompt_latest_run: dict[str, list] = {}
+    if latest_run is not None:
+        for resp in responses:
+            if getattr(resp, "execution_run_id", None) != latest_run.id:
+                continue
+            key_lr = (resp.prompt_text or "").strip()
+            if not key_lr:
+                continue
+            by_prompt_latest_run.setdefault(key_lr, []).append(resp)
 
     def _response_sort_key(x):
         c = x.created_at
@@ -2290,18 +2304,24 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
     tracked_name = profile_business_name
     prompt_scan_total = len(monitored_keys)
     prompt_scan_completed = prompt_scan_completed_count(
-        monitored_keys, by_prompt, latest_snapshot_per_platform
+        monitored_keys, by_prompt_latest_run, latest_snapshot_per_platform
     )
-    from .aeo.visibility_pending import aeo_visibility_pending_breakdown
+    from .aeo.visibility_pending import aeo_banner_visibility_pending_breakdown
 
-    _vis_bd = aeo_visibility_pending_breakdown(profile)
+    _vis_bd = aeo_banner_visibility_pending_breakdown(profile)
     visibility_pending = bool(_vis_bd["visibility_pending"])
     prompt_fill_target = aeo_effective_monitored_target_for_profile(profile)
     recommendations_pending = _aeo_recommendations_pipeline_pending(profile)
 
+    _lr_id = latest_run.id if latest_run is not None else None
     per_key_ready = {
-        k: aeo_full_ready.monitored_prompt_fully_ready(
-            k, profile, by_prompt, latest_snapshot_per_platform, recs_settled
+        k: aeo_full_ready.monitored_prompt_fully_ready_for_execution_run(
+            k,
+            profile,
+            by_prompt_latest_run,
+            latest_snapshot_per_platform,
+            recs_settled,
+            _lr_id,
         )
         for k in monitored_keys
     }
@@ -2314,7 +2334,10 @@ def _build_aeo_prompt_coverage_payload(profile: BusinessProfile, ready_only: boo
     with transaction.atomic():
         locked = BusinessProfile.objects.select_for_update().get(pk=profile.pk)
         durations = aeo_full_ready.merge_eta_state_after_completions(
-            locked, monitored_keys, per_key_ready
+            locked,
+            monitored_keys,
+            per_key_ready,
+            execution_run_id=_lr_id,
         )
 
     full_phase_eta_seconds, full_phase_eta_cold_start = aeo_full_ready.compute_full_phase_eta_seconds(

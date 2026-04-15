@@ -102,6 +102,15 @@ def get_latest_aggregate_for_prompt(profile_id: int, prompt_text: str) -> AEOPro
     )
 
 
+def get_aggregate_for_prompt_and_run(
+    profile_id: int, prompt_text: str, execution_run_id: int
+) -> AEOPromptExecutionAggregate | None:
+    h = hash_prompt(prompt_text)
+    return AEOPromptExecutionAggregate.objects.filter(
+        profile_id=profile_id, prompt_hash=h, execution_run_id=execution_run_id
+    ).first()
+
+
 def triple_extraction_complete_for_key(
     key: str,
     by_prompt: dict[str, list],
@@ -149,6 +158,28 @@ def monitored_prompt_fully_ready(
     return phase2_passes_complete(agg)
 
 
+def monitored_prompt_fully_ready_for_execution_run(
+    monitored_key: str,
+    profile: BusinessProfile,
+    by_prompt: dict[str, list],
+    latest_snapshot_per_platform: Callable[[list], dict[str, Any]],
+    recs_settled: bool,
+    execution_run_id: int | None,
+) -> bool:
+    """
+    Same as ``monitored_prompt_fully_ready`` but triple-extraction and Phase-2 aggregate are scoped
+    to a single ``AEOExecutionRun`` (progress bar / ``full_phase_*`` counts on the latest run).
+    """
+    if not recs_settled:
+        return False
+    if execution_run_id is None:
+        return False
+    if not triple_extraction_complete_for_key(monitored_key, by_prompt, latest_snapshot_per_platform):
+        return False
+    agg = get_aggregate_for_prompt_and_run(profile.id, monitored_key, int(execution_run_id))
+    return phase2_passes_complete(agg)
+
+
 def prompt_fully_ready(
     monitored_key: str,
     profile: BusinessProfile,
@@ -167,6 +198,21 @@ def prompt_fully_ready(
 def first_snapshot_created_at(profile_id: int, prompt_text: str) -> datetime | None:
     m = (
         AEOResponseSnapshot.objects.filter(profile_id=profile_id, prompt_text=prompt_text)
+        .aggregate(m=Min("created_at"))
+        .get("m")
+    )
+    return m
+
+
+def first_snapshot_created_at_for_run(
+    profile_id: int, prompt_text: str, execution_run_id: int
+) -> datetime | None:
+    m = (
+        AEOResponseSnapshot.objects.filter(
+            profile_id=profile_id,
+            prompt_text=prompt_text,
+            execution_run_id=execution_run_id,
+        )
         .aggregate(m=Min("created_at"))
         .get("m")
     )
@@ -229,6 +275,8 @@ def merge_eta_state_after_completions(
     monitored_keys: list[str],
     per_key_fully_ready: dict[str, bool],
     now: datetime | None = None,
+    *,
+    execution_run_id: int | None = None,
 ) -> list[float]:
     """
     Append durations for prompts that just became fully_ready (by prompt hash dedupe).
@@ -250,7 +298,10 @@ def merge_eta_state_after_completions(
         h = hash_prompt(key)
         if h in recorded:
             continue
-        first_at = first_snapshot_created_at(profile.id, key)
+        if execution_run_id is not None:
+            first_at = first_snapshot_created_at_for_run(profile.id, key, int(execution_run_id))
+        else:
+            first_at = first_snapshot_created_at(profile.id, key)
         if first_at is None:
             continue
         if django_timezone.is_naive(first_at):

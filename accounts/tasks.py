@@ -1530,6 +1530,125 @@ def run_aeo_phase5_recommendation_task(self, run_id: int) -> None:
         _enqueue_seo_after_aeo(run.id)
 
 
+def try_enqueue_aeo_full_monitored_pipeline(profile_id: int, *, source: str = "") -> dict[str, Any]:
+    """
+    Enqueue Phase 1 for **all** prompts on ``BusinessProfile.selected_aeo_prompts`` (via
+    ``plan_items_from_saved_prompt_strings``), with ``force_refresh=True`` — same path as production
+    refresh (Phase 1 → Phase 3 / Phase 2 chain → Phase 4 → Phase 5).
+
+    Used by staff UI and optional Celery Beat (``aeo_scheduled_full_monitoring_tick_task``).
+
+    Returns keys: ``ok``, ``queued``, ``run_id``, ``reason``, ``message``, ``prompt_count``.
+    Does not start a new run while another is ``pending`` or ``running`` for the profile.
+    """
+    from django.db import transaction
+
+    from .aeo.aeo_utils import plan_items_from_saved_prompt_strings
+    from .aeo.prompt_storage import monitored_prompt_keys_in_order
+    from .models import AEOExecutionRun, BusinessProfile
+
+    pid = int(profile_id)
+    profile = BusinessProfile.objects.filter(pk=pid).first()
+    if profile is None:
+        return {
+            "ok": False,
+            "queued": False,
+            "run_id": None,
+            "reason": "profile_not_found",
+            "message": "Business profile not found.",
+            "prompt_count": 0,
+        }
+
+    saved = list(profile.selected_aeo_prompts or [])
+    monitored_n = len(monitored_prompt_keys_in_order(saved))
+    payload = plan_items_from_saved_prompt_strings(saved)
+    if not payload:
+        return {
+            "ok": False,
+            "queued": False,
+            "run_id": None,
+            "reason": "no_prompts",
+            "message": "No monitored prompts on this profile.",
+            "prompt_count": monitored_n,
+        }
+
+    inflight = AEOExecutionRun.objects.filter(
+        profile=profile,
+        status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+    ).exists()
+    if inflight:
+        return {
+            "ok": True,
+            "queued": False,
+            "run_id": None,
+            "reason": "duplicate_inflight",
+            "message": "A pipeline run is already in progress for this profile.",
+            "prompt_count": monitored_n,
+        }
+
+    tag = (source or "").strip()[:400]
+    em = "full_rerun"
+    if tag:
+        em = f"{em} source={tag}"[:2000]
+
+    with transaction.atomic():
+        run = AEOExecutionRun.objects.create(
+            profile_id=pid,
+            prompt_count_requested=len(payload),
+            status=AEOExecutionRun.STATUS_PENDING,
+            error_message=em,
+        )
+        rid = int(run.id)
+        ps = list(payload)
+        transaction.on_commit(
+            lambda: run_aeo_phase1_execution_task.delay(rid, prompt_set=ps, force_refresh=True)
+        )
+
+    return {
+        "ok": True,
+        "queued": True,
+        "run_id": rid,
+        "reason": "enqueued",
+        "message": f"Enqueued full monitoring pipeline for {len(payload)} prompt(s).",
+        "prompt_count": monitored_n,
+    }
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def aeo_scheduled_full_monitoring_tick_task(self) -> None:
+    """
+    Celery Beat hook for scheduled full AEO re-runs.
+
+    Controlled by Django settings (env-backed):
+    - ``AEO_SCHEDULED_FULL_MONITORING_ENABLED`` — master switch (default False).
+    - ``AEO_SCHEDULED_FULL_MONITORING_PROFILE_IDS`` — list of BusinessProfile pk to enqueue each tick;
+      when empty, this task no-ops even if enabled (safe default: staff manual only until IDs are set).
+    - ``AEO_SCHEDULED_FULL_MONITORING_CRON_HOUR`` / ``_MINUTE`` — schedule registered in ``CELERY_BEAT_SCHEDULE``.
+    """
+    from django.conf import settings
+
+    if not bool(getattr(settings, "AEO_SCHEDULED_FULL_MONITORING_ENABLED", False)):
+        return
+    raw_ids = getattr(settings, "AEO_SCHEDULED_FULL_MONITORING_PROFILE_IDS", None) or []
+    if not raw_ids:
+        logger.info("[AEO cron] tick skipped (AEO_SCHEDULED_FULL_MONITORING_PROFILE_IDS empty)")
+        return
+    for raw in raw_ids:
+        try:
+            pid = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("[AEO cron] skip non-int profile id %r", raw)
+            continue
+        out = try_enqueue_aeo_full_monitored_pipeline(pid, source="scheduled_cron")
+        logger.info(
+            "[AEO cron] profile_id=%s reason=%s queued=%s run_id=%s",
+            pid,
+            out.get("reason"),
+            out.get("queued"),
+            out.get("run_id"),
+        )
+
+
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def trigger_seo_warmup_after_aeo_task(self, run_id: int) -> None:
     """
