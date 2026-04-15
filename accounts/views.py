@@ -137,6 +137,141 @@ def _plan_label_from_slug(raw_plan: str) -> str:
     return "Starter"
 
 
+def _billing_payment_method_from_object(raw_pm: object) -> dict | None:
+    """
+    Extract safe card metadata from a Stripe PaymentMethod-like object.
+
+    Returns only non-sensitive fields for API responses:
+    ``brand``, ``last4``, ``exp_month``, ``exp_year``, optional ``funding``.
+    """
+    pm = normalize_stripe_payload(raw_pm)
+    if not isinstance(pm, dict):
+        return None
+    card = pm.get("card")
+    if not isinstance(card, dict):
+        return None
+    brand = str(card.get("brand") or "").strip().lower()
+    last4 = str(card.get("last4") or "").strip()
+    exp_month = card.get("exp_month")
+    exp_year = card.get("exp_year")
+    funding = str(card.get("funding") or "").strip().lower()
+    try:
+        em = int(exp_month)
+        ey = int(exp_year)
+    except (TypeError, ValueError):
+        return None
+    if not brand or not last4:
+        return None
+    out = {
+        "brand": brand,
+        "last4": last4[-4:],
+        "exp_month": em,
+        "exp_year": ey,
+    }
+    if funding:
+        out["funding"] = funding
+    return out
+
+
+def _billing_payment_method_from_id(pm_id: object) -> dict | None:
+    pid = str(pm_id or "").strip()
+    if not pid:
+        return None
+    try:
+        pm = stripe.PaymentMethod.retrieve(pid)
+        return _billing_payment_method_from_object(pm)
+    except Exception:
+        logger.exception("[billing_summary] failed to retrieve payment method id=%s", pid)
+        return None
+
+
+def _billing_resolve_payment_method(
+    *,
+    customer_id: str,
+    subscription_dict: dict | None,
+    invoice_rows: list[dict] | None,
+) -> dict | None:
+    """
+    Resolve card metadata in priority order:
+    1) subscription default payment method
+    2) customer invoice settings default payment method
+    3) latest paid invoice's payment intent payment method
+    """
+    # 1) Subscription default payment method.
+    sub_default_pm = (
+        subscription_dict.get("default_payment_method")
+        if isinstance(subscription_dict, dict)
+        else None
+    )
+    if sub_default_pm:
+        from_sub = (
+            _billing_payment_method_from_object(sub_default_pm)
+            if isinstance(sub_default_pm, dict)
+            else _billing_payment_method_from_id(sub_default_pm)
+        )
+        if from_sub:
+            return from_sub
+
+    # 2) Customer invoice_settings.default_payment_method.
+    try:
+        cust_obj = stripe.Customer.retrieve(
+            customer_id,
+            expand=["invoice_settings.default_payment_method"],
+        )
+        cust = normalize_stripe_payload(cust_obj)
+        default_pm = _stripe_get_nested(cust, "invoice_settings", "default_payment_method", default=None)
+        if default_pm:
+            from_customer = (
+                _billing_payment_method_from_object(default_pm)
+                if isinstance(default_pm, dict)
+                else _billing_payment_method_from_id(default_pm)
+            )
+            if from_customer:
+                return from_customer
+    except Exception:
+        logger.exception("[billing_summary] failed to retrieve Stripe customer id=%s", customer_id)
+
+    # 3) Latest paid invoice payment intent payment method.
+    rows = invoice_rows if isinstance(invoice_rows, list) else []
+    paid_rows = [
+        r for r in rows if isinstance(r, dict) and str(r.get("status") or "").strip().lower() == "paid"
+    ]
+    for raw in paid_rows:
+        pi_ref = raw.get("payment_intent")
+        if isinstance(pi_ref, dict):
+            pm_candidate = pi_ref.get("payment_method")
+            if pm_candidate:
+                from_pi_obj = (
+                    _billing_payment_method_from_object(pm_candidate)
+                    if isinstance(pm_candidate, dict)
+                    else _billing_payment_method_from_id(pm_candidate)
+                )
+                if from_pi_obj:
+                    return from_pi_obj
+            continue
+        pi_id = str(pi_ref or "").strip()
+        if not pi_id:
+            continue
+        try:
+            pi_obj = stripe.PaymentIntent.retrieve(pi_id, expand=["payment_method"])
+            pi = normalize_stripe_payload(pi_obj)
+            pm = pi.get("payment_method") if isinstance(pi, dict) else None
+            if pm:
+                from_pi = (
+                    _billing_payment_method_from_object(pm)
+                    if isinstance(pm, dict)
+                    else _billing_payment_method_from_id(pm)
+                )
+                if from_pi:
+                    return from_pi
+        except Exception:
+            logger.exception(
+                "[billing_summary] failed to retrieve Stripe payment intent id=%s",
+                pi_id,
+            )
+    return None
+
+
 def _monthly_price_from_price_obj(price_obj: dict) -> tuple[str, int | None]:
     """
     Return display and integer cents/month from Stripe price.
@@ -1583,6 +1718,7 @@ def billing_summary(request: HttpRequest) -> Response:
         "renewal_date": None,
         "currency": "usd",
         "invoices": [],
+        "payment_method": None,
     }
 
     customer_id = str(getattr(profile, "stripe_customer_id", "") or "").strip()
@@ -1602,7 +1738,7 @@ def billing_summary(request: HttpRequest) -> Response:
         try:
             subscription = stripe.Subscription.retrieve(
                 subscription_id,
-                expand=["items.data.price"],
+                expand=["items.data.price", "default_payment_method"],
             )
             nsub = normalize_stripe_payload(subscription)
             if isinstance(nsub, dict):
@@ -1616,7 +1752,7 @@ def billing_summary(request: HttpRequest) -> Response:
                 customer=customer_id,
                 status="all",
                 limit=5,
-                expand=["data.items.data.price"],
+                expand=["data.items.data.price", "data.default_payment_method"],
             )
             nlisted = normalize_stripe_payload(listed)
             rows = nlisted.get("data", []) if isinstance(nlisted, dict) else []
@@ -1646,10 +1782,12 @@ def billing_summary(request: HttpRequest) -> Response:
                         logger.exception("[billing_summary] failed to persist fallback renewal profile_id=%s", profile.id)
 
     latest_paid_at: datetime | None = None
+    invoice_rows: list[dict] = []
     try:
         inv_list = stripe.Invoice.list(customer=customer_id, limit=12)
         ninv = normalize_stripe_payload(inv_list)
         rows = ninv.get("data", []) if isinstance(ninv, dict) else []
+        invoice_rows = rows if isinstance(rows, list) else []
         invoices_out: list[dict] = []
         if isinstance(rows, list):
             for raw in rows:
@@ -1679,6 +1817,12 @@ def billing_summary(request: HttpRequest) -> Response:
         out["invoices"] = invoices_out
     except Exception:
         logger.exception("[billing_summary] failed to list Stripe invoices customer=%s", customer_id)
+
+    out["payment_method"] = _billing_resolve_payment_method(
+        customer_id=customer_id,
+        subscription_dict=subscription_dict if isinstance(subscription_dict, dict) else None,
+        invoice_rows=invoice_rows,
+    )
 
     # Fallback renewal date: 30 days from latest successful payment.
     if out.get("renewal_date") is None and latest_paid_at is not None:
