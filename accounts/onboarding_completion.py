@@ -144,4 +144,17 @@ def user_has_completed_full_onboarding(user) -> bool:
     if user_has_external_workspace_membership(user):
         return True
     profile = resolve_main_business_profile_for_user(user)
-    return business_profile_fully_onboarded(profile)
+    if business_profile_fully_onboarded(profile):
+        return True
+    # Multi-workspace: switching `is_main` to a newer profile can leave the new main
+    # still running the AEO pipeline while another owned profile is already complete.
+    # Middleware and login must still allow /app so the user is not forced back through
+    # first-time onboarding for an established account.
+    owned_qs = BusinessProfile.objects.filter(user=user).order_by("-id")
+    main_id = getattr(profile, "pk", None)
+    if main_id is not None:
+        owned_qs = owned_qs.exclude(pk=main_id)
+    for bp in owned_qs:
+        if business_profile_fully_onboarded(bp):
+            return True
+    return False

@@ -205,3 +205,45 @@ def test_onboarding_crawl_latest_filters_by_domain():
     assert r_a.data["domain"] == "a.com"
     assert (r_a.data["ranked_keywords"] or [{}])[0].get("keyword") == "a"
     assert r_a.data.get("review_topics") == []
+
+
+@pytest.mark.django_db
+def test_onpage_crawl_reuses_completed_crawl_from_sibling_profile_for_same_domain(monkeypatch):
+    monkeypatch.setattr(django_transaction, "on_commit", lambda cb: cb())
+    calls = []
+    monkeypatch.setattr("accounts.tasks.onboarding_onpage_crawl_task.delay", lambda cid: calls.append(cid))
+
+    user = User.objects.create_user(
+        username="reuse-cross-profile",
+        email="reuse-cross-profile@example.com",
+        password="pw",
+    )
+    source_profile = BusinessProfile.objects.create(user=user, is_main=True)
+    target_profile = BusinessProfile.objects.create(user=user, is_main=False)
+    OnboardingOnPageCrawl.objects.create(
+        user=user,
+        business_profile=source_profile,
+        domain="cachedomain.test",
+        status=OnboardingOnPageCrawl.STATUS_COMPLETED,
+        ranked_keywords=[{"keyword": "cached", "search_volume": 50, "rank": 3}],
+        review_topics=[{"topic": "Cached Topic", "category": "service"}],
+    )
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    resp = client.post(
+        "/api/onboarding/onpage-crawl/",
+        {
+            "profile_id": target_profile.id,
+            "website_url": "https://cachedomain.test",
+            "business_name": "Target Co",
+            "location": "US",
+        },
+        format="json",
+    )
+    assert resp.status_code == 200
+    assert resp.data.get("reused") is True
+    assert calls == []
+    cloned = OnboardingOnPageCrawl.objects.filter(user=user, business_profile=target_profile).first()
+    assert cloned is not None
+    assert (cloned.ranked_keywords or [{}])[0].get("keyword") == "cached"

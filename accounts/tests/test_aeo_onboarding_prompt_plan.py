@@ -340,3 +340,57 @@ def test_aeo_onboarding_step2_reuses_db_prompts_same_domain_no_openai(monkeypatc
     assert set(pbt.keys()) == {"Alpha", "Beta"}
     assert len(pbt["Alpha"]) + len(pbt["Beta"]) == 10
     assert all(len(pbt[k]) > 0 for k in pbt)
+
+
+@pytest.mark.django_db
+def test_aeo_onboarding_step2_reuses_sibling_profile_prompts_same_domain_no_openai(monkeypatch, settings):
+    settings.AEO_TESTING_MODE = True
+    user = User.objects.create_user(
+        username="u-aeo-step2-sibling-cache",
+        email="u-aeo-step2-sibling-cache@example.com",
+        password="pw",
+    )
+    source_saved = [f"sibling cached prompt {i}" for i in range(10)]
+    BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="Source Co",
+        website_url="https://example.com",
+        selected_aeo_prompts=source_saved,
+    )
+    target = BusinessProfile.objects.create(
+        user=user,
+        is_main=False,
+        business_name="Target Co",
+        website_url="https://example.com",
+        selected_aeo_prompts=[],
+    )
+
+    def boom(*args, **kwargs):
+        raise AssertionError("build_full_aeo_prompt_plan must not be called when sibling cached prompts are reusable")
+
+    monkeypatch.setattr("accounts.views.build_full_aeo_prompt_plan", boom)
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    resp = client.post(
+        "/api/aeo/onboarding-prompt-plan/",
+        {
+            "profile_id": target.id,
+            "onboarding_step2_prompt_plan": True,
+            "selected_topics": ["Alpha", "Beta"],
+            "onboarding_context": {
+                "business_name": "Target Co",
+                "website_url": "https://www.example.com/services",
+                "location": "US",
+                "language": "English",
+            },
+        },
+        format="json",
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["meta"]["openai_status"] == "reused_saved"
+    pbt = body["prompts_by_topic"]
+    assert set(pbt.keys()) == {"Alpha", "Beta"}
+    assert len(pbt["Alpha"]) + len(pbt["Beta"]) == 10

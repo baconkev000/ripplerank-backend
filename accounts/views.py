@@ -457,7 +457,11 @@ def health_check(_: HttpRequest) -> JsonResponse:
 def auth_status(request: HttpRequest) -> Response:
     """
     Session-aware status for the Next.js app: whether the browser has a Django session
-    and whether the main BusinessProfile looks onboarded (matches google_callback rules).
+    and whether onboarding gates pass for app access.
+
+    For account holders with multiple owned profiles, this is true if the resolved main
+    profile is fully onboarded or any other owned profile is (so switching main to a
+    profile still in progress does not force /onboarding).
     """
     if not request.user.is_authenticated:
         return Response({"authenticated": False, "onboarding_complete": False})
@@ -710,7 +714,12 @@ def _onboarding_domain_claimed_by_other_user(domain: str, user) -> bool:
     return False
 
 
-def _onboarding_reusable_crawl_for_user(user, domain: str) -> OnboardingOnPageCrawl | None:
+def _onboarding_reusable_crawl_for_user(
+    user,
+    domain: str,
+    *,
+    business_profile_id: int | None = None,
+) -> OnboardingOnPageCrawl | None:
     """Latest completed onboarding crawl for this user/domain with keywords and/or review topics."""
     if not domain:
         return None
@@ -719,10 +728,48 @@ def _onboarding_reusable_crawl_for_user(user, domain: str) -> OnboardingOnPageCr
         domain=domain,
         status=OnboardingOnPageCrawl.STATUS_COMPLETED,
     ).order_by("-created_at")
+    if business_profile_id is not None:
+        qs = qs.filter(business_profile_id=int(business_profile_id))
     for crawl in qs[:5]:
         if crawl.ranked_keywords or crawl.review_topics:
             return crawl
     return None
+
+
+def _clone_onboarding_crawl_for_profile(
+    source: OnboardingOnPageCrawl,
+    *,
+    profile: BusinessProfile,
+    context: dict,
+) -> OnboardingOnPageCrawl:
+    """
+    Clone completed crawl payloads onto another profile so onboarding can reuse cached
+    DataForSEO/Gemini results without re-hitting third-party APIs.
+    """
+    return OnboardingOnPageCrawl.objects.create(
+        user=source.user,
+        business_profile=profile,
+        domain=source.domain,
+        status=source.status,
+        max_pages=source.max_pages,
+        pages=source.pages or [],
+        ranked_keywords=source.ranked_keywords or [],
+        topic_clusters=source.topic_clusters or {},
+        crawl_topic_seeds=source.crawl_topic_seeds or [],
+        ranked_keywords_error=source.ranked_keywords_error or "",
+        review_topics=source.review_topics or [],
+        review_topics_error=source.review_topics_error or "",
+        context=context,
+        task_id=source.task_id or "",
+        exit_reason=source.exit_reason or "",
+        error_message=source.error_message or "",
+        prompt_plan_status=source.prompt_plan_status,
+        prompt_plan_prompt_count=int(source.prompt_plan_prompt_count or 0),
+        prompt_plan_error=source.prompt_plan_error or "",
+        prompt_plan_task_id=source.prompt_plan_task_id or "",
+        prompt_plan_started_at=source.prompt_plan_started_at,
+        prompt_plan_finished_at=source.prompt_plan_finished_at,
+    )
 
 
 @csrf_exempt
@@ -742,6 +789,13 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
     website_url = (request.data.get("website_url") or "").strip()
     business_name = (request.data.get("business_name") or "").strip()
     location = (request.data.get("location") or "").strip()
+    profile_id_raw = request.data.get("profile_id")
+    profile_id: int | None = None
+    if profile_id_raw not in (None, ""):
+        try:
+            profile_id = int(profile_id_raw)
+        except (TypeError, ValueError):
+            return Response({"error": "profile_id must be an integer."}, status=400)
     customer_reach = str(request.data.get("customer_reach") or BusinessProfile.CUSTOMER_REACH_ONLINE).strip().lower()
     customer_reach_state = str(request.data.get("customer_reach_state") or "").strip()
     customer_reach_city = str(request.data.get("customer_reach_city") or "").strip()
@@ -776,7 +830,11 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
             status=409,
         )
 
-    reused = _onboarding_reusable_crawl_for_user(request.user, domain)
+    reused = _onboarding_reusable_crawl_for_user(
+        request.user,
+        domain,
+        business_profile_id=profile_id,
+    )
     if reused is not None:
         if (reused.ranked_keywords or []) and not (reused.review_topics or []):
 
@@ -800,20 +858,68 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
         )
 
     try:
-        profile = resolve_main_business_profile_for_user(request.user)
-        if profile is None:
-            if not should_create_owned_main_business_profile_for_user(request.user):
-                return Response(
-                    {"error": "No business profile for this account. Ask an admin to add you to the team."},
-                    status=403,
-                )
-            profile = BusinessProfile.objects.create(user=request.user, is_main=True)
-            BusinessProfileMembership.objects.get_or_create(
-                business_profile=profile,
+        if profile_id is not None:
+            profile = BusinessProfile.objects.filter(
+                id=profile_id,
                 user=request.user,
-                defaults={
-                    "role": BusinessProfileMembership.ROLE_ADMIN,
-                    "is_owner": True,
+            ).first()
+            if profile is None:
+                return Response(
+                    {"error": "Business profile not found for this account."},
+                    status=404,
+                )
+        else:
+            profile = resolve_main_business_profile_for_user(request.user)
+            if profile is None:
+                if not should_create_owned_main_business_profile_for_user(request.user):
+                    return Response(
+                        {"error": "No business profile for this account. Ask an admin to add you to the team."},
+                        status=403,
+                    )
+                profile = BusinessProfile.objects.create(user=request.user, is_main=True)
+                BusinessProfileMembership.objects.get_or_create(
+                    business_profile=profile,
+                    user=request.user,
+                    defaults={
+                        "role": BusinessProfileMembership.ROLE_ADMIN,
+                        "is_owner": True,
+                    },
+                )
+        # Cross-profile cache reuse: if this profile has no prior crawl for the domain,
+        # clone the latest completed crawl from another profile under the same account.
+        cross_profile_reuse = _onboarding_reusable_crawl_for_user(
+            request.user,
+            domain,
+            business_profile_id=None,
+        )
+        if (
+            cross_profile_reuse is not None
+            and int(getattr(cross_profile_reuse, "business_profile_id", 0) or 0) != int(profile.id)
+            and (cross_profile_reuse.ranked_keywords or cross_profile_reuse.review_topics)
+        ):
+            cloned = _clone_onboarding_crawl_for_profile(
+                cross_profile_reuse,
+                profile=profile,
+                context={
+                    "business_name": business_name,
+                    "location": location,
+                    "customer_reach": customer_reach,
+                    "customer_reach_state": customer_reach_state,
+                    "customer_reach_city": customer_reach_city,
+                },
+            )
+            return Response(
+                {
+                    "id": cloned.id,
+                    "status": cloned.status,
+                    "domain": domain,
+                    "reused": True,
+                    "ranked_keywords": cloned.ranked_keywords or [],
+                    "review_topics": cloned.review_topics or [],
+                    "review_topics_error": cloned.review_topics_error or "",
+                    "prompt_plan_status": cloned.prompt_plan_status,
+                    "prompt_plan_prompt_count": int(cloned.prompt_plan_prompt_count or 0),
+                    "prompt_plan_error": cloned.prompt_plan_error or "",
                 },
             )
 
@@ -866,7 +972,13 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
 def onboarding_crawl_latest(request: HttpRequest) -> Response:
     """Latest onboarding crawl for polling (ranked keywords up to ONBOARDING_RANKED_KEYWORDS_LIMIT)."""
     domain_param = (request.GET.get("domain") or "").strip().lower()
+    profile_id_param = (request.GET.get("profile_id") or "").strip()
     base = OnboardingOnPageCrawl.objects.filter(user=request.user)
+    if profile_id_param:
+        try:
+            base = base.filter(business_profile_id=int(profile_id_param))
+        except (TypeError, ValueError):
+            return Response({"error": "profile_id must be an integer."}, status=400)
     if domain_param:
         crawl = base.filter(domain=domain_param).order_by("-created_at").first()
     else:
@@ -4024,6 +4136,58 @@ def _assign_saved_prompts_to_selected_topics(
     return out
 
 
+def _saved_prompt_texts_for_profile_domain(
+    profile: BusinessProfile,
+    *,
+    website_url_from_context: str,
+    target_prompt_count: int,
+) -> list[str]:
+    """
+    Resolve a reusable prompt set for onboarding step-2:
+    1) current profile saved prompts (same domain),
+    2) fallback to another profile under same user with same domain.
+    """
+    if target_prompt_count < 1:
+        return []
+    website_url_ctx = str(website_url_from_context or "").strip()
+    if not website_url_ctx:
+        return []
+
+    def _extract(raw: list) -> list[str]:
+        items = plan_items_from_saved_prompt_strings(raw, max_items=target_prompt_count)
+        if len(items) != target_prompt_count:
+            return []
+        return [str(x.get("prompt") or "").strip() for x in items if str(x.get("prompt") or "").strip()]
+
+    if (
+        len(list(profile.selected_aeo_prompts or [])) == target_prompt_count
+        and _saved_prompts_domain_matches_onboarding_context(profile, website_url_ctx)
+    ):
+        own = _extract(list(profile.selected_aeo_prompts or []))
+        if len(own) == target_prompt_count:
+            return own
+
+    ctx_domain = normalize_domain(website_url_ctx) or ""
+    if not ctx_domain:
+        return []
+    sibling_qs = (
+        BusinessProfile.objects.filter(user=profile.user)
+        .exclude(pk=profile.pk)
+        .exclude(website_url="")
+        .order_by("-is_main", "-updated_at", "-id")
+    )
+    for sib in sibling_qs:
+        if normalize_domain(sib.website_url or "") != ctx_domain:
+            continue
+        raw_saved = list(sib.selected_aeo_prompts or [])
+        if len(raw_saved) != target_prompt_count:
+            continue
+        rows = _extract(raw_saved)
+        if len(rows) == target_prompt_count:
+            return rows
+    return []
+
+
 @csrf_exempt
 @api_view(["GET", "POST"])
 @authentication_classes([CsrfExemptSessionAuthentication])
@@ -4056,7 +4220,21 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     Response ``meta`` includes ``openai_status`` (``ok`` | ``partial`` | ``failed_empty`` |
     ``reused_saved``) and ``openai_message`` when generation cannot hit target count.
     """
-    profile = resolve_main_business_profile_for_user(request.user)
+    body = request.data if request.method == "POST" else {}
+    if not isinstance(body, dict):
+        body = {}
+    profile_id_raw = body.get("profile_id", request.GET.get("profile_id"))
+    profile: BusinessProfile | None = None
+    if profile_id_raw not in (None, ""):
+        try:
+            profile_id = int(profile_id_raw)
+        except (TypeError, ValueError):
+            return Response({"error": "profile_id must be an integer."}, status=400)
+        profile = BusinessProfile.objects.filter(id=profile_id, user=request.user).first()
+        if profile is None:
+            return Response({"error": "Business profile not found for this account."}, status=404)
+    else:
+        profile = resolve_main_business_profile_for_user(request.user)
     if not profile:
         if not should_create_owned_main_business_profile_for_user(request.user):
             return Response({"error": "No active business profile."}, status=404)
@@ -4069,10 +4247,6 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
                 "is_owner": True,
             },
         )
-
-    body = request.data if request.method == "POST" else {}
-    if not isinstance(body, dict):
-        body = {}
 
     city_override = _first_nonempty_str(body.get("city"), request.GET.get("city"))
     industry_override = _first_nonempty_str(body.get("industry"), request.GET.get("industry"))
@@ -4101,50 +4275,55 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
             )
         oc_early = body.get("onboarding_context") if isinstance(body.get("onboarding_context"), dict) else {}
         website_url_ctx = str(oc_early.get("website_url") or "").strip()
-        if (
-            len(saved_raw) == target_prompt_count
-            and _saved_prompts_domain_matches_onboarding_context(profile, website_url_ctx)
-        ):
-            raw_items = plan_items_from_saved_prompt_strings(saved_raw, max_items=target_prompt_count)
-            if len(raw_items) == target_prompt_count:
-                ser = _serialize_aeo_prompt_items(raw_items)
-                prompt_texts = [
-                    str(x.get("prompt") or "").strip() for x in ser if str(x.get("prompt") or "").strip()
-                ]
-                if len(prompt_texts) == target_prompt_count:
-                    pbt = _assign_saved_prompts_to_selected_topics(prompt_texts, selected_topics)
-                    if all(len(pbt.get(t, [])) > 0 for t in selected_topics):
-                        business_input = aeo_business_input_from_onboarding_payload(
-                            business_name=str(oc_early.get("business_name") or ""),
-                            website_url=website_url_ctx,
-                            location=str(oc_early.get("location") or ""),
-                            language=str(oc_early.get("language") or ""),
-                            selected_topics=selected_topics,
-                            customer_reach=str(oc_early.get("customer_reach") or ""),
-                            customer_reach_state=str(oc_early.get("customer_reach_state") or ""),
-                            customer_reach_city=str(oc_early.get("customer_reach_city") or ""),
-                        )
-                        return Response(
-                            {
-                                "groups": {
-                                    "fixed": [],
-                                    "dynamic": [],
-                                    "openai_generated": [],
-                                    "saved": ser,
-                                },
-                                "combined": ser,
-                                "business": business_input.as_dict(),
-                                "meta": {
-                                    "openai_status": "reused_saved",
-                                    "openai_message": "",
-                                    "openai_prompt_count": 0,
-                                    "combined_count": len(ser),
-                                    "combined_target": target_prompt_count,
-                                    "combined_shortfall": 0,
-                                },
-                                "prompts_by_topic": pbt,
-                            }
-                        )
+        prompt_texts = _saved_prompt_texts_for_profile_domain(
+            profile,
+            website_url_from_context=website_url_ctx,
+            target_prompt_count=target_prompt_count,
+        )
+        if len(prompt_texts) == target_prompt_count:
+            # Warm this profile cache so follow-up retries stay local to this profile.
+            if list(profile.selected_aeo_prompts or []) != prompt_texts:
+                try:
+                    profile.selected_aeo_prompts = prompt_texts
+                    profile.save(update_fields=["selected_aeo_prompts", "updated_at"])
+                except Exception:
+                    logger.exception("[AEO onboarding] failed to cache reused_saved prompts on profile")
+            ser = _serialize_aeo_prompt_items(
+                [{"prompt": p, "type": "", "weight": 1.0, "dynamic": True} for p in prompt_texts]
+            )
+            pbt = _assign_saved_prompts_to_selected_topics(prompt_texts, selected_topics)
+            if all(len(pbt.get(t, [])) > 0 for t in selected_topics):
+                business_input = aeo_business_input_from_onboarding_payload(
+                    business_name=str(oc_early.get("business_name") or ""),
+                    website_url=website_url_ctx,
+                    location=str(oc_early.get("location") or ""),
+                    language=str(oc_early.get("language") or ""),
+                    selected_topics=selected_topics,
+                    customer_reach=str(oc_early.get("customer_reach") or ""),
+                    customer_reach_state=str(oc_early.get("customer_reach_state") or ""),
+                    customer_reach_city=str(oc_early.get("customer_reach_city") or ""),
+                )
+                return Response(
+                    {
+                        "groups": {
+                            "fixed": [],
+                            "dynamic": [],
+                            "openai_generated": [],
+                            "saved": ser,
+                        },
+                        "combined": ser,
+                        "business": business_input.as_dict(),
+                        "meta": {
+                            "openai_status": "reused_saved",
+                            "openai_message": "",
+                            "openai_prompt_count": 0,
+                            "combined_count": len(ser),
+                            "combined_target": target_prompt_count,
+                            "combined_shortfall": 0,
+                        },
+                        "prompts_by_topic": pbt,
+                    }
+                )
 
     if onboarding_step2:
         reuse_saved = False
@@ -4240,27 +4419,28 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     except Exception:
         logger.exception("[AEO onboarding] failed saving selected_aeo_prompts")
 
-    try:
-        from .models import AEOExecutionRun
-        from .tasks import run_aeo_phase1_execution_task
+    if not skip_execution:
+        try:
+            from .models import AEOExecutionRun
+            from .tasks import run_aeo_phase1_execution_task
 
-        inflight = AEOExecutionRun.objects.filter(
-            profile=profile,
-            status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
-        ).exists()
-        if not inflight:
-            run = AEOExecutionRun.objects.create(
+            inflight = AEOExecutionRun.objects.filter(
                 profile=profile,
-                prompt_count_requested=min(len(combined), target_prompt_count),
-                status=AEOExecutionRun.STATUS_PENDING,
-            )
-            transaction.on_commit(
-                lambda run_id=run.id, prompt_payload=combined: run_aeo_phase1_execution_task.delay(
-                    run_id, prompt_payload
+                status__in=[AEOExecutionRun.STATUS_PENDING, AEOExecutionRun.STATUS_RUNNING],
+            ).exists()
+            if not inflight:
+                run = AEOExecutionRun.objects.create(
+                    profile=profile,
+                    prompt_count_requested=min(len(combined), target_prompt_count),
+                    status=AEOExecutionRun.STATUS_PENDING,
                 )
-            )
-    except Exception:
-        logger.exception("[AEO onboarding] failed to enqueue phase1 execution")
+                transaction.on_commit(
+                    lambda run_id=run.id, prompt_payload=combined: run_aeo_phase1_execution_task.delay(
+                        run_id, prompt_payload
+                    )
+                )
+        except Exception:
+            logger.exception("[AEO onboarding] failed to enqueue phase1 execution")
 
     prompts_by_topic = plan.get("prompts_by_topic") or {}
     if not isinstance(prompts_by_topic, dict):
@@ -4318,6 +4498,20 @@ def business_profile_list(request: HttpRequest) -> Response:
         # For additional profiles, default is_main to False unless explicitly set
         if "is_main" not in data:
             data["is_main"] = False
+
+    # Idempotency guard: if this user already has a profile for the same normalized
+    # website domain, return it instead of creating a duplicate profile.
+    website_url_raw = str(data.get("website_url") or "").strip()
+    requested_domain = normalize_domain(website_url_raw)
+    if requested_domain:
+        for row in existing_qs.exclude(website_url="").only("id", "website_url"):
+            if normalize_domain(row.website_url or "") == requested_domain:
+                access = viewer_team_access(request.user, row)
+                serializer = BusinessProfileSerializer(
+                    row,
+                    context={"request": request, "viewer_access": access},
+                )
+                return Response(serializer.data, status=200)
 
     serializer = BusinessProfileSerializer(data=data)
     serializer.is_valid(raise_exception=True)
