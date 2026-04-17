@@ -109,7 +109,7 @@ STORAGES = {
     },
 }
 
-# CORS & CSRF for production frontend and API
+# CORS & CSRF for staging frontend and API
 # ------------------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = [
     "https://ripplerank.ai",
