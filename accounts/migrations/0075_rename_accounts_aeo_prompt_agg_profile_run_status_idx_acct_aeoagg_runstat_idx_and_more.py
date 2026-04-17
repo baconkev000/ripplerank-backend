@@ -1,17 +1,17 @@
 """
 Reconcile AEOPromptExecutionAggregate btree index names with 0068 / 0069.
 
-Replaces a failing ``RenameIndex`` pair (0048 long names -> short canonical names):
-after ``0068_aeopromptexecutionaggregate_index_names`` the short indexes may already
-exist while legacy long-named indexes remain, so ``RenameIndex`` hits
-"relation already exists".
+A plain ``RenameIndex`` on the database fails when the short canonical name already
+exists (0068 may ``CREATE INDEX`` it while the 0048 long-named index remains).
 
-PostgreSQL-only, idempotent:
-- Both canonical and legacy: ``DROP INDEX`` legacy after verifying non-unique btree
-  on ``accounts_aeopromptexecutionaggregate`` with expected columns (not the unique
-  constraint ``accounts_aeo_prompt_agg_profile_run_hash_uq``).
-- Only legacy: ``ALTER INDEX ... RENAME TO`` canonical.
-- Only canonical: no-op.
+We use ``SeparateDatabaseAndState``:
+- **database_operations**: PostgreSQL-only ``RunPython`` drops the legacy index when
+  both exist (after safety checks), or renames legacy -> canonical when only legacy exists.
+- **state_operations**: ``RenameIndex`` only updates Django migration state (no SQL on DB),
+  matching ``models.py`` index names.
+
+After deploy, **rebuild** the Django image so this file replaces any older ``RenameIndex``-only
+0075 in the image; ``git pull`` alone is not enough when Compose uses a cached image.
 """
 
 from django.db import migrations
@@ -72,7 +72,7 @@ def _reconcile_pair(cursor, qn, legacy: str, canonical: str, required: list[str]
             return
         if not _def_matches(meta["def"], required, forbidden):
             return
-        cursor.execute("DROP INDEX {}".format(qn(legacy)))
+        cursor.execute("DROP INDEX IF EXISTS {}".format(qn(legacy)))
         return
     if has_legacy and not has_canonical:
         meta = _index_meta(cursor, legacy)
@@ -115,5 +115,21 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(forwards, migrations.RunPython.noop),
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunPython(forwards, migrations.RunPython.noop),
+            ],
+            state_operations=[
+                migrations.RenameIndex(
+                    model_name="aeopromptexecutionaggregate",
+                    new_name=STATUS_CANONICAL,
+                    old_name=LEGACY_STATUS,
+                ),
+                migrations.RenameIndex(
+                    model_name="aeopromptexecutionaggregate",
+                    new_name=HASH_CANONICAL,
+                    old_name=LEGACY_HASH,
+                ),
+            ],
+        ),
     ]
