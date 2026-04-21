@@ -364,21 +364,9 @@ def execute_onboarding_onpage_crawl(crawl_id: int) -> None:
         crawl.review_topics_error = (rt_err or "")[:2000]
         crawl.save(update_fields=["review_topics", "review_topics_error", "updated_at"])
 
-        if crawl.status == OnboardingOnPageCrawl.STATUS_COMPLETED and crawl.review_topics:
-            # Prompt plan follows LLM review topics, not ranked keyword rows.
-            if crawl.prompt_plan_status not in {
-                OnboardingOnPageCrawl.PROMPT_PLAN_QUEUED,
-                OnboardingOnPageCrawl.PROMPT_PLAN_RUNNING,
-                OnboardingOnPageCrawl.PROMPT_PLAN_COMPLETED,
-            }:
-                from .tasks import onboarding_prompt_generation_task
-
-                crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_QUEUED
-                crawl.prompt_plan_error = ""
-                crawl.save(update_fields=["prompt_plan_status", "prompt_plan_error", "updated_at"])
-                task = onboarding_prompt_generation_task.delay(crawl.id)
-                crawl.prompt_plan_task_id = str(getattr(task, "id", "") or "")[:128]
-                crawl.save(update_fields=["prompt_plan_task_id", "updated_at"])
+        # AEO prompts are generated only when the client POSTs ``/api/aeo/onboarding-prompt-plan/`` with
+        # ``onboarding_step2_prompt_plan`` and the user's ``selected_topics`` (including custom topics),
+        # not automatically from every inferred review topic row.
         logger.info(
             "[onboarding onpage] crawl id=%s status=%s pages=%s",
             crawl_id,

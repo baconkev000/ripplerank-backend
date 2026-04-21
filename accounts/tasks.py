@@ -2545,8 +2545,11 @@ def onboarding_onpage_crawl_task(self, crawl_id: int) -> None:
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
     """
-    Build onboarding prompt plan in background immediately after keyword pipeline.
-    Idempotent at crawl level (queued/running/completed states).
+    Build onboarding prompt plan from stored crawl ``review_topics`` (all rows).
+
+    Not enqueued automatically after on-page crawl; onboarding and add-company flows call
+    ``/api/aeo/onboarding-prompt-plan/`` with user-selected topics instead. Kept for tests
+    and any explicit invocation. Idempotent at crawl level (queued/running/completed states).
     """
     from .aeo.aeo_utils import (
         aeo_business_input_from_onboarding_payload,
@@ -2817,7 +2820,7 @@ def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
 def onboarding_review_topics_backfill_task(self, crawl_id: int) -> None:
     """
     Fill ``review_topics`` for legacy crawls that have ranked_keywords but no LLM topics yet.
-    May enqueue ``onboarding_prompt_generation_task`` when topics appear and prompt plan is still pending.
+    Does not enqueue prompt generation; the client requests prompts after topic selection.
     """
     from .models import OnboardingOnPageCrawl
     from .onboarding_review_topics import generate_review_topics_for_domain
@@ -2842,20 +2845,3 @@ def onboarding_review_topics_backfill_task(self, crawl_id: int) -> None:
     crawl.review_topics = rt_list
     crawl.review_topics_error = (rt_err or "")[:2000]
     crawl.save(update_fields=["review_topics", "review_topics_error", "updated_at"])
-
-    if not rt_list:
-        return
-
-    if crawl.prompt_plan_status in {
-        OnboardingOnPageCrawl.PROMPT_PLAN_QUEUED,
-        OnboardingOnPageCrawl.PROMPT_PLAN_RUNNING,
-        OnboardingOnPageCrawl.PROMPT_PLAN_COMPLETED,
-    }:
-        return
-
-    crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_QUEUED
-    crawl.prompt_plan_error = ""
-    crawl.save(update_fields=["prompt_plan_status", "prompt_plan_error", "updated_at"])
-    task = onboarding_prompt_generation_task.delay(crawl.id)
-    crawl.prompt_plan_task_id = str(getattr(task, "id", "") or "")[:128]
-    crawl.save(update_fields=["prompt_plan_task_id", "updated_at"])
