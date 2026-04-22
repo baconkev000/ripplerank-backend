@@ -4665,11 +4665,19 @@ def business_profile_list(request: HttpRequest) -> Response:
     if site_url and normalize_domain(site_url):
         data_user = workspace_data_user(profile) or request.user
         try:
+            # Ranked snapshot row (sync) so the client can read basic metrics immediately.
             get_or_refresh_seo_score_for_user(
                 data_user,
                 site_url=site_url,
                 force_refresh=True,
                 business_profile=profile,
+            )
+            # Full enrichment + metrics (same pipeline as post-payment / refresh-seo-snapshot API),
+            # off the request thread so the add-company modal does not block on DataForSEO.
+            from .tasks import sync_enrich_seo_snapshot_for_profile_task
+
+            transaction.on_commit(
+                lambda pid=profile.pk: sync_enrich_seo_snapshot_for_profile_task.delay(pid)
             )
         except Exception:
             logger.exception(

@@ -105,6 +105,57 @@ def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
         raise
 
 
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=2, retry_backoff=30, ignore_result=True)
+def sync_enrich_seo_snapshot_for_profile_task(self, profile_id: int) -> None:
+    """
+    Synchronously enrich the current-period SEO snapshot (gap + LLM + Labs ranks, metrics persist).
+
+    Call after ``get_or_refresh_seo_score_for_user`` has created/updated the ranked-keyword row
+    (e.g. new business profile POST). Mirrors the second half of ``post_payment_seo_snapshot_task``.
+    """
+    from .business_profile_access import workspace_data_user
+    from .models import BusinessProfile
+    from .seo_snapshot_refresh import sync_enrich_current_period_seo_snapshot_for_profile
+
+    pid = int(profile_id)
+    profile = BusinessProfile.objects.filter(pk=pid).select_related("user").first()
+    if profile is None:
+        logger.warning("[SEO sync enrich task] profile_not_found profile_id=%s", pid)
+        return
+    data_user = workspace_data_user(profile) or profile.user
+    if data_user is None:
+        logger.warning("[SEO sync enrich task] skip_no_data_user profile_id=%s", pid)
+        return
+    try:
+        sync_result = sync_enrich_current_period_seo_snapshot_for_profile(
+            profile,
+            data_user_fallback=data_user,
+            abort_on_low_coverage=True,
+        )
+        if sync_result.get("aborted_low_coverage"):
+            logger.warning(
+                "[SEO sync enrich task] aborted_low_coverage profile_id=%s snapshot_id=%s detail=%s",
+                pid,
+                sync_result.get("snapshot_id"),
+                sync_result.get("detail"),
+            )
+        elif sync_result.get("persisted"):
+            logger.info(
+                "[SEO sync enrich task] persisted profile_id=%s snapshot_id=%s",
+                pid,
+                sync_result.get("snapshot_id"),
+            )
+        elif sync_result.get("detail"):
+            logger.info(
+                "[SEO sync enrich task] skipped profile_id=%s detail=%s",
+                pid,
+                sync_result.get("detail"),
+            )
+    except Exception:
+        logger.exception("[SEO sync enrich task] failed profile_id=%s", pid)
+        raise
+
+
 def _seo_datetime_iso(value: Any) -> str | None:
     if value is None:
         return None
@@ -283,7 +334,11 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
     from .models import SEOOverviewSnapshot
 
     try:
-        snapshot = SEOOverviewSnapshot.objects.filter(pk=snapshot_id).first()
+        snapshot = (
+            SEOOverviewSnapshot.objects.filter(pk=snapshot_id)
+            .select_related("business_profile", "user")
+            .first()
+        )
     except Exception as e:
         logger.warning("[SEO async] enrich_snapshot_keywords_task snapshot load failed snapshot_id=%s: %s", snapshot_id, e)
         return
@@ -305,10 +360,14 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
     location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
     language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
     user = snapshot.user
-    profile_for_usage = (
-        user.business_profiles.filter(is_main=True).first()
-        or user.business_profiles.first()
-    )
+    # Must match the snapshot row: multi-company accounts share one user; using is_main would
+    # enrich non-main snapshots with the wrong profile (competitors, usage caps, Labs context).
+    profile_for_usage = getattr(snapshot, "business_profile", None)
+    if profile_for_usage is None:
+        profile_for_usage = (
+            user.business_profiles.filter(is_main=True).first()
+            or user.business_profiles.first()
+        )
 
     # Copy so we don't mutate in-place until we're ready to save
     top_keywords: List[Dict[str, Any]] = [dict(k) for k in (getattr(snapshot, "top_keywords", None) or [])]

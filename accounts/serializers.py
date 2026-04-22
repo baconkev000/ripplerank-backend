@@ -548,7 +548,6 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     def _get_seo_bundle(self, obj: BusinessProfile) -> dict | None:
         context = getattr(self, "context", {}) or {}
         if context.get("skip_heavy_profile_metrics"):
-            setattr(self, "_seo_bundle_cache", None)
             return None
 
         user = getattr(obj, "user", None)
@@ -561,10 +560,13 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             )
             return None
 
-        # Simple per-instance cache so we only call the helper once per profile.
-        cache_attr = "_seo_bundle_cache"
-        if hasattr(self, cache_attr):
-            return getattr(self, cache_attr)
+        # Per-profile-id cache: DRF reuses one child serializer for many=True lists; a single
+        # attribute would serve every row the first profile's bundle.
+        cache_attr = "_seo_bundle_cache_by_profile_id"
+        cache_map = getattr(self, cache_attr, None)
+        pid = getattr(obj, "id", None)
+        if pid is not None and isinstance(cache_map, dict) and pid in cache_map:
+            return cache_map[pid]
 
         try:
             logger.info(
@@ -577,12 +579,16 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 site_url=site_url or None,
                 business_profile=obj,
             )
+            if not isinstance(cache_map, dict):
+                cache_map = {}
+            if pid is not None:
+                cache_map[pid] = data
+                setattr(self, cache_attr, cache_map)
             if not data:
                 logger.info(
                     "[BusinessProfileSerializer] get_seo_score: no data returned for user_id=%s",
                     getattr(user, "id", None),
                 )
-                setattr(self, cache_attr, None)
                 return None
 
             logger.info(
@@ -590,7 +596,6 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 {k: data.get(k) for k in ["seo_score", "search_performance_score"]},
                 getattr(user, "id", None),
             )
-            setattr(self, cache_attr, data)
             return data
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception(
@@ -598,7 +603,11 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 getattr(user, "id", None),
                 str(exc)[:300],
             )
-            setattr(self, cache_attr, None)
+            if pid is not None:
+                if not isinstance(cache_map, dict):
+                    cache_map = {}
+                cache_map[pid] = None
+                setattr(self, cache_attr, cache_map)
             return None
 
     def get_seo_score(self, obj: BusinessProfile) -> int | None:
