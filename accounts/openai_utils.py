@@ -7,7 +7,7 @@ Keeps all OpenAI client usage and message formatting in one place.
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Mapping
 
 from django.conf import settings
 from django.http import HttpRequest
@@ -861,6 +861,297 @@ def generate_aeo_recommendations(aeo_data: dict, seo_data: dict | None = None) -
         return out[:5]
     except Exception:
         return []
+
+
+def _strip_json_fence(text: str) -> str:
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
+        if "```" in raw:
+            raw = raw.rsplit("```", 1)[0].strip()
+    return raw
+
+
+def _gp_trunc(s: str, max_len: int) -> str:
+    t = " ".join(str(s or "").split()).strip()
+    if len(t) <= max_len:
+        return t
+    return t[: max(0, max_len - 1)].rstrip() + "…"
+
+
+def _gp_as_str_list(raw: Any, cap: int, item_max: int = 480) -> list[str]:
+    out: list[str] = []
+    if isinstance(raw, list):
+        for x in raw:
+            s = _gp_trunc(str(x or ""), item_max)
+            if s:
+                out.append(s)
+            if len(out) >= cap:
+                break
+    elif isinstance(raw, str) and raw.strip():
+        out.append(_gp_trunc(raw.strip(), item_max))
+    return out[:cap]
+
+
+def _gp_parse_faqs(raw: Any, cap: int = 8, qa_max: int = 480) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw[: cap * 2]:
+        if not isinstance(item, dict):
+            continue
+        q = _gp_trunc(str(item.get("q") or item.get("question") or ""), qa_max)
+        a = _gp_trunc(str(item.get("a") or item.get("answer") or ""), qa_max)
+        if q and a:
+            out.append({"q": q, "a": a})
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _gp_parse_plan_steps(raw: Any, cap: int = 12, title_max: int = 200, instr_max: int = 900) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return out
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        try:
+            sn = int(item.get("step_number", i + 1))
+        except (TypeError, ValueError):
+            sn = i + 1
+        title = _gp_trunc(str(item.get("title") or ""), title_max)
+        instruction = _gp_trunc(str(item.get("instruction") or ""), instr_max)
+        if title or instruction:
+            out.append({"step_number": sn, "title": title, "instruction": instruction})
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _gp_parse_internal_links(raw: Any, cap: int = 12) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            {
+                "from_or_section": _gp_trunc(str(item.get("from_or_section") or ""), 200),
+                "to_url": _gp_trunc(str(item.get("to_url") or ""), 400),
+                "anchor_hint": _gp_trunc(str(item.get("anchor_hint") or ""), 200),
+            }
+        )
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _build_actions_landing_page_context_block(
+    *,
+    seo_issues: list[str],
+    action_faqs: list[dict[str, str]],
+    trust_block: str,
+    quick_facts: list[str],
+    plan_steps: list[dict[str, Any]],
+    internal_links: list[dict[str, str]],
+    affected_keywords: list[str],
+    target_keywords: list[str],
+    copy_example: str,
+) -> str:
+    """Human-readable block for the user message (bounded)."""
+    lines: list[str] = []
+
+    issues_lines = "\n".join(f"- {_gp_trunc(str(x), 480)}" for x in (seo_issues or [])[:32] if str(x).strip())
+    if not issues_lines.strip():
+        issues_lines = "- None specified"
+    lines.append(
+        "INTERNAL — Topic and service gaps (structure the page around these in natural language only; "
+        "never present them as an audit, checklist, or SEO/ranking explanation on the page)"
+    )
+    lines.append(issues_lines)
+
+    if action_faqs:
+        lines.append("\nASSETS — FAQ (use faithfully where relevant; do not invent Q/As beyond these)")
+        for pair in action_faqs:
+            lines.append(f"Q: {pair.get('q', '')}\nA: {pair.get('a', '')}")
+
+    tb = (trust_block or "").strip()
+    if tb:
+        lines.append("\nASSETS — Business facts / local context (use verbatim where appropriate; do not invent credentials)")
+        lines.append(tb)
+
+    if quick_facts:
+        lines.append("\nASSETS — Quick facts / citation bullets")
+        for qf in quick_facts:
+            lines.append(f"- {_gp_trunc(qf, 480)}")
+
+    if plan_steps:
+        lines.append("\nPLAN — Full steps (titles + instructions; follow this execution detail)")
+        for st in plan_steps:
+            sn = st.get("step_number", "")
+            title = str(st.get("title") or "").strip()
+            instr = str(st.get("instruction") or "").strip()
+            lines.append(f"{sn}. {title}\n   {instr}" if title else f"{sn}. {instr}")
+
+    if internal_links:
+        lines.append("\nASSETS — Internal link hints")
+        for link in internal_links:
+            lines.append(
+                f"- From/section: {link.get('from_or_section', '')} → URL: {link.get('to_url', '')} "
+                f"(anchor hint: {link.get('anchor_hint', '')})"
+            )
+
+    if affected_keywords:
+        lines.append("\nDATA — Affected / cluster keywords")
+        lines.append(", ".join(_gp_trunc(k, 80) for k in affected_keywords))
+
+    if target_keywords:
+        lines.append("\nDATA — Target keywords")
+        lines.append(", ".join(_gp_trunc(k, 80) for k in target_keywords))
+
+    ce = (copy_example or "").strip()
+    if ce:
+        lines.append("\nASSETS — Example / long-form copy snippet")
+        lines.append(ce)
+
+    return "\n".join(lines)
+
+
+def parse_actions_landing_page_request_extras(data: Any) -> dict[str, Any]:
+    """Normalize optional structured fields from the generate-page-preview POST body."""
+    raw: dict[str, Any] = dict(data) if isinstance(data, Mapping) else {}
+    return {
+        "action_faqs": _gp_parse_faqs(raw.get("action_faqs")),
+        "trust_block": _gp_trunc(str(raw.get("trust_block") or ""), 900),
+        "quick_facts": _gp_as_str_list(raw.get("quick_facts"), 10),
+        "plan_steps": _gp_parse_plan_steps(raw.get("plan_steps")),
+        "internal_links": _gp_parse_internal_links(raw.get("internal_links")),
+        "affected_keywords": _gp_as_str_list(raw.get("affected_keywords"), 12, 120),
+        "target_keywords": _gp_as_str_list(raw.get("target_keywords"), 12, 120),
+        "copy_example": _gp_trunc(str(raw.get("copy_example") or ""), 900),
+    }
+
+
+def generate_structured_landing_page_preview(
+    *,
+    keyword: str,
+    business_name: str,
+    location: str,
+    service_area: str,
+    seo_issues: list[str],
+    page_type: str | None = None,
+    business_profile: BusinessProfile | None = None,
+    action_faqs: list[dict[str, str]] | None = None,
+    trust_block: str = "",
+    quick_facts: list[str] | None = None,
+    plan_steps: list[dict[str, Any]] | None = None,
+    internal_links: list[dict[str, str]] | None = None,
+    affected_keywords: list[str] | None = None,
+    target_keywords: list[str] | None = None,
+    copy_example: str = "",
+) -> dict[str, Any]:
+    """
+    Ask OpenAI for a strict JSON document describing a landing page as a tree of UI components.
+
+    Prompts favor natural business copy and forbid audit/schema/ranking meta language; internal
+    SEO issue lines are framing only. Returns a dict with top-level key ``page`` (title, slug, components).
+    """
+    system = (
+        "You are an expert UX copywriter and landing page architect. Generate a high-converting, "
+        "natural-sounding local service landing page as STRICT JSON ONLY (no HTML, no markdown, no prose outside JSON).\n\n"
+        "Write like a real business website—not an SEO tool, audit report, or AI system. Hide all search/optimization mechanics; "
+        "never explain why content exists.\n\n"
+        "FORBIDDEN anywhere in visitor-facing strings: mentions of schema, JSON-LD, structured data, SEO implementation, "
+        "ranking signals, meta commentary about search engines or AI, or artificial section titles such as "
+        "\"Trust & Verification\", \"Business Credentials\", \"SEO Schema Implementation\", \"Ranking Signals\", "
+        "or \"Certified Local Provider\" unless explicitly provided in inputs. Do not fabricate ratings, review counts, "
+        "or certifications. Do not use \"verified\" or \"licensed team\" unless explicitly in the input assets.\n\n"
+        "Trust: weave naturally into sentences (e.g. serving a neighborhood), not as a labeled trust stack. "
+        "Avoid repetitive filler (\"top rated\", \"established\", \"trusted\") unless grounded in provided data.\n\n"
+        "PAGE FLOW (use sections to separate meaning, not SEO categories):\n"
+        "1) Hero: clear human headline, short supporting paragraph, primary CTA button.\n"
+        "2) Intro: what the visitor is looking for, location woven in naturally.\n"
+        "3) Main value: what the business offers; benefits in plain language.\n"
+        "4) Location / service area: cities or neighborhoods in a paragraph or list.\n"
+        "5) Social proof: real reviews only if provided; otherwise generic placeholder like "
+        "\"Customers often highlight quality and speed of service.\"—no fake numbers.\n"
+        "6) Optional details: pricing/hours/services only if provided in inputs.\n"
+        "7) FAQ (accordion only): real customer questions—availability, pricing, location, how it works—not audit questions.\n"
+        "8) Final CTA: simple, action-oriented, not a repeat of the hero.\n\n"
+        "INTERNAL inputs may include topic gaps or FAQs—use them to structure copy only; never expose them as diagnostics.\n\n"
+        "Allowed component ``type`` values: h1, h2, h3, h4, h5, h6, paragraph, div, section, button, "
+        "list, table, accordion, columns.\n\n"
+        "For ``list``, use ``items`` as an array of strings; optional ``ordered`` boolean for numbered list.\n"
+        "For ``columns``, set ``columns`` to 2 or 3, and ``children`` as an array of columns where each "
+        "column is an array of component objects.\n"
+        "For ``accordion``, use ``items`` as an array of objects with ``title`` and ``content`` strings.\n"
+        "For ``table``, use ``headers`` (string array) and ``rows`` (array of string arrays).\n"
+        "For ``button``, use ``content`` and optional ``url``.\n"
+        "For headings and ``paragraph``, use ``content``.\n"
+        "For ``section`` and ``div``, use ``children`` for nested components.\n\n"
+        "Output shape (exact top-level keys): "
+        '{"page":{"title":"string","slug":"string","components":[...]}}\n'
+        "Do NOT include null values. Do not include trailing commas. Output must parse as JSON."
+    )
+    faqs = action_faqs or []
+    qf = quick_facts or []
+    steps = plan_steps or []
+    ilinks = internal_links or []
+    aff = affected_keywords or []
+    tgt = target_keywords or []
+    context_block = _build_actions_landing_page_context_block(
+        seo_issues=seo_issues or [],
+        action_faqs=faqs,
+        trust_block=trust_block,
+        quick_facts=qf,
+        plan_steps=steps,
+        internal_links=ilinks,
+        affected_keywords=aff,
+        target_keywords=tgt,
+        copy_example=copy_example,
+    )
+    pt = (page_type or "").strip()
+    page_type_line = f"Page type: {pt}\n" if pt else ""
+    user_msg = (
+        "INPUTS (use for copy only; the published page must read like a normal business site):\n\n"
+        f"Primary keyword / topic: {keyword}\n"
+        f"Business name: {business_name}\n"
+        f"Location: {location}\n"
+        f"Service area: {service_area}\n"
+        f"{page_type_line}"
+        f"{context_block}\n\n"
+        "Produce one landing page that converts visitors into actions. Use the keyword and location naturally—no stuffing. "
+        "If internal topic lines conflict with provided FAQs or business facts, prefer the explicit FAQs and facts.\n\n"
+        "Return ONLY valid JSON with this exact shape (no other keys at the top level):\n"
+        '{"page":{"title":"string","slug":"string","components":[]}}'
+    )
+
+    client = _get_client("OPEN_AI_SEO_API_KEY")
+    model = _get_model()
+    completion = chat_completion_create_logged(
+        client,
+        operation="openai.chat.actions_landing_page_preview",
+        business_profile=business_profile,
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_msg},
+        ],
+        response_format={"type": "json_object"},
+    )
+    raw = _strip_json_fence(completion.choices[0].message.content or "")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Model returned non-object JSON")
+    page = data.get("page")
+    if not isinstance(page, dict):
+        raise ValueError("Model JSON must include a page object")
+    comps = page.get("components")
+    if not isinstance(comps, list):
+        page["components"] = []
+    return data
 
 
 def seo_chat(request: HttpRequest) -> Response:

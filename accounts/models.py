@@ -442,6 +442,50 @@ class AEODashboardBundleCache(models.Model):
         return f"AEODashboardBundleCache(profile_id={self.profile_id})"
 
 
+class ActionsGeneratedPageSnapshot(models.Model):
+    """
+    Persisted structured JSON for Actions → “Generate Page” previews (OpenAI output, no HTML).
+
+    One row per business profile + action_key (client card id). Re-open returns ``page_data``
+    when ``content_hash`` matches the request and ``regenerate`` is false. Run ``makemigrations``
+    / ``migrate`` to create or alter the table.
+    """
+
+    profile = models.ForeignKey(
+        BusinessProfile,
+        on_delete=models.CASCADE,
+        related_name="generated_page_snapshots",
+    )
+    action_key = models.CharField(
+        max_length=512,
+        db_index=True,
+        help_text="Actions UI card id (e.g. seo-step-0, aeo strategy stable id).",
+    )
+    content_hash = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="SHA-256 hex of canonical generation inputs; cache hit only when this matches the request.",
+    )
+    page_data = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Actions generated page snapshot"
+        verbose_name_plural = "Actions generated page snapshots"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["profile", "action_key"],
+                name="uniq_actions_genpage_profile_action",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"ActionsGeneratedPageSnapshot(profile_id={self.profile_id}, key={self.action_key[:40]!r})"
+
+
 class AEOResponseSnapshot(models.Model):
     """
     Raw OpenAI (or other platform) answer for a single AEO visibility prompt.

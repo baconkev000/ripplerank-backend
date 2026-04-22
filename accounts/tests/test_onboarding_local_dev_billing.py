@@ -52,3 +52,32 @@ def test_local_dev_billing_complete_sets_fake_stripe_when_debug_on(settings):
     assert p.stripe_subscription_id == "sub_local_dev"
     assert p.stripe_subscription_status == "active"
     assert p.plan == BusinessProfile.PLAN_ADVANCED
+
+
+@pytest.mark.django_db
+def test_local_dev_billing_complete_enqueues_post_payment_seo_when_website_present(
+    settings, monkeypatch, django_capture_on_commit_callbacks,
+):
+    settings.DEBUG = True
+    enqueued: list[int] = []
+
+    def _fake_delay(profile_id: int) -> None:
+        enqueued.append(int(profile_id))
+
+    monkeypatch.setattr(
+        "accounts.tasks.post_payment_seo_snapshot_task.delay",
+        _fake_delay,
+    )
+    user = User.objects.create_user(username="ldbseo@example.com", email="ldbseo@example.com", password="x")
+    BusinessProfile.objects.create(
+        user=user,
+        is_main=True,
+        business_name="WithSite",
+        website_url="https://ldbseo.example.com",
+    )
+    client = APIClient()
+    client.force_authenticate(user=user)
+    with django_capture_on_commit_callbacks(execute=True):
+        res = client.post("/api/onboarding/local-dev-billing-complete/", {"plan": "pro"}, format="json")
+    assert res.status_code == 200
+    assert enqueued == [BusinessProfile.objects.get(user=user, is_main=True).id]

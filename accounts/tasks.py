@@ -75,6 +75,31 @@ def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
             getattr(data_user, "id", None),
             bundle is not None,
         )
+        from .seo_snapshot_refresh import sync_enrich_current_period_seo_snapshot_for_profile
+
+        sync_result = sync_enrich_current_period_seo_snapshot_for_profile(
+            profile,
+            abort_on_low_coverage=True,
+        )
+        if sync_result.get("aborted_low_coverage"):
+            logger.warning(
+                "[stripe->SEO] sync_enrich_aborted_low_coverage profile_id=%s snapshot_id=%s detail=%s",
+                pid,
+                sync_result.get("snapshot_id"),
+                sync_result.get("detail"),
+            )
+        elif sync_result.get("persisted"):
+            logger.info(
+                "[stripe->SEO] sync_enrich_persisted profile_id=%s snapshot_id=%s",
+                pid,
+                sync_result.get("snapshot_id"),
+            )
+        elif sync_result.get("detail"):
+            logger.info(
+                "[stripe->SEO] sync_enrich_skipped profile_id=%s detail=%s",
+                pid,
+                sync_result.get("detail"),
+            )
     except Exception:
         logger.exception("[stripe->SEO] refresh_failed profile_id=%s", pid)
         raise
@@ -1571,8 +1596,11 @@ def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
 
     logger.info("[AEO phase4] scoring start run_id=%s profile_id=%s", run.id, run.profile_id)
     try:
+        # Starter profiles: layered scoring (sample → confidence). CONFIDENCE uses strict aggregate
+        # filters and may match zero rows while SAMPLE still produced a row — we must not drop the
+        # sample snapshot_id on the execution run (downstream Phase 5 / staff enqueue require it).
         if _is_onboarding_sample_size_profile(profile):
-            calculate_layered_scores_from_aggregates(
+            sample_score_data = calculate_layered_scores_from_aggregates(
                 profile,
                 execution_run_id=run.id,
                 score_layer=AEOScoreSnapshot.LAYER_SAMPLE,
@@ -1584,11 +1612,22 @@ def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
                 score_layer=AEOScoreSnapshot.LAYER_CONFIDENCE,
                 save=True,
             )
+            snapshot_id = score_data.get("snapshot_id") or sample_score_data.get("snapshot_id")
+            total_prompts = int(score_data.get("total_prompts") or sample_score_data.get("total_prompts") or 0)
+            if snapshot_id is None:
+                score_data = calculate_aeo_scores_for_business(
+                    profile, save=True, execution_run_id=run.id
+                )
+                snapshot_id = score_data.get("snapshot_id")
+                total_prompts = int(score_data.get("total_prompts") or 0)
         else:
             score_data = calculate_aeo_scores_for_business(
                 profile, save=True, execution_run_id=run.id
             )
-        run.score_snapshot_id = score_data.get("snapshot_id")
+            snapshot_id = score_data.get("snapshot_id")
+            total_prompts = int(score_data.get("total_prompts") or 0)
+
+        run.score_snapshot_id = snapshot_id
         run.scoring_status = AEOExecutionRun.STAGE_COMPLETED
         run.save(update_fields=["score_snapshot_id", "scoring_status", "updated_at"])
         logger.info(
@@ -1596,7 +1635,7 @@ def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
             run.id,
             run.profile_id,
             run.score_snapshot_id,
-            int(score_data.get("total_prompts") or 0),
+            total_prompts,
         )
         if _aeo_recommendation_stage_enabled():
             run_aeo_phase5_recommendation_task.delay(run.id)
