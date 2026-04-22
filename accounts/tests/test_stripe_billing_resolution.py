@@ -678,14 +678,23 @@ def test_post_payment_seo_snapshot_task_calls_get_or_refresh_with_force(monkeypa
     from accounts.tasks import post_payment_seo_snapshot_task
 
     calls: list[tuple] = []
+    sync_calls: list[tuple] = []
 
     def _fake_get(user, *, site_url=None, force_refresh=False):
         calls.append((getattr(user, "id", None), site_url, force_refresh))
         return {"seo_score": 50}
 
+    def _fake_sync(*args, **kwargs):
+        sync_calls.append((args, kwargs))
+        return {"ok": True, "persisted": False, "external_api_called": False}
+
     monkeypatch.setattr(
         "accounts.dataforseo_utils.get_or_refresh_seo_score_for_user",
         _fake_get,
+    )
+    monkeypatch.setattr(
+        "accounts.seo_snapshot_refresh.sync_enrich_current_period_seo_snapshot_for_profile",
+        _fake_sync,
     )
     user = User.objects.create_user(username="seotask@example.com", email="seotask@example.com", password="x")
     profile = BusinessProfile.objects.create(
@@ -698,6 +707,9 @@ def test_post_payment_seo_snapshot_task_calls_get_or_refresh_with_force(monkeypa
     assert calls[0][0] == user.id
     assert calls[0][1] == "https://seotask.example.com"
     assert calls[0][2] is True
+    assert len(sync_calls) == 1
+    assert sync_calls[0][0][0].id == profile.id
+    assert sync_calls[0][1].get("abort_on_low_coverage") is True
 
 
 def test_infer_sync_failure_reason_invoice_does_not_use_invoice_id_as_subscription():

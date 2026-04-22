@@ -16,7 +16,6 @@ from django.db import transaction
 from django.utils import timezone as django_tz
 
 from .aeo.aeo_plan_targets import (
-    AEO_PLAN_CAP_STARTER,
     aeo_effective_monitored_target_for_profile,
     aeo_http_call_bounds_for_monitoring,
     aeo_should_run_post_payment_expansion,
@@ -68,6 +67,7 @@ def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
             data_user,
             site_url=site,
             force_refresh=True,
+            business_profile=profile,
         )
         logger.info(
             "[stripe->SEO] refresh_done profile_id=%s user_id=%s has_bundle=%s",
@@ -75,8 +75,84 @@ def post_payment_seo_snapshot_task(self, profile_id: int) -> None:
             getattr(data_user, "id", None),
             bundle is not None,
         )
+        from .seo_snapshot_refresh import sync_enrich_current_period_seo_snapshot_for_profile
+
+        sync_result = sync_enrich_current_period_seo_snapshot_for_profile(
+            profile,
+            abort_on_low_coverage=True,
+        )
+        if sync_result.get("aborted_low_coverage"):
+            logger.warning(
+                "[stripe->SEO] sync_enrich_aborted_low_coverage profile_id=%s snapshot_id=%s detail=%s",
+                pid,
+                sync_result.get("snapshot_id"),
+                sync_result.get("detail"),
+            )
+        elif sync_result.get("persisted"):
+            logger.info(
+                "[stripe->SEO] sync_enrich_persisted profile_id=%s snapshot_id=%s",
+                pid,
+                sync_result.get("snapshot_id"),
+            )
+        elif sync_result.get("detail"):
+            logger.info(
+                "[stripe->SEO] sync_enrich_skipped profile_id=%s detail=%s",
+                pid,
+                sync_result.get("detail"),
+            )
     except Exception:
         logger.exception("[stripe->SEO] refresh_failed profile_id=%s", pid)
+        raise
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=2, retry_backoff=30, ignore_result=True)
+def sync_enrich_seo_snapshot_for_profile_task(self, profile_id: int) -> None:
+    """
+    Synchronously enrich the current-period SEO snapshot (gap + LLM + Labs ranks, metrics persist).
+
+    Call after ``get_or_refresh_seo_score_for_user`` has created/updated the ranked-keyword row
+    (e.g. new business profile POST). Mirrors the second half of ``post_payment_seo_snapshot_task``.
+    """
+    from .business_profile_access import workspace_data_user
+    from .models import BusinessProfile
+    from .seo_snapshot_refresh import sync_enrich_current_period_seo_snapshot_for_profile
+
+    pid = int(profile_id)
+    profile = BusinessProfile.objects.filter(pk=pid).select_related("user").first()
+    if profile is None:
+        logger.warning("[SEO sync enrich task] profile_not_found profile_id=%s", pid)
+        return
+    data_user = workspace_data_user(profile) or profile.user
+    if data_user is None:
+        logger.warning("[SEO sync enrich task] skip_no_data_user profile_id=%s", pid)
+        return
+    try:
+        sync_result = sync_enrich_current_period_seo_snapshot_for_profile(
+            profile,
+            data_user_fallback=data_user,
+            abort_on_low_coverage=True,
+        )
+        if sync_result.get("aborted_low_coverage"):
+            logger.warning(
+                "[SEO sync enrich task] aborted_low_coverage profile_id=%s snapshot_id=%s detail=%s",
+                pid,
+                sync_result.get("snapshot_id"),
+                sync_result.get("detail"),
+            )
+        elif sync_result.get("persisted"):
+            logger.info(
+                "[SEO sync enrich task] persisted profile_id=%s snapshot_id=%s",
+                pid,
+                sync_result.get("snapshot_id"),
+            )
+        elif sync_result.get("detail"):
+            logger.info(
+                "[SEO sync enrich task] skipped profile_id=%s detail=%s",
+                pid,
+                sync_result.get("detail"),
+            )
+    except Exception:
+        logger.exception("[SEO sync enrich task] failed profile_id=%s", pid)
         raise
 
 
@@ -172,7 +248,19 @@ def _seo_snapshot_corpus_newer_than_keyword_suggestions(snapshot: Any) -> bool:
 
 
 def _is_onboarding_sample_size_profile(profile) -> bool:
-    return aeo_effective_monitored_target_for_profile(profile) <= AEO_PLAN_CAP_STARTER
+    """Starter / unpaid: lighter monitored set. Pro+ get full pipeline staging."""
+    from .models import BusinessProfile
+
+    slug = str(getattr(profile, "plan", "") or "").strip().lower()
+    if slug in (
+        BusinessProfile.PLAN_PRO,
+        "professional",
+        BusinessProfile.PLAN_ADVANCED,
+        "enterprise",
+        "scale",
+    ):
+        return False
+    return True
 
 
 def _aeo_recommendation_stage_enabled() -> bool:
@@ -246,7 +334,11 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
     from .models import SEOOverviewSnapshot
 
     try:
-        snapshot = SEOOverviewSnapshot.objects.filter(pk=snapshot_id).first()
+        snapshot = (
+            SEOOverviewSnapshot.objects.filter(pk=snapshot_id)
+            .select_related("business_profile", "user")
+            .first()
+        )
     except Exception as e:
         logger.warning("[SEO async] enrich_snapshot_keywords_task snapshot load failed snapshot_id=%s: %s", snapshot_id, e)
         return
@@ -268,10 +360,14 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
     location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
     language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
     user = snapshot.user
-    profile_for_usage = (
-        user.business_profiles.filter(is_main=True).first()
-        or user.business_profiles.first()
-    )
+    # Must match the snapshot row: multi-company accounts share one user; using is_main would
+    # enrich non-main snapshots with the wrong profile (competitors, usage caps, Labs context).
+    profile_for_usage = getattr(snapshot, "business_profile", None)
+    if profile_for_usage is None:
+        profile_for_usage = (
+            user.business_profiles.filter(is_main=True).first()
+            or user.business_profiles.first()
+        )
 
     # Copy so we don't mutate in-place until we're ready to save
     top_keywords: List[Dict[str, Any]] = [dict(k) for k in (getattr(snapshot, "top_keywords", None) or [])]
@@ -410,10 +506,12 @@ def enrich_snapshot_keywords_task(self, snapshot_id: int) -> None:
         outranking_competitor_pct,
     )
 
-    profile_for_metrics = (
-        snapshot.user.business_profiles.filter(is_main=True).first()
-        or snapshot.user.business_profiles.first()
-    )
+    profile_for_metrics = getattr(snapshot, "business_profile", None)
+    if profile_for_metrics is None:
+        profile_for_metrics = (
+            snapshot.user.business_profiles.filter(is_main=True).first()
+            or snapshot.user.business_profiles.first()
+        )
     from .dataforseo_utils import resolve_snapshot_location_context as _resolve_snap_ctx
 
     snapshot_context = _resolve_snap_ctx(
@@ -1571,8 +1669,11 @@ def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
 
     logger.info("[AEO phase4] scoring start run_id=%s profile_id=%s", run.id, run.profile_id)
     try:
+        # Starter profiles: layered scoring (sample → confidence). CONFIDENCE uses strict aggregate
+        # filters and may match zero rows while SAMPLE still produced a row — we must not drop the
+        # sample snapshot_id on the execution run (downstream Phase 5 / staff enqueue require it).
         if _is_onboarding_sample_size_profile(profile):
-            calculate_layered_scores_from_aggregates(
+            sample_score_data = calculate_layered_scores_from_aggregates(
                 profile,
                 execution_run_id=run.id,
                 score_layer=AEOScoreSnapshot.LAYER_SAMPLE,
@@ -1584,11 +1685,22 @@ def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
                 score_layer=AEOScoreSnapshot.LAYER_CONFIDENCE,
                 save=True,
             )
+            snapshot_id = score_data.get("snapshot_id") or sample_score_data.get("snapshot_id")
+            total_prompts = int(score_data.get("total_prompts") or sample_score_data.get("total_prompts") or 0)
+            if snapshot_id is None:
+                score_data = calculate_aeo_scores_for_business(
+                    profile, save=True, execution_run_id=run.id
+                )
+                snapshot_id = score_data.get("snapshot_id")
+                total_prompts = int(score_data.get("total_prompts") or 0)
         else:
             score_data = calculate_aeo_scores_for_business(
                 profile, save=True, execution_run_id=run.id
             )
-        run.score_snapshot_id = score_data.get("snapshot_id")
+            snapshot_id = score_data.get("snapshot_id")
+            total_prompts = int(score_data.get("total_prompts") or 0)
+
+        run.score_snapshot_id = snapshot_id
         run.scoring_status = AEOExecutionRun.STAGE_COMPLETED
         run.save(update_fields=["score_snapshot_id", "scoring_status", "updated_at"])
         logger.info(
@@ -1596,7 +1708,7 @@ def run_aeo_phase4_scoring_task(self, run_id: int) -> None:
             run.id,
             run.profile_id,
             run.score_snapshot_id,
-            int(score_data.get("total_prompts") or 0),
+            total_prompts,
         )
         if _aeo_recommendation_stage_enabled():
             run_aeo_phase5_recommendation_task.delay(run.id)
@@ -2021,6 +2133,7 @@ def trigger_seo_warmup_after_aeo_task(self, run_id: int) -> None:
             run.profile.user,
             site_url=website,
             force_refresh=False,
+            business_profile=run.profile,
         )
         run.seo_triggered_at = django_tz.now()
         run.seo_trigger_status = "success"
@@ -2545,8 +2658,11 @@ def onboarding_onpage_crawl_task(self, crawl_id: int) -> None:
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
     """
-    Build onboarding prompt plan in background immediately after keyword pipeline.
-    Idempotent at crawl level (queued/running/completed states).
+    Build onboarding prompt plan from stored crawl ``review_topics`` (all rows).
+
+    Not enqueued automatically after on-page crawl; onboarding and add-company flows call
+    ``/api/aeo/onboarding-prompt-plan/`` with user-selected topics instead. Kept for tests
+    and any explicit invocation. Idempotent at crawl level (queued/running/completed states).
     """
     from .aeo.aeo_utils import (
         aeo_business_input_from_onboarding_payload,
@@ -2817,7 +2933,7 @@ def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
 def onboarding_review_topics_backfill_task(self, crawl_id: int) -> None:
     """
     Fill ``review_topics`` for legacy crawls that have ranked_keywords but no LLM topics yet.
-    May enqueue ``onboarding_prompt_generation_task`` when topics appear and prompt plan is still pending.
+    Does not enqueue prompt generation; the client requests prompts after topic selection.
     """
     from .models import OnboardingOnPageCrawl
     from .onboarding_review_topics import generate_review_topics_for_domain
@@ -2842,20 +2958,3 @@ def onboarding_review_topics_backfill_task(self, crawl_id: int) -> None:
     crawl.review_topics = rt_list
     crawl.review_topics_error = (rt_err or "")[:2000]
     crawl.save(update_fields=["review_topics", "review_topics_error", "updated_at"])
-
-    if not rt_list:
-        return
-
-    if crawl.prompt_plan_status in {
-        OnboardingOnPageCrawl.PROMPT_PLAN_QUEUED,
-        OnboardingOnPageCrawl.PROMPT_PLAN_RUNNING,
-        OnboardingOnPageCrawl.PROMPT_PLAN_COMPLETED,
-    }:
-        return
-
-    crawl.prompt_plan_status = OnboardingOnPageCrawl.PROMPT_PLAN_QUEUED
-    crawl.prompt_plan_error = ""
-    crawl.save(update_fields=["prompt_plan_status", "prompt_plan_error", "updated_at"])
-    task = onboarding_prompt_generation_task.delay(crawl.id)
-    crawl.prompt_plan_task_id = str(getattr(task, "id", "") or "")[:128]
-    crawl.save(update_fields=["prompt_plan_task_id", "updated_at"])

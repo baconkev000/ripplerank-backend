@@ -1,3 +1,4 @@
+import json
 import logging
 import secrets
 from typing import Optional
@@ -28,6 +29,7 @@ from .business_profile_access import (
     workspace_data_user,
 )
 from .models import (
+    ActionsGeneratedPageSnapshot,
     AEOCompetitorSnapshot,
     AEODashboardBundleCache,
     AgentActivityLog,
@@ -59,6 +61,7 @@ from .dataforseo_utils import (
     seo_snapshot_context_for_profile,
     sort_top_keywords_for_display,
 )
+from .seo_snapshot_refresh import sync_enrich_current_period_seo_snapshot_for_profile
 from .constants import SEO_SNAPSHOT_TTL
 from .onboarding_completion import (
     user_has_completed_full_onboarding,
@@ -1339,6 +1342,11 @@ def seo_overview(request: HttpRequest) -> Response:
     force_refresh = request.GET.get("refresh") == "1"
 
     profile = resolve_main_business_profile_for_user(request.user)
+    if not profile:
+        return Response(
+            {"detail": "No active business profile."},
+            status=400,
+        )
     profile_for_context = profile
     data_user = workspace_data_user(profile) or request.user
     snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile_for_context)
@@ -1347,7 +1355,7 @@ def seo_overview(request: HttpRequest) -> Response:
     if not force_refresh:
         try:
             snapshot = SEOOverviewSnapshot.objects.get(
-                user=data_user,
+                business_profile=profile,
                 period_start=start_current,
                 cached_location_mode=snapshot_mode,
                 cached_location_code=snapshot_location_code,
@@ -1409,7 +1417,7 @@ def seo_overview(request: HttpRequest) -> Response:
 
         # If the website domain has changed since the last fetch, force a fresh
         # DataForSEO call instead of using cached snapshots.
-        domain_cache_key = f"seo_overview_domain:{data_user.id}"
+        domain_cache_key = f"seo_overview_domain:{profile.pk}"
         previous_domain = cache.get(domain_cache_key)
         if previous_domain and previous_domain != domain:
             force_refresh = True
@@ -1449,7 +1457,7 @@ def seo_overview(request: HttpRequest) -> Response:
             )
             try:
                 snapshot = SEOOverviewSnapshot.objects.get(
-                    user=data_user,
+                    business_profile=profile,
                     period_start=start_current,
                     cached_location_mode=snapshot_mode,
                     cached_location_code=snapshot_location_code,
@@ -1483,7 +1491,7 @@ def seo_overview(request: HttpRequest) -> Response:
         # Compute growth vs previous snapshot visibility (stored in organic_visitors).
         try:
             snapshot = SEOOverviewSnapshot.objects.get(
-                user=data_user,
+                business_profile=profile,
                 period_start=start_current,
                 cached_location_mode=snapshot_mode,
                 cached_location_code=snapshot_location_code,
@@ -1498,11 +1506,15 @@ def seo_overview(request: HttpRequest) -> Response:
             organic_growth_pct = ((current_visibility - prev_vis) / prev_vis) * 100.0
 
         snapshot, _ = SEOOverviewSnapshot.objects.get_or_create(
-            user=data_user,
+            business_profile=profile,
             period_start=start_current,
             cached_location_mode=snapshot_mode,
             cached_location_code=snapshot_location_code,
+            defaults={"user": profile.user},
         )
+        if snapshot.user_id != profile.user_id:
+            snapshot.user = profile.user
+            snapshot.save(update_fields=["user"])
         snapshot.organic_visitors = current_visibility
         snapshot.prev_organic_visitors = prev_vis
         snapshot.keywords_ranking = keywords_ranking
@@ -1563,7 +1575,7 @@ def seo_keywords(request: HttpRequest) -> Response:
     snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
     snapshot = (
         SEOOverviewSnapshot.objects.filter(
-            user=data_user,
+            business_profile=profile,
             period_start=start_current,
             cached_domain__iexact=domain,
             cached_location_mode=snapshot_mode,
@@ -1586,10 +1598,11 @@ def seo_keywords(request: HttpRequest) -> Response:
             data_user,
             site_url=site_url,
             force_refresh=force_refresh,
+            business_profile=profile,
         )
         snapshot = (
             SEOOverviewSnapshot.objects.filter(
-                user=data_user,
+                business_profile=profile,
                 period_start=start_current,
                 cached_domain__iexact=domain,
                 cached_location_mode=snapshot_mode,
@@ -1676,12 +1689,13 @@ def seo_keyword_debug(request: HttpRequest) -> Response:
     today = datetime.now(timezone.utc).date()
     start_current = today.replace(day=1)
     profile = resolve_main_business_profile_for_user(request.user)
-    data_user = workspace_data_user(profile) or request.user
+    if not profile:
+        return Response({"detail": "No active business profile."}, status=404)
     snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
 
     snapshot = (
         SEOOverviewSnapshot.objects.filter(
-            user=data_user,
+            business_profile=profile,
             period_start=start_current,
             cached_location_mode=snapshot_mode,
             cached_location_code=snapshot_location_code,
@@ -1690,7 +1704,7 @@ def seo_keyword_debug(request: HttpRequest) -> Response:
         .first()
     )
     if not snapshot:
-        return Response({"detail": "No SEOOverviewSnapshot for this user this month."}, status=404)
+        return Response({"detail": "No SEOOverviewSnapshot for this profile this month."}, status=404)
 
     top_keywords = getattr(snapshot, "top_keywords", None) or []
     matches: list[dict] = []
@@ -1872,6 +1886,7 @@ def business_profile(request: HttpRequest) -> Response:
             get_or_refresh_seo_score_for_user(
                 workspace_data_user(serializer.instance) or request.user,
                 site_url=new_site_url,
+                business_profile=serializer.instance,
             )
         except Exception:
             # Never block profile saves on DataForSEO errors.
@@ -2261,6 +2276,14 @@ def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
             "updated_at",
         ],
     )
+    site = str(getattr(profile, "website_url", "") or "").strip()
+    if site:
+        from .tasks import post_payment_seo_snapshot_task
+
+        def _enqueue_post_payment_seo() -> None:
+            post_payment_seo_snapshot_task.delay(profile.id)
+
+        transaction.on_commit(_enqueue_post_payment_seo)
     return Response({"ok": True, "plan": plan})
 
 
@@ -2300,9 +2323,7 @@ def seo_profile_data(request: HttpRequest) -> Response:
     website = str(getattr(profile, "website_url", "") or "").strip()
     parsed_domain = normalize_domain(website) if website else ""
 
-    snapshots_qs = SEOOverviewSnapshot.objects.filter(
-        user=data_user,
-    )
+    snapshots_qs = SEOOverviewSnapshot.objects.filter(business_profile=profile)
     if parsed_domain:
         snapshots_qs = snapshots_qs.filter(cached_domain__iexact=parsed_domain)
 
@@ -2343,6 +2364,7 @@ def seo_score_history_data(request: HttpRequest) -> Response:
                 data_user,
                 site_url=website,
                 force_refresh=False,
+                business_profile=profile,
             )
         except Exception:
             logger.exception(
@@ -2351,9 +2373,7 @@ def seo_score_history_data(request: HttpRequest) -> Response:
                 website,
             )
 
-    snapshots_qs = SEOOverviewSnapshot.objects.filter(
-        user=data_user,
-    )
+    snapshots_qs = SEOOverviewSnapshot.objects.filter(business_profile=profile)
     if parsed_domain:
         snapshots_qs = snapshots_qs.filter(cached_domain__iexact=parsed_domain)
 
@@ -2375,6 +2395,7 @@ def seo_score_history_data(request: HttpRequest) -> Response:
                 data_user,
                 site_url=website,
                 force_refresh=False,
+                business_profile=profile,
             ) or {}
             current_score = current_bundle.get("seo_score")
             if current_score is not None:
@@ -3339,6 +3360,109 @@ def aeo_mark_recommendation_complete(request: HttpRequest) -> Response:
     AEODashboardBundleCache.objects.filter(profile=profile).delete()
 
     return Response({"ok": True, "completed_strategy_ids": completed_ids})
+
+
+def _profile_location_line(profile: BusinessProfile) -> str:
+    parts = [str(profile.customer_reach_city or "").strip(), str(profile.customer_reach_state or "").strip()]
+    parts = [p for p in parts if p]
+    if parts:
+        return ", ".join(parts)
+    return str(profile.business_address or "").strip()
+
+
+def _profile_service_area_line(profile: BusinessProfile) -> str:
+    reach = str(profile.customer_reach or "").strip().lower()
+    if reach == "local":
+        loc = _profile_location_line(profile)
+        return f"{loc} and surrounding area".strip() if loc else "Local service area"
+    return "Online / nationwide"
+
+
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def actions_generate_page_preview(request: HttpRequest) -> Response:
+    """
+    Structured JSON landing page preview for an action card.
+
+    Returns a stored snapshot when ``action_key`` + ``content_hash`` match a saved row
+    unless ``regenerate`` is true (then OpenAI runs and the snapshot is updated).
+    ``content_hash`` must be a SHA-256 hex string of the canonical generation inputs
+    (keyword, assets, plan steps, business context lines, etc.) so previews refresh when
+    card content changes.
+    """
+    profile = resolve_main_business_profile_for_user(request.user)
+    if not profile:
+        return Response({"error": "Business profile not found."}, status=404)
+
+    action_key = str(request.data.get("action_key") or "").strip()
+    if not action_key or len(action_key) > 500:
+        return Response({"error": "action_key is required (max 500 characters)."}, status=400)
+
+    keyword = str(request.data.get("keyword") or "").strip()
+    if not keyword:
+        return Response({"error": "keyword is required."}, status=400)
+
+    regenerate = request.data.get("regenerate") in (True, "true", "1", 1)
+    content_hash = str(request.data.get("content_hash") or "").strip()[:64]
+
+    if not regenerate and content_hash:
+        snap = (
+            ActionsGeneratedPageSnapshot.objects.filter(profile=profile, action_key=action_key)
+            .only("page_data", "content_hash")
+            .first()
+        )
+        if (
+            snap
+            and (snap.content_hash or "") == content_hash
+            and isinstance(snap.page_data, dict)
+            and isinstance(snap.page_data.get("page"), dict)
+        ):
+            return Response(snap.page_data)
+
+    business_name = str(request.data.get("business_name") or profile.business_name or "").strip()
+    location = str(request.data.get("location") or _profile_location_line(profile) or "").strip()
+    service_area = str(request.data.get("service_area") or _profile_service_area_line(profile) or "").strip()
+    page_type = str(request.data.get("page_type") or "").strip() or None
+
+    raw_issues = request.data.get("seo_issues")
+    seo_issues: list[str] = []
+    if isinstance(raw_issues, list):
+        for x in raw_issues:
+            s = str(x or "").strip()
+            if s:
+                seo_issues.append(s)
+    elif isinstance(raw_issues, str) and raw_issues.strip():
+        seo_issues.append(raw_issues.strip())
+
+    extras = openai_utils.parse_actions_landing_page_request_extras(request.data)
+
+    try:
+        payload = openai_utils.generate_structured_landing_page_preview(
+            keyword=keyword,
+            business_name=business_name or "Your business",
+            location=location or "—",
+            service_area=service_area or "—",
+            seo_issues=seo_issues,
+            page_type=page_type,
+            business_profile=profile,
+            **extras,
+        )
+    except json.JSONDecodeError as exc:
+        logger.warning("actions_generate_page_preview json decode: %s", exc)
+        return Response({"error": "Model returned invalid JSON. Try again."}, status=502)
+    except Exception as exc:
+        logger.exception("actions_generate_page_preview failed")
+        return Response({"error": str(exc)[:500]}, status=502)
+
+    ActionsGeneratedPageSnapshot.objects.update_or_create(
+        profile=profile,
+        action_key=action_key,
+        defaults={"page_data": payload, "content_hash": content_hash},
+    )
+
+    return Response(payload)
 
 
 @csrf_exempt
@@ -4534,6 +4658,33 @@ def business_profile_list(request: HttpRequest) -> Response:
     if profile.is_main:
         existing_qs.exclude(pk=profile.pk).update(is_main=False)
 
+    # Bootstrap SEO snapshot when the profile already has a site URL (add-company flow sets URL on POST).
+    # Without this, PATCH finalize only updates prompts and never hits the "website changed" refresh path.
+    # Mirrors staff ``seo_snapshot_refresh``: force DataForSEO once + enqueue enrichment / next-steps tasks.
+    site_url = str(getattr(profile, "website_url", "") or "").strip()
+    if site_url and normalize_domain(site_url):
+        data_user = workspace_data_user(profile) or request.user
+        try:
+            # Ranked snapshot row (sync) so the client can read basic metrics immediately.
+            get_or_refresh_seo_score_for_user(
+                data_user,
+                site_url=site_url,
+                force_refresh=True,
+                business_profile=profile,
+            )
+            # Full enrichment + metrics (same pipeline as post-payment / refresh-seo-snapshot API),
+            # off the request thread so the add-company modal does not block on DataForSEO.
+            from .tasks import sync_enrich_seo_snapshot_for_profile_task
+
+            transaction.on_commit(
+                lambda pid=profile.pk: sync_enrich_seo_snapshot_for_profile_task.delay(pid)
+            )
+        except Exception:
+            logger.exception(
+                "[business_profile_list] SEO snapshot bootstrap failed profile_id=%s",
+                getattr(profile, "id", None),
+            )
+
     return Response(serializer.data, status=201)
 
 
@@ -4574,7 +4725,7 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
     try:
         snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
         snapshot = SEOOverviewSnapshot.objects.filter(
-            user=data_user,
+            business_profile=profile,
             period_start=start_current,
             cached_domain__iexact=domain,
             cached_location_mode=snapshot_mode,
@@ -4588,9 +4739,13 @@ def refresh_seo_next_steps(request: HttpRequest) -> Response:
         # which will create one and enqueue enrichment tasks; then try again.
         from .dataforseo_utils import get_or_refresh_seo_score_for_user
 
-        get_or_refresh_seo_score_for_user(data_user, site_url=site_url)
+        get_or_refresh_seo_score_for_user(
+            data_user,
+            site_url=site_url,
+            business_profile=profile,
+        )
         snapshot = SEOOverviewSnapshot.objects.filter(
-            user=data_user,
+            business_profile=profile,
             period_start=start_current,
             cached_domain__iexact=domain,
             cached_location_mode=snapshot_mode,
@@ -4643,9 +4798,9 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
     Force a refresh of the SEO snapshot (keywords, rankings, visibility) for the user's
     main business profile, then return the updated profile.
 
-    This calls get_or_refresh_seo_score_for_user with the current website_url so that:
-    - top_keywords (including rank and missed_searches_monthly) are up to date
-    - search_visibility_percent, missed_searches_monthly, etc. are recomputed
+    Uses ``sync_enrich_current_period_seo_snapshot_for_profile`` (same path as post-payment
+    Celery follow-up): bootstraps the current-period row if needed, synchronously enriches
+    keywords and recomputes metrics, then enqueues next-steps and keyword-action tasks.
     """
     user = request.user
 
@@ -4657,7 +4812,6 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
         )
 
     site_url = profile.website_url
-    data_user = workspace_data_user(profile) or user
     logger.info(
         "[refresh_endpoint] module=seo user_id=%s profile_id=%s refresh_started=true external_api_called=false",
         getattr(user, "id", None),
@@ -4665,30 +4819,7 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
     )
     external_api_called = False
     try:
-        # IMPORTANT:
-        # ranked_keywords/live is returning rank_absolute=null in our current pipeline.
-        # If we recompute/save a fresh snapshot here, it overwrites previously-enriched
-        # keyword ranks back to null.
-        #
-        # Instead, we ONLY re-run enrichment tasks (gap keywords + next steps) on the
-        # existing snapshot, so ranks stay intact and refresh is meaningful.
-        from accounts.third_party_usage import usage_profile_context
-
-        from .dataforseo_utils import (
-            normalize_domain,
-            enrich_with_gap_keywords,
-            enrich_with_llm_keywords,
-            enrich_keyword_ranks_from_labs,
-            recompute_snapshot_metrics_from_keywords,
-            normalize_seo_snapshot_metrics,
-        )
-        from .tasks import (
-            generate_snapshot_next_steps_task,
-            generate_keyword_action_suggestions_task,
-        )
-
-        domain = normalize_domain(site_url) or ""
-        if not domain:
+        if not (normalize_domain(site_url) or ""):
             raise ValueError("Could not normalize domain for refresh_seo_snapshot")
 
         force_domain_intersection = False
@@ -4699,240 +4830,21 @@ def refresh_seo_snapshot(request: HttpRequest) -> Response:
         except Exception:
             force_domain_intersection = False
 
-        today = datetime.now(timezone.utc).date()
-        start_current = today.replace(day=1)
-        snapshot_mode, snapshot_location_code = _seo_snapshot_context_for_profile(profile)
-
-        snapshot = SEOOverviewSnapshot.objects.filter(
-            user=data_user,
-            period_start=start_current,
-            cached_location_mode=snapshot_mode,
-            cached_location_code=snapshot_location_code,
-        ).order_by("-last_fetched_at").first()
-
-        # If snapshot doesn't exist yet, fall back to full creation (it will enqueue tasks).
-        if not snapshot:
-            get_or_refresh_seo_score_for_user(data_user, site_url=site_url)
-            snapshot = SEOOverviewSnapshot.objects.filter(
-                user=data_user,
-                period_start=start_current,
-                cached_location_mode=snapshot_mode,
-                cached_location_code=snapshot_location_code,
-            ).order_by("-last_fetched_at").first()
-
-        if snapshot:
-            # Synchronously enrich only keywords so the UI immediately reflects
-            # updated "You rank #X" pills instead of showing cached rank=null
-            # while background tasks are still running.
-            location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
-            language_code = getattr(settings, "DATAFORSEO_LANGUAGE_CODE", "en")
-            user = snapshot.user
-
-            top_keywords: list[dict] = [dict(k) for k in (getattr(snapshot, "top_keywords", None) or [])]
-            with usage_profile_context(profile):
-                enrich_with_gap_keywords(
-                    domain=domain,
-                    location_code=location_code,
-                    language_code=language_code,
-                    user=user,
-                    top_keywords=top_keywords,
-                    force_refresh=force_domain_intersection,
-                )
-                external_api_called = True
-                enrich_with_llm_keywords(
-                    user=user,
-                    location_code=location_code,
-                    top_keywords=top_keywords,
-                )
-                rank_stats = enrich_keyword_ranks_from_labs(
-                    domain=domain,
-                    location_code=location_code,
-                    language_code=language_code,
-                    top_keywords=top_keywords,
-                    user=user,
-                    business_profile=profile,
-                    force_refresh_domain_intersection=force_domain_intersection,
-                )
-                external_api_called = True
-            total = int(rank_stats.get("total") or 0)
-            ranked_after = int(rank_stats.get("non_null_after") or 0)
-            coverage = (ranked_after / total) if total > 0 else 0.0
-            min_coverage = float(getattr(settings, "SEO_RANK_ENRICHMENT_MIN_COVERAGE", 0.05))
-            logger.info(
-                "[SEO refresh] rank enrichment coverage user_id=%s total=%s ranked_after=%s coverage=%.2f%% filled_ranked=%s filled_gap=%s",
-                getattr(user, "id", None),
-                total,
-                ranked_after,
-                coverage * 100.0,
-                int(rank_stats.get("filled_from_ranked") or 0),
-                int(rank_stats.get("filled_from_gap") or 0),
+        sync_result = sync_enrich_current_period_seo_snapshot_for_profile(
+            profile,
+            data_user_fallback=user,
+            force_domain_intersection=force_domain_intersection,
+            abort_on_low_coverage=True,
+        )
+        external_api_called = bool(sync_result.get("external_api_called"))
+        if sync_result.get("aborted_low_coverage"):
+            return Response(
+                {
+                    "detail": sync_result.get("detail"),
+                    "rank_coverage_percent": sync_result.get("rank_coverage_percent"),
+                },
+                status=409,
             )
-            if total > 0 and coverage < min_coverage:
-                refresh_warning = (
-                    "Rank enrichment coverage is too low; refresh aborted to avoid returning all-none ranks."
-                )
-                logger.warning(
-                    "[SEO refresh] %s user_id=%s coverage=%.2f%% threshold=%.2f%%",
-                    refresh_warning,
-                    getattr(user, "id", None),
-                    coverage * 100.0,
-                    min_coverage * 100.0,
-                )
-                return Response(
-                    {
-                        "detail": refresh_warning,
-                        "rank_coverage_percent": round(coverage * 100.0, 2),
-                    },
-                    status=409,
-                )
-
-            max_kw = int(getattr(settings, "SEO_TOP_KEYWORDS_MAX_PERSISTED", 200))
-            for _row in top_keywords:
-                if not (_row or {}).get("keyword_origin"):
-                    _row["keyword_origin"] = "ranked"
-            top_keywords_sorted = sort_top_keywords_for_display(top_keywords, max_rows=max_kw)
-            total_keywords = len(top_keywords_sorted)
-            keywords_with_rank = sum(
-                1 for k in top_keywords_sorted if isinstance(k.get("rank"), int) and (k.get("rank") or 0) > 0
-            )
-            keywords_with_competitor = sum(
-                1
-                for k in top_keywords_sorted
-                if (
-                    (k.get("top_competitor_domain") or k.get("top_competitor"))
-                    or (isinstance(k.get("competitors"), list) and len(k.get("competitors") or []) > 0)
-                )
-            )
-            keywords_with_outranking_competitor = sum(
-                1
-                for k in top_keywords_sorted
-                if (
-                    isinstance(k.get("rank"), int)
-                    and (k.get("rank") or 0) > 0
-                    and (
-                        (
-                            isinstance(k.get("top_competitor_rank"), int)
-                            and (k.get("top_competitor_rank") or 0) > 0
-                            and int(k.get("top_competitor_rank")) < int(k.get("rank"))
-                        )
-                        or (
-                            isinstance(k.get("competitors"), list)
-                            and any(
-                                isinstance(c.get("rank"), int)
-                                and (c.get("rank") or 0) > 0
-                                and int(c.get("rank")) < int(k.get("rank"))
-                                for c in (k.get("competitors") or [])
-                            )
-                        )
-                    )
-                )
-            )
-            rank_pct = (keywords_with_rank / total_keywords * 100.0) if total_keywords > 0 else 0.0
-            competitor_pct = (keywords_with_competitor / total_keywords * 100.0) if total_keywords > 0 else 0.0
-            outranking_competitor_pct = (
-                keywords_with_outranking_competitor / total_keywords * 100.0
-                if total_keywords > 0
-                else 0.0
-            )
-            logger.info(
-                "[SEO refresh] keyword coverage user_id=%s total=%s rank_non_null_pct=%.2f competitor_data_pct=%.2f outranking_competitor_pct=%.2f",
-                getattr(user, "id", None),
-                total_keywords,
-                rank_pct,
-                competitor_pct,
-                outranking_competitor_pct,
-            )
-            metrics = normalize_seo_snapshot_metrics(
-                recompute_snapshot_metrics_from_keywords(
-                    top_keywords=top_keywords_sorted,
-                    domain=domain,
-                    location_code=location_code,
-                    language_code=language_code,
-                    seo_location_mode=str(snapshot_mode or "organic"),
-                    business_profile=profile,
-                )
-            )
-            logger.info(
-                "[SEO refresh] recompute user_id=%s keywords_with_rank=%s estimated_traffic_before=%s estimated_traffic_after=%s appearances_before=%s appearances_after=%s total_search_volume_before=%s total_search_volume_after=%s visibility_before=%s visibility_after=%s missed_before=%s missed_after=%s",
-                getattr(user, "id", None),
-                keywords_with_rank,
-                int(snapshot.organic_visitors or 0),
-                int(metrics.get("estimated_traffic") or 0),
-                int(snapshot.estimated_search_appearances_monthly or 0),
-                int(metrics.get("estimated_search_appearances_monthly") or 0),
-                int(snapshot.total_search_volume or 0),
-                int(metrics.get("total_search_volume") or 0),
-                int(snapshot.search_visibility_percent or 0),
-                int(metrics.get("search_visibility_percent") or 0),
-                int(snapshot.missed_searches_monthly or 0),
-                int(metrics.get("missed_searches_monthly") or 0),
-            )
-            if (
-                keywords_with_rank > 0
-                and int(metrics.get("search_visibility_percent") or 0) == 0
-                and int(metrics.get("total_search_volume") or 0) > 0
-            ):
-                logger.warning(
-                    "[SEO refresh] consistency_check user_id=%s ranked_keywords=%s visibility_zero_with_volume=true",
-                    getattr(user, "id", None),
-                    keywords_with_rank,
-                )
-            with transaction.atomic():
-                snapshot_context = {
-                    "mode": snapshot_mode,
-                    "code": snapshot_location_code,
-                    "label": "",
-                }
-                if snapshot_mode == "local":
-                    default_location_code = int(getattr(settings, "DATAFORSEO_LOCATION_CODE", 2840))
-                    resolved_code, _used_fallback, resolved_label = get_profile_location_code(profile, default_location_code)
-                    snapshot_context["code"] = int(resolved_code or 0)
-                    snapshot_context["label"] = str(resolved_label or "")
-                snapshot.top_keywords = top_keywords_sorted
-                snapshot.keywords_enriched_at = datetime.now(timezone.utc)
-                snapshot.refreshed_at = datetime.now(timezone.utc)
-                snapshot.organic_visitors = int(metrics["estimated_traffic"])
-                snapshot.total_search_volume = int(metrics["total_search_volume"])
-                snapshot.estimated_search_appearances_monthly = int(metrics["estimated_search_appearances_monthly"])
-                snapshot.search_visibility_percent = int(metrics["search_visibility_percent"])
-                snapshot.missed_searches_monthly = int(metrics["missed_searches_monthly"])
-                snapshot.search_performance_score = int(metrics["search_performance_score"])
-                snapshot.keywords_ranking = int(metrics["keywords_ranking"])
-                snapshot.top3_positions = int(metrics["top3_positions"])
-                snapshot.cached_location_mode = str(snapshot_context.get("mode") or "organic")
-                snapshot.cached_location_code = int(snapshot_context.get("code") or 0)
-                snapshot.cached_location_label = str(snapshot_context.get("label") or "")
-                snapshot.local_verification_applied = any(
-                    str((row or {}).get("rank_source") or "baseline") == "local_verified"
-                    for row in top_keywords_sorted
-                )
-                snapshot.local_verified_keyword_count = sum(
-                    1 for row in top_keywords_sorted if (row or {}).get("local_verified_rank") is not None
-                )
-                snapshot.save(
-                    update_fields=[
-                        "top_keywords",
-                        "keywords_enriched_at",
-                        "refreshed_at",
-                        "organic_visitors",
-                        "total_search_volume",
-                        "estimated_search_appearances_monthly",
-                        "search_visibility_percent",
-                        "missed_searches_monthly",
-                        "search_performance_score",
-                        "keywords_ranking",
-                        "top3_positions",
-                        "cached_location_mode",
-                        "cached_location_code",
-                        "cached_location_label",
-                        "local_verification_applied",
-                        "local_verified_keyword_count",
-                    ]
-                )
-
-            # Next steps / action suggestions can remain async.
-            generate_snapshot_next_steps_task.delay(snapshot.id)
-            generate_keyword_action_suggestions_task.delay(snapshot.id)
     except Exception:
         # Never block the UI on SEO refresh failures; return the profile anyway.
         pass
@@ -5003,6 +4915,7 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
                 get_or_refresh_seo_score_for_user(
                     request.user,
                     site_url=new_site_url,
+                    business_profile=profile,
                 )
             except Exception:
                 pass

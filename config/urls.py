@@ -101,6 +101,11 @@ urlpatterns += [
         name="aeo-mark-recommendation-complete",
     ),
     path(
+        "api/actions/generate-page-preview/",
+        accounts_views.actions_generate_page_preview,
+        name="actions-generate-page-preview",
+    ),
+    path(
         "api/aeo/platform-visibility/",
         accounts_views.aeo_platform_visibility_data,
         name="aeo-platform-visibility-data",

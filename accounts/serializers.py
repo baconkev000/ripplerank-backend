@@ -74,7 +74,7 @@ def _fallback_top_keywords_from_stored_snapshots(profile: BusinessProfile) -> li
     loc_mode, loc_code = seo_snapshot_context_for_profile(profile)
     qs = (
         SEOOverviewSnapshot.objects.filter(
-            user=profile.user,
+            business_profile=profile,
             cached_domain__iexact=domain,
             cached_location_mode=str(loc_mode or "organic"),
             cached_location_code=int(loc_code or 0),
@@ -89,13 +89,13 @@ def _fallback_top_keywords_from_stored_snapshots(profile: BusinessProfile) -> li
     return []
 
 
-def _skip_heavy_latest_seo_snapshot_actions_payload(user) -> dict:
+def _skip_heavy_latest_seo_snapshot_actions_payload(profile: BusinessProfile) -> dict:
     """
     When ``skip_heavy_profile_metrics`` avoids calling DataForSEO, still expose stored
-    SEO overview actions from the latest ``SEOOverviewSnapshot`` for this user (same
-    ordering as ``get_top_keywords`` skip-heavy branch: ``-last_fetched_at``, ``-id``).
+    SEO overview actions from the latest ``SEOOverviewSnapshot`` for this business profile
+    (same ordering as ``get_top_keywords`` skip-heavy branch: ``-last_fetched_at``, ``-id``).
     """
-    if not user:
+    if not profile:
         return {
             "seo_next_steps": [],
             "keyword_action_suggestions": [],
@@ -103,7 +103,7 @@ def _skip_heavy_latest_seo_snapshot_actions_payload(user) -> dict:
             "enrichment_status": "complete",
         }
     snap = (
-        SEOOverviewSnapshot.objects.filter(user=user)
+        SEOOverviewSnapshot.objects.filter(business_profile=profile)
         .order_by("-last_fetched_at", "-id")
         .only(
             "seo_next_steps",
@@ -548,7 +548,6 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     def _get_seo_bundle(self, obj: BusinessProfile) -> dict | None:
         context = getattr(self, "context", {}) or {}
         if context.get("skip_heavy_profile_metrics"):
-            setattr(self, "_seo_bundle_cache", None)
             return None
 
         user = getattr(obj, "user", None)
@@ -561,10 +560,13 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             )
             return None
 
-        # Simple per-instance cache so we only call the helper once per profile.
-        cache_attr = "_seo_bundle_cache"
-        if hasattr(self, cache_attr):
-            return getattr(self, cache_attr)
+        # Per-profile-id cache: DRF reuses one child serializer for many=True lists; a single
+        # attribute would serve every row the first profile's bundle.
+        cache_attr = "_seo_bundle_cache_by_profile_id"
+        cache_map = getattr(self, cache_attr, None)
+        pid = getattr(obj, "id", None)
+        if pid is not None and isinstance(cache_map, dict) and pid in cache_map:
+            return cache_map[pid]
 
         try:
             logger.info(
@@ -572,13 +574,21 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 getattr(user, "id", None),
                 site_url,
             )
-            data = get_or_refresh_seo_score_for_user(user, site_url=site_url or None)
+            data = get_or_refresh_seo_score_for_user(
+                user,
+                site_url=site_url or None,
+                business_profile=obj,
+            )
+            if not isinstance(cache_map, dict):
+                cache_map = {}
+            if pid is not None:
+                cache_map[pid] = data
+                setattr(self, cache_attr, cache_map)
             if not data:
                 logger.info(
                     "[BusinessProfileSerializer] get_seo_score: no data returned for user_id=%s",
                     getattr(user, "id", None),
                 )
-                setattr(self, cache_attr, None)
                 return None
 
             logger.info(
@@ -586,7 +596,6 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 {k: data.get(k) for k in ["seo_score", "search_performance_score"]},
                 getattr(user, "id", None),
             )
-            setattr(self, cache_attr, data)
             return data
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception(
@@ -594,7 +603,11 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
                 getattr(user, "id", None),
                 str(exc)[:300],
             )
-            setattr(self, cache_attr, None)
+            if pid is not None:
+                if not isinstance(cache_map, dict):
+                    cache_map = {}
+                cache_map[pid] = None
+                setattr(self, cache_attr, cache_map)
             return None
 
     def get_seo_score(self, obj: BusinessProfile) -> int | None:
@@ -651,7 +664,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         if context.get("skip_heavy_profile_metrics"):
             # Cached snapshot only — lets onboarding hydrate keyword topics without DataForSEO.
             snap = (
-                SEOOverviewSnapshot.objects.filter(user=obj.user)
+                SEOOverviewSnapshot.objects.filter(business_profile=obj)
                 .order_by("-last_fetched_at", "-id")
                 .only("top_keywords")
                 .first()
@@ -676,8 +689,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         pid = getattr(obj, "id", None)
         if isinstance(cache_map, dict) and pid in cache_map:
             return cache_map[pid]
-        user = getattr(obj, "user", None)
-        payload = _skip_heavy_latest_seo_snapshot_actions_payload(user)
+        payload = _skip_heavy_latest_seo_snapshot_actions_payload(obj)
         if not isinstance(cache_map, dict):
             cache_map = {}
         cache_map[pid] = payload

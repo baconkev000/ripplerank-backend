@@ -7,7 +7,7 @@ Keeps all OpenAI client usage and message formatting in one place.
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Mapping
 
 from django.conf import settings
 from django.http import HttpRequest
@@ -399,16 +399,18 @@ def _enforce_structured_recommendation_constraints(rows: list[dict[str, Any]]) -
 
 def generate_seo_next_steps(seo_data: dict, *, snapshot: Any | None = None) -> list[dict]:
     """
-    Produce up to eight structured next steps grounded in ``build_structured_issues`` evidence, reframed
-    for answer engines (AI assistants, Perplexity-style answers, AI Overviews): citeable blocks,
-    entity clarity, and page-level actions—not generic “rank higher” advice.
+    Produce up to eight structured next steps grounded in ``build_structured_issues`` evidence.
+
+    Each step is rewritten for non-technical business owners: clear outcome title, plain-language
+    ``why_it_matters``, optional ``expected_benefit``, and owner-friendly steps. Technical SEO work
+    is directed to ``internal_notes`` only (not mixed into customer-facing copy).
 
     ``seo_data`` should include scores, ``top_keywords``, and optionally ``on_page`` / ``serp`` for the
     deterministic issue engine. When ``snapshot`` is set, merges crawl-derived FAQ signals and
     persists structured issues on the snapshot.
 
-    Returns the same dict shape as before (``title``, ``why_it_matters``, ``exact_fix``, ``example``,
-    plus ``label`` / ``tag`` for backward compatibility).
+    Returns dicts with ``title``, ``why_it_matters``, ``exact_fix``, ``example``, optional
+    ``expected_benefit`` / ``internal_notes`` / ``action_card``, plus ``label`` / ``tag`` for compatibility.
     """
     if not seo_data:
         return []
@@ -531,14 +533,35 @@ def generate_keyword_action_suggestions(
 
 # System prompt for LLM rewrite of deterministic SEO issues → display-ready action cards.
 SEO_STRUCTURED_REWRITE_SYSTEM_PROMPT = (
-    "You are generating ACTION-CARD DATA for a frontend Actions page.\n"
-    "Focus on clarity, scanability, and implementation detail for SEO/AEO improvements that improve AI-answer inclusion "
-    "and citation likelihood in assistants (Google SGE/AI Overviews, ChatGPT, Perplexity).\n\n"
-    "Use wording that makes cited/cite outcomes explicit when supported by evidence.\n"
-    "INPUT JSON contains:\n"
-    "- actions[] (prioritized deterministic fixes)\n"
-    "- keywords[] (keyword-level context)\n"
-    "- optional snapshot context\n\n"
+    "You are a business coach and marketing consultant generating ACTION-CARD DATA for a non-technical business owner.\n"
+    "Write like a friendly expert explaining growth steps — NOT like SEO software, a developer tool, or an audit report.\n\n"
+    "INPUT JSON contains prioritized deterministic actions plus keyword context. Use it ONLY to infer what to recommend; "
+    "never echo internal issue_ids, snake_case slugs, or raw diagnostic labels in user-facing strings.\n\n"
+    "TITLE (most important):\n"
+    "- One clear, human headline that describes a BUSINESS OUTCOME (visibility, trust, or conversion).\n"
+    "- Must be understandable in one second with zero SEO vocabulary.\n"
+    "- Convert abstract or technical labels into outcomes. BAD: local_trust_gap, LocalBusiness schema, open places near me optimization. "
+    "GOOD: Make your business easier to find in local searches; Help customers choose you with clearer contact details.\n\n"
+    "WHY IT MATTERS:\n"
+    "- Plain language only: how this affects customers finding them, trusting them, or taking action.\n"
+    "- No algorithm talk, ranking-math, or search-engine mechanics.\n\n"
+    "EXPECTED BENEFIT (recommended):\n"
+    "- One short outcome sentence, e.g. More local customers can discover your business when they search nearby.\n\n"
+    "STEPS (user-facing only):\n"
+    "- Short, imperative, real-world actions the owner can take or delegate (website copy, contact page, service area wording).\n"
+    "- No schema/JSON-LD/markup instructions here.\n\n"
+    "IMPLEMENTATION SEPARATION (critical):\n"
+    "- Put ALL technical SEO implementation (schema types, JSON-LD, NAP consistency, canonicals, hreflang, crawl/index notes, "
+    "markup names like LocalBusiness/FAQPage, developer-only fixes) in internal_notes ONLY.\n"
+    "- internal_notes must NEVER be copied into title, subtitle, goal, why_it_matters, steps, example, or copy_paste_content.\n"
+    "- Leave schema_requirements as an empty array [] (technical items belong in internal_notes only).\n\n"
+    "TERMINOLOGY — never use these in user-facing fields; if a concept is needed, plain-English only:\n"
+    "- Schema / JSON-LD / structured data → say search engine information or describe the visitor outcome without naming formats.\n"
+    "- NAP → business contact details (name, address, phone).\n"
+    "- Indexing → showing up in search results.\n"
+    "- Ranking signals → visibility in search results.\n"
+    "- LocalBusiness markup / FAQPage schema → omit entirely from user-facing text.\n\n"
+    "PRIORITY LENS: each action should map loosely to Visibility (being found), Trust (being chosen), or Conversion (getting customers).\n\n"
     "Return ONLY valid JSON. No markdown. No extra prose.\n"
     "Preferred output shape:\n"
     "{"
@@ -550,24 +573,27 @@ SEO_STRUCTURED_REWRITE_SYSTEM_PROMPT = (
     "\"priority\":\"high|medium|low\","
     "\"title\":\"...\","
     "\"subtitle\":\"...\","
+    "\"why_it_matters\":\"...\","
+    "\"expected_benefit\":\"...\","
     "\"goal\":\"...\","
     "\"whats_missing\":[\"...\"],"
+    "\"internal_notes\":[\"...\"],"
     "\"steps\":[{\"step_number\":1,\"title\":\"...\",\"instruction\":\"...\"}],"
     "\"copy_paste_content\":{\"local_trust_block\":\"...\",\"faq\":[{\"q\":\"...\",\"a\":\"...\"}],\"quick_facts\":[\"...\"]},"
-    "\"schema_requirements\":[\"...\"],"
+    "\"schema_requirements\":[],"
     "\"internal_linking\":[{\"from_or_section\":\"...\",\"to_url\":\"...\",\"anchor_hint\":\"...\"}],"
     "\"target_url\":\"...\","
-    "\"ai_optimization_notes\":{\"why_it_helps\":[\"...\"],\"expected_impact\":[\"...\"]},"
     "\"evidence\":{\"keyword\":\"...\",\"search_volume\":0,\"rank\":0,\"competitor_rank\":0,\"competitor_domains\":[\"...\"],\"location\":\"...\",\"source_issue_ids\":[\"...\"]},"
-    "\"display_hints\":{\"expanded_by_default\":false,\"show_copy_paste_section\":true,\"show_schema_section\":true,\"show_internal_linking_section\":true}"
+    "\"display_hints\":{\"expanded_by_default\":false,\"show_copy_paste_section\":true,\"show_schema_section\":false,\"show_internal_linking_section\":true}"
     "}]"
     "}\n"
-    "If you cannot build the full card, return legacy compact JSON with keys title, why_it_matters, exact_fix, example.\n\n"
+    "If you cannot build the full card, return legacy compact JSON with keys: "
+    "title, why_it_matters, exact_fix, example, optional expected_benefit, optional internal_notes (string array).\n\n"
     "STRICT RULES:\n"
     "- Do NOT invent keywords, ranks, URLs, search volumes, competitor domains, location, or issue IDs.\n"
     "- Deduplicate overlapping recommendations and keep the richer merged result.\n"
-    "- No vague directives like 'optimize SEO' or 'improve content' without exact sections/actions.\n"
-    "- Steps must be imperative and implementation-ready.\n"
+    "- No vague directives like 'optimize SEO' or 'improve content' without concrete owner-friendly steps.\n"
+    "- whats_missing should be short customer-facing gaps (plain English), not developer tickets.\n"
     "- Use empty strings/arrays instead of guessing unknown values.\n"
 )
 
@@ -576,18 +602,36 @@ _SEO_VAGUE_PATTERN = re.compile(
     r"get\s+more\s+traffic|drive\s+more\s+clicks|climb\s+the\s+serp)\b",
     re.IGNORECASE,
 )
-_SEO_ACTION_PATTERN = re.compile(
-    r"\b(create|add|publish|rewrite|expand|implement|build|update|link|schema|section|page|heading|h1|h2|faq|"
-    r"table|comparison|entity|snippet|paragraph|list|bullet|quote|citat|mentionable|answer block|internal\s+link|"
-    r"subhead|structured\s+data|json-ld|proof|testimonial|q&a|question)\b",
+# Owner-friendly steps should sound like real marketing tasks, not developer tickets.
+_SUBSTANTIVE_OWNER_STEP_PATTERN = re.compile(
+    r"\b(add|show|write|update|include|put|create|list|describe|mention|phone|address|hours?|"
+    r"services?|service\s+area|neighborhood|city|cities|towns?|contact|website|web\s+site|homepage|"
+    r"contact\s+page|location|map|directions|reviews?|photos?|customers|business\s+name|"
+    r"clearly|where\s+you\s+serve|serve|serving|book|call|email|form|page|section|paragraph|"
+    r"headline|intro|about|team|coverage|areas?)\b",
     re.IGNORECASE,
 )
-# Vague “AI visibility” claims without concrete edits (must still match _SEO_ACTION_PATTERN somewhere in exact_fix).
+# Vague “AI visibility” claims without concrete owner-facing steps.
 _AEO_VAGUE_PATTERN = re.compile(
     r"\b(ai\s+visibility|be\s+seen\s+in\s+ai|win\s+at\s+aeo|dominate\s+ai)\b",
     re.IGNORECASE,
 )
 _BANNED_GENERIC_WORDS = re.compile(r"\b(optimi[sz]e|improve|enhance)\b", re.IGNORECASE)
+_SEO_FORBIDDEN_USER_JARGON = re.compile(
+    r"\b(?:schema|json-ld|json\s*ld|structured\s+data|localbusiness|faqpage|naps?|ranking\s+signals?|"
+    r"indexation|indexing|crawl\s+budget|canonicals?|301\s+redirect|hreflang|rich\s+results|entity\s+signals?|"
+    r"eeat|e-e-a-t|serps?|sge|search\s+console|core\s+web\s+vitals|lcp|cls)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_internal_issue_slug(title: str) -> bool:
+    t = (title or "").strip()
+    if not t or " " in t:
+        return False
+    if "_" not in t:
+        return False
+    return bool(re.match(r"^[a-z0-9_]+$", t.lower()))
 
 
 def _seo_rewrite_output_is_valid(payload: dict, recommendation: dict) -> bool:
@@ -596,18 +640,22 @@ def _seo_rewrite_output_is_valid(payload: dict, recommendation: dict) -> bool:
     fix = str(payload.get("exact_fix") or "").strip()
     if not title or not why or not fix:
         return False
-    if _SEO_VAGUE_PATTERN.search(fix) and not _SEO_ACTION_PATTERN.search(fix):
+    if _looks_like_internal_issue_slug(title):
         return False
-    if _AEO_VAGUE_PATTERN.search(fix) and not _SEO_ACTION_PATTERN.search(fix):
+    blob = f"{title} {why} {fix} {payload.get('example') or ''}"
+    if _SEO_FORBIDDEN_USER_JARGON.search(blob):
         return False
-    if _BANNED_GENERIC_WORDS.search(fix) and not _SEO_ACTION_PATTERN.search(fix):
+    if len(fix) < 35:
         return False
-    if len(fix) < 20:
+    if _SEO_VAGUE_PATTERN.search(fix) and not _SUBSTANTIVE_OWNER_STEP_PATTERN.search(fix):
+        return False
+    if _AEO_VAGUE_PATTERN.search(fix) and not _SUBSTANTIVE_OWNER_STEP_PATTERN.search(fix):
+        return False
+    if _BANNED_GENERIC_WORDS.search(fix) and not _SUBSTANTIVE_OWNER_STEP_PATTERN.search(fix):
         return False
     evidence = recommendation.get("evidence") or {}
     keyword = str(evidence.get("primary_keyword") or evidence.get("keyword") or "").strip().lower()
     url = str(evidence.get("url") or evidence.get("your_url") or "").strip().lower()
-    # When we have concrete context, ensure rewritten output keeps at least one anchor.
     combined = f"{title} {why} {fix} {payload.get('example') or ''}".lower()
     if keyword and keyword not in combined and url and url not in combined:
         return False
@@ -622,11 +670,17 @@ def _coerce_rewrite_payload_to_legacy(data: dict) -> dict:
     if not isinstance(data, dict):
         return {}
     if all(k in data for k in ("title", "why_it_matters", "exact_fix")):
+        internal_notes = data.get("internal_notes")
+        if not isinstance(internal_notes, list):
+            internal_notes = []
+        internal_notes = [str(x).strip() for x in internal_notes if str(x).strip()]
         return {
             "title": str(data.get("title") or "").strip(),
             "why_it_matters": str(data.get("why_it_matters") or "").strip(),
             "exact_fix": str(data.get("exact_fix") or "").strip(),
             "example": str(data.get("example") or "").strip(),
+            "expected_benefit": str(data.get("expected_benefit") or "").strip(),
+            "internal_notes": internal_notes,
         }
 
     cards = data.get("actions")
@@ -634,8 +688,12 @@ def _coerce_rewrite_payload_to_legacy(data: dict) -> dict:
         first_card = cards[0]
         title = str(first_card.get("title") or "").strip()
         goal = str(first_card.get("goal") or "").strip()
+        why_direct = str(first_card.get("why_it_matters") or "").strip()
         missing = [str(x).strip() for x in list(first_card.get("whats_missing") or []) if str(x).strip()]
-        why = " ".join([x for x in [goal, ". ".join(missing[:2])] if x]).strip()
+        # Prefer explicit why_it_matters / goal; do not merge technical whats_missing into the main explanation.
+        why = why_direct or goal
+        if not why and missing:
+            why = ". ".join(missing[:3])
 
         steps = list(first_card.get("steps") or [])
         step_lines: list[str] = []
@@ -667,11 +725,26 @@ def _coerce_rewrite_payload_to_legacy(data: dict) -> dict:
             elif isinstance(quick, list) and quick:
                 example = str(quick[0] or "").strip()
 
+        exp_ben = str(first_card.get("expected_benefit") or "").strip()
+        if not exp_ben:
+            ai_notes = first_card.get("ai_optimization_notes") or {}
+            if isinstance(ai_notes, dict):
+                exp_lines = ai_notes.get("expected_impact")
+                if isinstance(exp_lines, list) and exp_lines:
+                    exp_ben = str(exp_lines[0] or "").strip()
+
+        internal_raw = first_card.get("internal_notes")
+        internal_notes: list[str] = []
+        if isinstance(internal_raw, list):
+            internal_notes = [str(x).strip() for x in internal_raw if str(x).strip()]
+
         return {
             "title": title,
             "why_it_matters": why,
             "exact_fix": exact_fix,
             "example": example,
+            "expected_benefit": exp_ben,
+            "internal_notes": internal_notes,
             "action_card": first_card,
         }
 
@@ -709,11 +782,18 @@ def _coerce_rewrite_payload_to_legacy(data: dict) -> dict:
         elif isinstance(quick, list) and quick:
             example = str(quick[0] or "").strip()
 
+    internal_raw = first.get("internal_notes")
+    internal_notes: list[str] = []
+    if isinstance(internal_raw, list):
+        internal_notes = [str(x).strip() for x in internal_raw if str(x).strip()]
+
     return {
         "title": title,
         "why_it_matters": why,
         "exact_fix": exact_fix,
         "example": example,
+        "expected_benefit": str(first.get("expected_benefit") or "").strip(),
+        "internal_notes": internal_notes,
     }
 
 
@@ -723,8 +803,10 @@ def _rewrite_structured_seo_recommendation(
     snapshot_context: dict | None = None,
 ) -> dict:
     """
-    AI rewrite layer for deterministic SEO issue recommendations, reframed for AI answer / citation use
-    without changing structured keys (title, why_it_matters, exact_fix, example).
+    AI rewrite layer for deterministic SEO issue recommendations.
+
+    Produces owner-friendly ``title``, ``why_it_matters``, and ``exact_fix`` plus optional
+    ``expected_benefit`` and ``internal_notes`` (technical items must stay in internal_notes only).
     """
     system = SEO_STRUCTURED_REWRITE_SYSTEM_PROMPT
     ev = recommendation.get("evidence") or {}
@@ -756,6 +838,10 @@ def _rewrite_structured_seo_recommendation(
         "why_it_matters": str(recommendation.get("why_it_matters") or "").strip(),
         "exact_fix": str(recommendation.get("exact_fix") or "").strip(),
         "example": str(recommendation.get("example") or "").strip(),
+        "expected_benefit": str(recommendation.get("expected_benefit") or "").strip(),
+        "internal_notes": list(recommendation.get("internal_notes") or [])
+        if isinstance(recommendation.get("internal_notes"), list)
+        else [],
     }
 
     for _ in range(2):
@@ -863,6 +949,297 @@ def generate_aeo_recommendations(aeo_data: dict, seo_data: dict | None = None) -
         return []
 
 
+def _strip_json_fence(text: str) -> str:
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
+        if "```" in raw:
+            raw = raw.rsplit("```", 1)[0].strip()
+    return raw
+
+
+def _gp_trunc(s: str, max_len: int) -> str:
+    t = " ".join(str(s or "").split()).strip()
+    if len(t) <= max_len:
+        return t
+    return t[: max(0, max_len - 1)].rstrip() + "…"
+
+
+def _gp_as_str_list(raw: Any, cap: int, item_max: int = 480) -> list[str]:
+    out: list[str] = []
+    if isinstance(raw, list):
+        for x in raw:
+            s = _gp_trunc(str(x or ""), item_max)
+            if s:
+                out.append(s)
+            if len(out) >= cap:
+                break
+    elif isinstance(raw, str) and raw.strip():
+        out.append(_gp_trunc(raw.strip(), item_max))
+    return out[:cap]
+
+
+def _gp_parse_faqs(raw: Any, cap: int = 8, qa_max: int = 480) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw[: cap * 2]:
+        if not isinstance(item, dict):
+            continue
+        q = _gp_trunc(str(item.get("q") or item.get("question") or ""), qa_max)
+        a = _gp_trunc(str(item.get("a") or item.get("answer") or ""), qa_max)
+        if q and a:
+            out.append({"q": q, "a": a})
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _gp_parse_plan_steps(raw: Any, cap: int = 12, title_max: int = 200, instr_max: int = 900) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return out
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        try:
+            sn = int(item.get("step_number", i + 1))
+        except (TypeError, ValueError):
+            sn = i + 1
+        title = _gp_trunc(str(item.get("title") or ""), title_max)
+        instruction = _gp_trunc(str(item.get("instruction") or ""), instr_max)
+        if title or instruction:
+            out.append({"step_number": sn, "title": title, "instruction": instruction})
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _gp_parse_internal_links(raw: Any, cap: int = 12) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            {
+                "from_or_section": _gp_trunc(str(item.get("from_or_section") or ""), 200),
+                "to_url": _gp_trunc(str(item.get("to_url") or ""), 400),
+                "anchor_hint": _gp_trunc(str(item.get("anchor_hint") or ""), 200),
+            }
+        )
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _build_actions_landing_page_context_block(
+    *,
+    seo_issues: list[str],
+    action_faqs: list[dict[str, str]],
+    trust_block: str,
+    quick_facts: list[str],
+    plan_steps: list[dict[str, Any]],
+    internal_links: list[dict[str, str]],
+    affected_keywords: list[str],
+    target_keywords: list[str],
+    copy_example: str,
+) -> str:
+    """Human-readable block for the user message (bounded)."""
+    lines: list[str] = []
+
+    issues_lines = "\n".join(f"- {_gp_trunc(str(x), 480)}" for x in (seo_issues or [])[:32] if str(x).strip())
+    if not issues_lines.strip():
+        issues_lines = "- None specified"
+    lines.append(
+        "INTERNAL — Topic and service gaps (structure the page around these in natural language only; "
+        "never present them as an audit, checklist, or SEO/ranking explanation on the page)"
+    )
+    lines.append(issues_lines)
+
+    if action_faqs:
+        lines.append("\nASSETS — FAQ (use faithfully where relevant; do not invent Q/As beyond these)")
+        for pair in action_faqs:
+            lines.append(f"Q: {pair.get('q', '')}\nA: {pair.get('a', '')}")
+
+    tb = (trust_block or "").strip()
+    if tb:
+        lines.append("\nASSETS — Business facts / local context (use verbatim where appropriate; do not invent credentials)")
+        lines.append(tb)
+
+    if quick_facts:
+        lines.append("\nASSETS — Quick facts / citation bullets")
+        for qf in quick_facts:
+            lines.append(f"- {_gp_trunc(qf, 480)}")
+
+    if plan_steps:
+        lines.append("\nPLAN — Full steps (titles + instructions; follow this execution detail)")
+        for st in plan_steps:
+            sn = st.get("step_number", "")
+            title = str(st.get("title") or "").strip()
+            instr = str(st.get("instruction") or "").strip()
+            lines.append(f"{sn}. {title}\n   {instr}" if title else f"{sn}. {instr}")
+
+    if internal_links:
+        lines.append("\nASSETS — Internal link hints")
+        for link in internal_links:
+            lines.append(
+                f"- From/section: {link.get('from_or_section', '')} → URL: {link.get('to_url', '')} "
+                f"(anchor hint: {link.get('anchor_hint', '')})"
+            )
+
+    if affected_keywords:
+        lines.append("\nDATA — Affected / cluster keywords")
+        lines.append(", ".join(_gp_trunc(k, 80) for k in affected_keywords))
+
+    if target_keywords:
+        lines.append("\nDATA — Target keywords")
+        lines.append(", ".join(_gp_trunc(k, 80) for k in target_keywords))
+
+    ce = (copy_example or "").strip()
+    if ce:
+        lines.append("\nASSETS — Example / long-form copy snippet")
+        lines.append(ce)
+
+    return "\n".join(lines)
+
+
+def parse_actions_landing_page_request_extras(data: Any) -> dict[str, Any]:
+    """Normalize optional structured fields from the generate-page-preview POST body."""
+    raw: dict[str, Any] = dict(data) if isinstance(data, Mapping) else {}
+    return {
+        "action_faqs": _gp_parse_faqs(raw.get("action_faqs")),
+        "trust_block": _gp_trunc(str(raw.get("trust_block") or ""), 900),
+        "quick_facts": _gp_as_str_list(raw.get("quick_facts"), 10),
+        "plan_steps": _gp_parse_plan_steps(raw.get("plan_steps")),
+        "internal_links": _gp_parse_internal_links(raw.get("internal_links")),
+        "affected_keywords": _gp_as_str_list(raw.get("affected_keywords"), 12, 120),
+        "target_keywords": _gp_as_str_list(raw.get("target_keywords"), 12, 120),
+        "copy_example": _gp_trunc(str(raw.get("copy_example") or ""), 900),
+    }
+
+
+def generate_structured_landing_page_preview(
+    *,
+    keyword: str,
+    business_name: str,
+    location: str,
+    service_area: str,
+    seo_issues: list[str],
+    page_type: str | None = None,
+    business_profile: BusinessProfile | None = None,
+    action_faqs: list[dict[str, str]] | None = None,
+    trust_block: str = "",
+    quick_facts: list[str] | None = None,
+    plan_steps: list[dict[str, Any]] | None = None,
+    internal_links: list[dict[str, str]] | None = None,
+    affected_keywords: list[str] | None = None,
+    target_keywords: list[str] | None = None,
+    copy_example: str = "",
+) -> dict[str, Any]:
+    """
+    Ask OpenAI for a strict JSON document describing a landing page as a tree of UI components.
+
+    Prompts favor natural business copy and forbid audit/schema/ranking meta language; internal
+    SEO issue lines are framing only. Returns a dict with top-level key ``page`` (title, slug, components).
+    """
+    system = (
+        "You are an expert UX copywriter and landing page architect. Generate a high-converting, "
+        "natural-sounding local service landing page as STRICT JSON ONLY (no HTML, no markdown, no prose outside JSON).\n\n"
+        "Write like a real business website—not an SEO tool, audit report, or AI system. Hide all search/optimization mechanics; "
+        "never explain why content exists.\n\n"
+        "FORBIDDEN anywhere in visitor-facing strings: mentions of schema, JSON-LD, structured data, SEO implementation, "
+        "ranking signals, meta commentary about search engines or AI, or artificial section titles such as "
+        "\"Trust & Verification\", \"Business Credentials\", \"SEO Schema Implementation\", \"Ranking Signals\", "
+        "or \"Certified Local Provider\" unless explicitly provided in inputs. Do not fabricate ratings, review counts, "
+        "or certifications. Do not use \"verified\" or \"licensed team\" unless explicitly in the input assets.\n\n"
+        "Trust: weave naturally into sentences (e.g. serving a neighborhood), not as a labeled trust stack. "
+        "Avoid repetitive filler (\"top rated\", \"established\", \"trusted\") unless grounded in provided data.\n\n"
+        "PAGE FLOW (use sections to separate meaning, not SEO categories):\n"
+        "1) Hero: clear human headline, short supporting paragraph, primary CTA button.\n"
+        "2) Intro: what the visitor is looking for, location woven in naturally.\n"
+        "3) Main value: what the business offers; benefits in plain language.\n"
+        "4) Location / service area: cities or neighborhoods in a paragraph or list.\n"
+        "5) Social proof: real reviews only if provided; otherwise generic placeholder like "
+        "\"Customers often highlight quality and speed of service.\"—no fake numbers.\n"
+        "6) Optional details: pricing/hours/services only if provided in inputs.\n"
+        "7) FAQ (accordion only): real customer questions—availability, pricing, location, how it works—not audit questions.\n"
+        "8) Final CTA: simple, action-oriented, not a repeat of the hero.\n\n"
+        "INTERNAL inputs may include topic gaps or FAQs—use them to structure copy only; never expose them as diagnostics.\n\n"
+        "Allowed component ``type`` values: h1, h2, h3, h4, h5, h6, paragraph, div, section, button, "
+        "list, table, accordion, columns.\n\n"
+        "For ``list``, use ``items`` as an array of strings; optional ``ordered`` boolean for numbered list.\n"
+        "For ``columns``, set ``columns`` to 2 or 3, and ``children`` as an array of columns where each "
+        "column is an array of component objects.\n"
+        "For ``accordion``, use ``items`` as an array of objects with ``title`` and ``content`` strings.\n"
+        "For ``table``, use ``headers`` (string array) and ``rows`` (array of string arrays).\n"
+        "For ``button``, use ``content`` and optional ``url``.\n"
+        "For headings and ``paragraph``, use ``content``.\n"
+        "For ``section`` and ``div``, use ``children`` for nested components.\n\n"
+        "Output shape (exact top-level keys): "
+        '{"page":{"title":"string","slug":"string","components":[...]}}\n'
+        "Do NOT include null values. Do not include trailing commas. Output must parse as JSON."
+    )
+    faqs = action_faqs or []
+    qf = quick_facts or []
+    steps = plan_steps or []
+    ilinks = internal_links or []
+    aff = affected_keywords or []
+    tgt = target_keywords or []
+    context_block = _build_actions_landing_page_context_block(
+        seo_issues=seo_issues or [],
+        action_faqs=faqs,
+        trust_block=trust_block,
+        quick_facts=qf,
+        plan_steps=steps,
+        internal_links=ilinks,
+        affected_keywords=aff,
+        target_keywords=tgt,
+        copy_example=copy_example,
+    )
+    pt = (page_type or "").strip()
+    page_type_line = f"Page type: {pt}\n" if pt else ""
+    user_msg = (
+        "INPUTS (use for copy only; the published page must read like a normal business site):\n\n"
+        f"Primary keyword / topic: {keyword}\n"
+        f"Business name: {business_name}\n"
+        f"Location: {location}\n"
+        f"Service area: {service_area}\n"
+        f"{page_type_line}"
+        f"{context_block}\n\n"
+        "Produce one landing page that converts visitors into actions. Use the keyword and location naturally—no stuffing. "
+        "If internal topic lines conflict with provided FAQs or business facts, prefer the explicit FAQs and facts.\n\n"
+        "Return ONLY valid JSON with this exact shape (no other keys at the top level):\n"
+        '{"page":{"title":"string","slug":"string","components":[]}}'
+    )
+
+    client = _get_client("OPEN_AI_SEO_API_KEY")
+    model = _get_model()
+    completion = chat_completion_create_logged(
+        client,
+        operation="openai.chat.actions_landing_page_preview",
+        business_profile=business_profile,
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_msg},
+        ],
+        response_format={"type": "json_object"},
+    )
+    raw = _strip_json_fence(completion.choices[0].message.content or "")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Model returned non-object JSON")
+    page = data.get("page")
+    if not isinstance(page, dict):
+        raise ValueError("Model JSON must include a page object")
+    comps = page.get("components")
+    if not isinstance(comps, list):
+        page["components"] = []
+    return data
+
+
 def seo_chat(request: HttpRequest) -> Response:
     """
     Core implementation of the SEO agent chat endpoint backed by OpenAI.
@@ -919,6 +1296,7 @@ def seo_chat(request: HttpRequest) -> Response:
         seo_score_data = get_or_refresh_seo_score_for_user(
             request.user,
             site_url=profile.website_url if profile and profile.website_url else None,
+            business_profile=profile,
         )
         if seo_score_data is not None:
             seo_score_block = (

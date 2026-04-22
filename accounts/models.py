@@ -247,14 +247,19 @@ class BusinessProfileMembership(models.Model):
 
 class SEOOverviewSnapshot(models.Model):
     """
-    Stores monthly SEO overview metrics for a user
+    Stores monthly SEO overview metrics per business profile
     (first day of the month + last time data was fetched).
     Keyword list and search metrics are cached and only refreshed once per hour
-    or when the user changes their business profile website URL (domain).
+    or when the profile's website URL (domain) changes.
     """
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="seo_overview_snapshots",
+    )
+    business_profile = models.ForeignKey(
+        "BusinessProfile",
         on_delete=models.CASCADE,
         related_name="seo_overview_snapshots",
     )
@@ -292,12 +297,20 @@ class SEOOverviewSnapshot(models.Model):
     seo_structured_issues_refreshed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        unique_together = ("user", "period_start", "cached_location_mode", "cached_location_code")
+        unique_together = (
+            "business_profile",
+            "period_start",
+            "cached_location_mode",
+            "cached_location_code",
+        )
         verbose_name = "SEO overview snapshot"
         verbose_name_plural = "SEO overview snapshots"
 
     def __str__(self) -> str:
-        return f"SEOOverviewSnapshot(user={self.user!s}, period_start={self.period_start})"
+        return (
+            f"SEOOverviewSnapshot(profile_id={getattr(self, 'business_profile_id', None)}, "
+            f"period_start={self.period_start})"
+        )
 
     def save(self, *args, **kwargs):
         """
@@ -440,6 +453,50 @@ class AEODashboardBundleCache(models.Model):
 
     def __str__(self) -> str:
         return f"AEODashboardBundleCache(profile_id={self.profile_id})"
+
+
+class ActionsGeneratedPageSnapshot(models.Model):
+    """
+    Persisted structured JSON for Actions → “Generate Page” previews (OpenAI output, no HTML).
+
+    One row per business profile + action_key (client card id). Re-open returns ``page_data``
+    when ``content_hash`` matches the request and ``regenerate`` is false. Run ``makemigrations``
+    / ``migrate`` to create or alter the table.
+    """
+
+    profile = models.ForeignKey(
+        BusinessProfile,
+        on_delete=models.CASCADE,
+        related_name="generated_page_snapshots",
+    )
+    action_key = models.CharField(
+        max_length=512,
+        db_index=True,
+        help_text="Actions UI card id (e.g. seo-step-0, aeo strategy stable id).",
+    )
+    content_hash = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="SHA-256 hex of canonical generation inputs; cache hit only when this matches the request.",
+    )
+    page_data = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Actions generated page snapshot"
+        verbose_name_plural = "Actions generated page snapshots"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["profile", "action_key"],
+                name="uniq_actions_genpage_profile_action",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"ActionsGeneratedPageSnapshot(profile_id={self.profile_id}, key={self.action_key[:40]!r})"
 
 
 class AEOResponseSnapshot(models.Model):
