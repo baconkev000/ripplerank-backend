@@ -2678,6 +2678,14 @@ def onboarding_onpage_crawl_task(self, crawl_id: int) -> None:
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
+def onboarding_ranked_keywords_fetch_task(self, crawl_id: int) -> None:
+    """DataForSEO Labs ranked_keywords + clustering after onboarding crawl pages + review topics."""
+    from .onboarding_onpage import execute_onboarding_ranked_keywords_fetch
+
+    execute_onboarding_ranked_keywords_fetch(int(crawl_id))
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), max_retries=0, ignore_result=True)
 def onboarding_prompt_generation_task(self, crawl_id: int) -> None:
     """
     Build onboarding prompt plan from stored crawl ``review_topics`` (all rows).

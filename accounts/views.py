@@ -766,6 +766,11 @@ def _clone_onboarding_crawl_for_profile(
         topic_clusters=source.topic_clusters or {},
         crawl_topic_seeds=source.crawl_topic_seeds or [],
         ranked_keywords_error=source.ranked_keywords_error or "",
+        ranked_keywords_fetch_status=(
+            OnboardingOnPageCrawl.RANKED_FETCH_COMPLETE
+            if (source.ranked_keywords or [])
+            else getattr(source, "ranked_keywords_fetch_status", "") or ""
+        ),
         review_topics=source.review_topics or [],
         review_topics_error=source.review_topics_error or "",
         context=context,
@@ -1013,6 +1018,10 @@ def onboarding_crawl_latest(request: HttpRequest) -> Response:
             "review_topics_error": crawl.review_topics_error or "",
             "exit_reason": crawl.exit_reason,
             "ranked_keywords_error": crawl.ranked_keywords_error or "",
+            "ranked_keywords_pending": getattr(
+                crawl, "ranked_keywords_fetch_status", ""
+            )
+            == OnboardingOnPageCrawl.RANKED_FETCH_PENDING,
             "prompt_plan_status": crawl.prompt_plan_status,
             "prompt_plan_prompt_count": int(crawl.prompt_plan_prompt_count or 0),
             "prompt_plan_error": crawl.prompt_plan_error or "",
@@ -2250,9 +2259,23 @@ def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
     if not (settings.DEBUG or settings.ALLOW_ONBOARDING_BILLING_BYPASS):
         return Response(status=404)
 
-    profile = resolve_main_business_profile_for_user(request.user)
-    if profile is None:
-        return Response({"error": "No active business profile."}, status=404)
+    raw_profile_id = None
+    if isinstance(request.data, dict):
+        raw_profile_id = request.data.get("profile_id")
+    target_profile = None
+    if raw_profile_id is not None and str(raw_profile_id).strip() != "":
+        try:
+            pk = int(raw_profile_id)
+        except (TypeError, ValueError):
+            return Response({"error": "Invalid profile_id."}, status=400)
+        target_profile = BusinessProfile.objects.filter(pk=pk, user=request.user).first()
+        if target_profile is None:
+            return Response({"error": "Business profile not found."}, status=404)
+        profile = target_profile
+    else:
+        profile = resolve_main_business_profile_for_user(request.user)
+        if profile is None:
+            return Response({"error": "No active business profile."}, status=404)
     access = viewer_team_access(request.user, profile)
     if not access["viewer_can_access_billing"]:
         return Response({"error": "Billing is not available for this account."}, status=403)
@@ -3554,9 +3577,19 @@ def aeo_onboarding_competitors_data(request: HttpRequest) -> Response:
     """
     from .aeo.aeo_scoring_utils import aeo_onboarding_competitors_visibility
 
-    profile = resolve_main_business_profile_for_user(request.user)
-    if not profile:
-        return Response({"has_data": False, "total_prompts": 0, "rows": []})
+    pid_raw = (request.GET.get("profile_id") or "").strip()
+    if pid_raw:
+        try:
+            pk = int(pid_raw)
+        except ValueError:
+            return Response({"has_data": False, "total_prompts": 0, "rows": []}, status=400)
+        profile = BusinessProfile.objects.filter(pk=pk, user=request.user).first()
+        if profile is None:
+            return Response({"has_data": False, "total_prompts": 0, "rows": []}, status=404)
+    else:
+        profile = resolve_main_business_profile_for_user(request.user)
+        if not profile:
+            return Response({"has_data": False, "total_prompts": 0, "rows": []})
     return Response(aeo_onboarding_competitors_visibility(profile))
 
 

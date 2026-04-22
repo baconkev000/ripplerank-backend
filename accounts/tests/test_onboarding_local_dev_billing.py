@@ -82,3 +82,25 @@ def test_local_dev_billing_complete_runs_full_seo_snapshot_when_website_present(
     res = client.post("/api/onboarding/local-dev-billing-complete/", {"plan": "pro"}, format="json")
     assert res.status_code == 200
     assert full_calls == [BusinessProfile.objects.get(user=user, is_main=True).id]
+
+
+@pytest.mark.django_db
+def test_local_dev_billing_complete_with_profile_id_updates_that_profile(settings):
+    settings.DEBUG = True
+    user = User.objects.create_user(username="ldb4@example.com", email="ldb4@example.com", password="x")
+    main_p = BusinessProfile.objects.create(user=user, is_main=True, business_name="Main")
+    extra = BusinessProfile.objects.create(user=user, is_main=False, business_name="Extra")
+    client = APIClient()
+    client.force_authenticate(user=user)
+    res = client.post(
+        "/api/onboarding/local-dev-billing-complete/",
+        {"plan": "starter", "profile_id": extra.id},
+        format="json",
+    )
+    assert res.status_code == 200
+    extra.refresh_from_db()
+    main_p.refresh_from_db()
+    assert extra.stripe_subscription_status == "active"
+    assert extra.plan == BusinessProfile.PLAN_STARTER
+    main_p.refresh_from_db()
+    assert (main_p.stripe_customer_id or "") == ""

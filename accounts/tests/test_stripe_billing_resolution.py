@@ -148,6 +148,26 @@ def test_checkout_session_success_has_updated_fields():
 
 
 @pytest.mark.django_db
+def test_checkout_session_client_reference_promotes_profile_to_main():
+    user = User.objects.create_user(username="promo@example.com", email="promo@example.com", password="x")
+    main_profile = BusinessProfile.objects.create(user=user, is_main=True, business_name="Main")
+    new_profile = BusinessProfile.objects.create(user=user, is_main=False, business_name="NewCo")
+    payload = {
+        "object": {
+            "client_reference_id": str(new_profile.id),
+            "customer": "cus_promo",
+            "subscription": "sub_promo",
+        }
+    }
+    result = sync_from_checkout_session(payload, event_id="evt_promo")
+    assert result.handled is True
+    new_profile.refresh_from_db()
+    main_profile.refresh_from_db()
+    assert new_profile.is_main is True
+    assert main_profile.is_main is False
+
+
+@pytest.mark.django_db
 def test_checkout_session_sets_plan_from_expanded_subscription_price(settings):
     settings.STRIPE_PRICE_ID_STARTER_MONTHLY = "price_from_sub"
     user = User.objects.create_user(username="expsub@example.com", email="expsub@example.com", password="x")
