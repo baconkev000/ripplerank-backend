@@ -61,7 +61,10 @@ from .dataforseo_utils import (
     seo_snapshot_context_for_profile,
     sort_top_keywords_for_display,
 )
-from .seo_snapshot_refresh import sync_enrich_current_period_seo_snapshot_for_profile
+from .seo_snapshot_refresh import (
+    run_full_seo_snapshot_for_profile,
+    sync_enrich_current_period_seo_snapshot_for_profile,
+)
 from .constants import SEO_SNAPSHOT_TTL
 from .onboarding_completion import (
     user_has_completed_full_onboarding,
@@ -1883,10 +1886,12 @@ def business_profile(request: HttpRequest) -> Response:
     new_site_url = serializer.instance.website_url
     if new_site_url and new_site_url != old_site_url:
         try:
-            get_or_refresh_seo_score_for_user(
-                workspace_data_user(serializer.instance) or request.user,
-                site_url=new_site_url,
-                business_profile=serializer.instance,
+            inst = serializer.instance
+            data_user = workspace_data_user(inst) or request.user
+            run_full_seo_snapshot_for_profile(
+                inst,
+                data_user_fallback=data_user,
+                abort_on_low_coverage=True,
             )
         except Exception:
             # Never block profile saves on DataForSEO errors.
@@ -2278,12 +2283,18 @@ def onboarding_local_dev_billing_complete(request: HttpRequest) -> Response:
     )
     site = str(getattr(profile, "website_url", "") or "").strip()
     if site:
-        from .tasks import post_payment_seo_snapshot_task
-
-        def _enqueue_post_payment_seo() -> None:
-            post_payment_seo_snapshot_task.delay(profile.id)
-
-        transaction.on_commit(_enqueue_post_payment_seo)
+        data_user = workspace_data_user(profile) or request.user
+        try:
+            run_full_seo_snapshot_for_profile(
+                profile,
+                data_user_fallback=data_user,
+                abort_on_low_coverage=True,
+            )
+        except Exception:
+            logger.exception(
+                "[onboarding_local_dev_billing_complete] full SEO snapshot failed profile_id=%s",
+                profile.id,
+            )
     return Response({"ok": True, "plan": plan})
 
 
@@ -4665,19 +4676,10 @@ def business_profile_list(request: HttpRequest) -> Response:
     if site_url and normalize_domain(site_url):
         data_user = workspace_data_user(profile) or request.user
         try:
-            # Ranked snapshot row (sync) so the client can read basic metrics immediately.
-            get_or_refresh_seo_score_for_user(
-                data_user,
-                site_url=site_url,
-                force_refresh=True,
-                business_profile=profile,
-            )
-            # Full enrichment + metrics (same pipeline as post-payment / refresh-seo-snapshot API),
-            # off the request thread so the add-company modal does not block on DataForSEO.
-            from .tasks import sync_enrich_seo_snapshot_for_profile_task
-
-            transaction.on_commit(
-                lambda pid=profile.pk: sync_enrich_seo_snapshot_for_profile_task.delay(pid)
+            run_full_seo_snapshot_for_profile(
+                profile,
+                data_user_fallback=data_user,
+                abort_on_low_coverage=True,
             )
         except Exception:
             logger.exception(
@@ -4912,10 +4914,11 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
         new_site_url = profile.website_url
         if new_site_url and new_site_url != old_site_url:
             try:
-                get_or_refresh_seo_score_for_user(
-                    request.user,
-                    site_url=new_site_url,
-                    business_profile=profile,
+                data_user = workspace_data_user(profile) or request.user
+                run_full_seo_snapshot_for_profile(
+                    profile,
+                    data_user_fallback=data_user,
+                    abort_on_low_coverage=True,
                 )
             except Exception:
                 pass
