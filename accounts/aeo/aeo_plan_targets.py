@@ -22,6 +22,8 @@ from django.conf import settings
 
 from accounts.models import BusinessProfile
 
+_ACTIVE_SUBSCRIPTION_STATUSES = frozenset({"active", "trialing", "past_due"})
+
 AEO_PLAN_CAP_STARTER: int = 25
 AEO_PLAN_CAP_PRO: int = 75
 AEO_PLAN_CAP_ADVANCED: int = 150
@@ -41,6 +43,51 @@ def aeo_monitored_prompt_cap_for_plan_slug(plan: str) -> int:
     if p == BusinessProfile.PLAN_ADVANCED:
         return AEO_PLAN_CAP_ADVANCED
     return AEO_PLAN_CAP_STARTER
+
+
+def _normalized_plan_slug(raw: str) -> str:
+    p = (raw or "").strip().lower()
+    if p == BusinessProfile.PLAN_PRO:
+        return BusinessProfile.PLAN_PRO
+    if p in {BusinessProfile.PLAN_ADVANCED, "enterprise", "scale"}:
+        return BusinessProfile.PLAN_ADVANCED
+    if p == BusinessProfile.PLAN_STARTER:
+        return BusinessProfile.PLAN_STARTER
+    return BusinessProfile.PLAN_NONE
+
+
+def _effective_plan_slug_for_profile(profile: BusinessProfile | None) -> str:
+    """
+    Resolve plan for feature gating and target sizing.
+
+    For add-company flows, newly created profiles may intentionally keep ``plan=""`` until
+    onboarding/payment completes. In that case, inherit the owning account's effective paid
+    tier from the user's primary profile so caps/expansion still align with account billing.
+    """
+    if profile is None:
+        return BusinessProfile.PLAN_NONE
+    own = _normalized_plan_slug(str(getattr(profile, "plan", "") or ""))
+    if own != BusinessProfile.PLAN_NONE:
+        return own
+
+    owner_id = getattr(profile, "user_id", None)
+    if not owner_id:
+        return BusinessProfile.PLAN_NONE
+    anchor = (
+        BusinessProfile.objects.filter(user_id=owner_id)
+        .order_by("-is_main", "id")
+        .only("plan", "stripe_subscription_status")
+        .first()
+    )
+    if anchor is None:
+        return BusinessProfile.PLAN_NONE
+    anchor_plan = _normalized_plan_slug(str(getattr(anchor, "plan", "") or ""))
+    if anchor_plan != BusinessProfile.PLAN_NONE:
+        return anchor_plan
+    status = str(getattr(anchor, "stripe_subscription_status", "") or "").strip().lower()
+    if status in _ACTIVE_SUBSCRIPTION_STATUSES:
+        return BusinessProfile.PLAN_STARTER
+    return BusinessProfile.PLAN_NONE
 
 
 def aeo_custom_monitored_prompt_cap_for_plan_slug(plan: str) -> int:
@@ -75,7 +122,7 @@ def aeo_effective_monitored_target_for_profile(profile: BusinessProfile | None) 
         return aeo_fallback_global_target_count()
     if aeo_testing_mode():
         return aeo_testing_target_count()
-    return aeo_monitored_prompt_cap_for_plan_slug(profile.plan)
+    return aeo_monitored_prompt_cap_for_plan_slug(_effective_plan_slug_for_profile(profile))
 
 
 def aeo_effective_custom_prompt_cap_for_profile(profile: BusinessProfile | None) -> int:
@@ -85,7 +132,7 @@ def aeo_effective_custom_prompt_cap_for_profile(profile: BusinessProfile | None)
     In testing mode, caps at the effective monitored target so append flows stay small.
     """
     base = aeo_custom_monitored_prompt_cap_for_plan_slug(
-        profile.plan if profile is not None else ""
+        _effective_plan_slug_for_profile(profile) if profile is not None else ""
     )
     if profile is None:
         return base
@@ -127,7 +174,10 @@ def aeo_onboarding_min_for_validation(instance: BusinessProfile | None, attrs: d
 def aeo_should_run_post_payment_expansion(profile: BusinessProfile) -> bool:
     if aeo_testing_mode():
         return False
-    return profile.plan in {BusinessProfile.PLAN_PRO, BusinessProfile.PLAN_ADVANCED}
+    return _effective_plan_slug_for_profile(profile) in {
+        BusinessProfile.PLAN_PRO,
+        BusinessProfile.PLAN_ADVANCED,
+    }
 
 
 def aeo_http_call_bounds_for_monitoring(

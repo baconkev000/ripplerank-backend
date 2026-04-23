@@ -795,7 +795,6 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
     """
     Queue DataForSEO On-Page crawl (max 10 pages) after onboarding step 1.
 
-    If the domain is already on another user's business profile, returns 409.
     If this user already has a completed crawl with ranked keywords for the domain,
     returns that row without enqueueing a new crawl.
     """
@@ -833,17 +832,6 @@ def onboarding_onpage_crawl_start(request: HttpRequest) -> Response:
     domain = normalize_domain(website_url)
     if not domain:
         return Response({"error": "A valid website_url is required"}, status=400)
-
-    if _onboarding_domain_claimed_by_other_user(domain, request.user):
-        return Response(
-            {
-                "error": (
-                    "This website is already linked to another account. "
-                    "Use a different URL or sign in with the account that owns it."
-                ),
-            },
-            status=409,
-        )
 
     reused = _onboarding_reusable_crawl_for_user(
         request.user,
@@ -4679,6 +4667,8 @@ def business_profile_list(request: HttpRequest) -> Response:
     data = request.data.copy()
     # Never allow client to set a different user
     data.pop("user", None)
+    # New company profiles start without a plan; billing/webhooks determine paid tier later.
+    data.pop("plan", None)
 
     if is_first:
         # First profile for this user is main by definition
@@ -4992,6 +4982,28 @@ def business_profile_detail(request: HttpRequest, pk: int) -> Response:
                 )
             except Exception:
                 pass
+
+        # For add-company onboarding, selected prompts are initially the interactive baseline.
+        # If this account is Pro/Advanced, enqueue background expansion to full monitored cap
+        # even when this profile's own plan field is still blank.
+        selected_prompts_in_payload = "selected_aeo_prompts" in request.data
+        if selected_prompts_in_payload and list(profile.selected_aeo_prompts or []):
+            try:
+                if aeo_should_run_post_payment_expansion(profile):
+                    from .tasks import schedule_aeo_prompt_plan_expansion
+
+                    cap = int(aeo_effective_monitored_target_for_profile(profile))
+                    transaction.on_commit(
+                        lambda pid=int(profile.id), expansion_cap=cap: schedule_aeo_prompt_plan_expansion.delay(
+                            pid,
+                            expansion_cap=expansion_cap,
+                        )
+                    )
+            except Exception:
+                logger.exception(
+                    "[business_profile_detail] enqueue prompt expansion failed profile_id=%s",
+                    getattr(profile, "id", None),
+                )
 
         # Default PATCH/PUT response to lightweight metrics so profile saves never block on
         # live DataForSEO calls (can exceed worker timeout during external crawl requests).
