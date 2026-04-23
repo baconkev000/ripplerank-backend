@@ -945,8 +945,27 @@ def run_prompt_batch_via_openai(
         else aeo_openai_max_output_tokens_for_target(AEO_PLAN_CAP_STARTER)
     )
 
+    def _prompt_batch_timeout_seconds() -> float:
+        """
+        Bound synchronous onboarding prompt-plan OpenAI calls so Gunicorn workers do not hit
+        hard abort before SDK timeout handling can return a graceful empty batch.
+        """
+        v = getattr(settings, "AEO_ONBOARDING_OPENAI_TIMEOUT", None)
+        if v is None:
+            v = getattr(settings, "AEO_OPENAI_TIMEOUT", 20.0)
+        try:
+            # Keep below common 30s worker timeout defaults.
+            return min(25.0, max(5.0, float(v)))
+        except (TypeError, ValueError):
+            return 20.0
+
     try:
         client = _get_client(api_key_env)
+        try:
+            client = client.with_options(timeout=_prompt_batch_timeout_seconds(), max_retries=0)
+        except Exception:
+            # Older/newer SDK shapes may not expose with_options.
+            pass
         completion = chat_completion_create_logged(
             client,
             operation="openai.chat.aeo_prompt_batch",
