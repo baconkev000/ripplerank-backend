@@ -23,6 +23,7 @@ from .dataforseo_utils import (
     seo_snapshot_context_for_profile,
 )
 from .openai_utils import generate_aeo_recommendations
+from .onboarding_completion import business_profile_fully_onboarded
 from . import debug_log as _debug
 
 
@@ -213,6 +214,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
     viewer_can_access_billing = serializers.SerializerMethodField()
     viewer_can_manage_team = serializers.SerializerMethodField()
     viewer_email = serializers.SerializerMethodField()
+    onboarding_complete = serializers.SerializerMethodField()
 
     class Meta:
         model = BusinessProfile
@@ -283,6 +285,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "viewer_can_access_billing",
             "viewer_can_manage_team",
             "viewer_email",
+            "onboarding_complete",
         ]
         read_only_fields = [
             "id",
@@ -307,6 +310,7 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
             "viewer_can_access_billing",
             "viewer_can_manage_team",
             "viewer_email",
+            "onboarding_complete",
         ]
 
     def _viewer_access_dict(self) -> dict:
@@ -342,6 +346,12 @@ class BusinessProfileSerializer(serializers.ModelSerializer):
         if u is not None and getattr(u, "is_authenticated", False) and getattr(u, "email", None):
             return str(u.email)
         return str(getattr(obj.user, "email", "") or "")
+
+    def get_onboarding_complete(self, obj: BusinessProfile) -> bool:
+        try:
+            return bool(business_profile_fully_onboarded(obj))
+        except Exception:
+            return False
 
     def get_aeo_onboarding_prompt_target_count(self, obj: BusinessProfile) -> int:
         return aeo_effective_monitored_target_for_profile(obj)
