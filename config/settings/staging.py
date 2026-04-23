@@ -116,14 +116,22 @@ STORAGES = {
 CORS_ALLOWED_ORIGINS = [
     "https://amplerank.ai",
     "https://www.amplerank.ai",
+    "https://app.amplerank.ai",
+    "https://api.amplerank.ai",
     "https://staging.amplerank.ai",
     "https://staging-api.amplerank.ai",
     "http://localhost:3000",
 ]
+# Keep explicit allowlist above, but also allow branded subdomains (preview/frontdoor variants).
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://([a-z0-9-]+\.)?amplerank\.ai$",
+]
 CSRF_TRUSTED_ORIGINS = [
+    "https://api.amplerank.ai",
     "https://staging-api.amplerank.ai",
     "https://amplerank.ai",
     "https://www.amplerank.ai",
+    "https://app.amplerank.ai",
     "https://staging.amplerank.ai",
     "http://localhost:3000",
 ]

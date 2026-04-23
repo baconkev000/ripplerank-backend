@@ -4718,19 +4718,18 @@ def business_profile_list(request: HttpRequest) -> Response:
 
     # Bootstrap SEO snapshot when the profile already has a site URL (add-company flow sets URL on POST).
     # Without this, PATCH finalize only updates prompts and never hits the "website changed" refresh path.
-    # Mirrors staff ``seo_snapshot_refresh``: force DataForSEO once + enqueue enrichment / next-steps tasks.
+    # Run async to avoid holding this HTTP request open on DataForSEO network latency.
     site_url = str(getattr(profile, "website_url", "") or "").strip()
     if site_url and normalize_domain(site_url):
-        data_user = workspace_data_user(profile) or request.user
         try:
-            run_full_seo_snapshot_for_profile(
-                profile,
-                data_user_fallback=data_user,
-                abort_on_low_coverage=True,
+            from .tasks import sync_enrich_seo_snapshot_for_profile_task
+
+            transaction.on_commit(
+                lambda pid=int(profile.id): sync_enrich_seo_snapshot_for_profile_task.delay(pid)
             )
         except Exception:
             logger.exception(
-                "[business_profile_list] SEO snapshot bootstrap failed profile_id=%s",
+                "[business_profile_list] SEO snapshot bootstrap enqueue failed profile_id=%s",
                 getattr(profile, "id", None),
             )
 
