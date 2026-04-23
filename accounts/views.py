@@ -4507,9 +4507,9 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
     if onboarding_step2:
         reuse_saved = False
 
-    if reuse_saved and isinstance(saved_raw, list) and len(saved_raw) == target_prompt_count:
+    if reuse_saved and isinstance(saved_raw, list):
         raw_items = plan_items_from_saved_prompt_strings(saved_raw, max_items=target_prompt_count)
-        if len(raw_items) == target_prompt_count:
+        if raw_items:
             ser = _serialize_aeo_prompt_items(raw_items)
             biz = aeo_business_input_from_profile(
                 profile,
@@ -4554,7 +4554,7 @@ def aeo_onboarding_prompt_plan(request: HttpRequest) -> Response:
                         "openai_prompt_count": 0,
                         "combined_count": len(ser),
                         "combined_target": target_prompt_count,
-                        "combined_shortfall": 0,
+                        "combined_shortfall": max(0, target_prompt_count - len(ser)),
                     },
                     "prompts_by_topic": {},
                 }
