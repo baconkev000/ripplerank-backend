@@ -47,13 +47,18 @@ def test_post_second_business_profile_allowed_with_advanced_plan(monkeypatch):
         plan=BusinessProfile.PLAN_ADVANCED,
         stripe_subscription_status="active",
     )
-    full_calls: list[int] = []
+    enqueued_profile_ids: list[int] = []
 
-    def _capture_full(profile, **kwargs):
-        full_calls.append(int(profile.pk))
-        return {"ok": True, "persisted": True}
+    class _NoopTask:
+        @staticmethod
+        def delay(profile_id: int):
+            enqueued_profile_ids.append(int(profile_id))
+            return None
 
-    monkeypatch.setattr("accounts.views.run_full_seo_snapshot_for_profile", _capture_full)
+    monkeypatch.setattr(
+        "accounts.tasks.sync_enrich_seo_snapshot_for_profile_task",
+        _NoopTask,
+    )
     client = APIClient()
     client.force_authenticate(user=user)
     resp = client.post(
@@ -67,4 +72,4 @@ def test_post_second_business_profile_allowed_with_advanced_plan(monkeypatch):
     )
     assert resp.status_code == 201
     assert BusinessProfile.objects.filter(user=user).count() == 2
-    assert full_calls == [int(resp.data["id"])]
+    assert enqueued_profile_ids == [int(resp.data["id"])]
