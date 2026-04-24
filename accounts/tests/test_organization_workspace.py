@@ -46,6 +46,39 @@ def test_accessible_profiles_org_admin_sees_all_sites():
 
 
 @pytest.mark.django_db
+def test_accessible_profiles_org_admin_hidden_from_team_ui_still_sees_all_sites():
+    """Internal admins: org membership must work even when hidden_from_team_ui is true."""
+    owner = User.objects.create_user(username="orghideown", email="orghideown@example.com", password="pw")
+    admin = User.objects.create_user(username="orghideadm", email="orghideadm@example.com", password="pw")
+    org = Organization.objects.create(owner_user=owner, name="Hidden UI Org")
+    BusinessProfile.objects.create(
+        user=owner,
+        is_main=True,
+        organization=org,
+        business_name="Main",
+        website_url="https://main-h.example",
+        business_address="US",
+    )
+    BusinessProfile.objects.create(
+        user=owner,
+        is_main=False,
+        organization=org,
+        business_name="Sub",
+        website_url="https://sub-h.example",
+        business_address="US",
+    )
+    OrganizationMembership.objects.create(
+        organization=org,
+        user=admin,
+        role=OrganizationMembership.ROLE_ADMIN,
+        is_owner=False,
+        hidden_from_team_ui=True,
+    )
+    qs = accessible_business_profiles_queryset(admin)
+    assert qs.count() == 2
+
+
+@pytest.mark.django_db
 def test_accessible_profiles_site_only_admin_sees_one_site():
     owner = User.objects.create_user(username="orgown2", email="orgown2@example.com", password="pw")
     admin = User.objects.create_user(username="orgadm2", email="orgadm2@example.com", password="pw")

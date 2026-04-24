@@ -460,6 +460,7 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
     list_display = (
         "id",
         "user",
+        "organization",
         "business_name",
         "industry",
         "plan",
@@ -469,13 +470,23 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
         "created_at",
         "updated_at",
     )
-    search_fields = ("user__email", "user__username", "business_name", "industry")
-    list_filter = ("industry", "plan", "aeo_prompt_expansion_status", "created_at")
+    search_fields = (
+        "user__email",
+        "user__username",
+        "business_name",
+        "industry",
+        "organization__name",
+    )
+    list_filter = ("industry", "plan", "aeo_prompt_expansion_status", "created_at", "organization")
+    raw_id_fields = ("organization",)
     filter_horizontal = ("tracked_competitors",)
     inlines = (
         BusinessProfileMembershipInline,
         ThirdPartyApiErrorLogInline,
     )
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related("organization", "user")
     readonly_fields = (
         "created_at",
         "updated_at",
@@ -488,6 +499,7 @@ class BusinessProfileAdmin(CsvExportAdminMixin, admin.ModelAdmin):
                 "fields": (
                     "user",
                     "is_main",
+                    "organization",
                     "full_name",
                     "business_name",
                     "business_address",

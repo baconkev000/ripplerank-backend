@@ -4,8 +4,9 @@ and derive UI / permission flags for viewers.
 
 Organizations group all sites (BusinessProfile rows) under one billing workspace.
 OrganizationMembership grants access to every site in the org (typically created when
-someone is invited on the main company profile). Site-only BusinessProfileMembership
-on a sub-site does not imply org-wide access.
+someone is invited on the main company profile). ``hidden_from_team_ui`` only affects
+customer-facing team lists, not API/workspace access (internal admins stay fully scoped).
+Site-only BusinessProfileMembership on a sub-site does not imply org-wide access.
 """
 from __future__ import annotations
 
@@ -51,10 +52,7 @@ def accessible_business_profiles_queryset(user: Any):
         return BusinessProfile.objects.none()
 
     org_ids = list(
-        OrganizationMembership.objects.filter(user=user, hidden_from_team_ui=False).values_list(
-            "organization_id",
-            flat=True,
-        )
+        OrganizationMembership.objects.filter(user=user).values_list("organization_id", flat=True)
     )
     q = Q(user=user)
     if org_ids:
@@ -118,11 +116,7 @@ def get_organization_membership(user: Any, profile: BusinessProfile | None) -> O
     oid = getattr(profile, "organization_id", None)
     if not oid:
         return None
-    return OrganizationMembership.objects.filter(
-        organization_id=int(oid),
-        user=user,
-        hidden_from_team_ui=False,
-    ).first()
+    return OrganizationMembership.objects.filter(organization_id=int(oid), user=user).first()
 
 
 def workspace_data_user(profile: BusinessProfile | None) -> Any:
